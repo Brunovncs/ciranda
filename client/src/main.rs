@@ -3,7 +3,7 @@
 // would only add noise.
 #![allow(clippy::result_large_err)]
 
-//! Harmony's desktop client: voice channels with cameras and screen sharing, text channels, and
+//! Ciranda's desktop client: voice channels with cameras and screen sharing, text channels, and
 //! the server's people, drawn with GPUI.
 
 #[macro_use]
@@ -41,17 +41,24 @@ fn first_size(cx: &gpui::App) -> gpui::Size<gpui::Pixels> {
 }
 
 fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("harmony=info,warn")).init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("ciranda=info,warn")).init();
     let smoke = std::env::args().any(|a| a == "--smoke");
+    let relaunched = core::update::relaunched();
+    if let Some(legacy) = core::settings::legacy_dir() {
+        let Some(_harmony) = tray::Instance::claim_legacy(&legacy, relaunched) else {
+            log::info!("Harmony is running on {}: its window was asked to show", legacy.display());
+            return;
+        };
+        core::settings::adopt_legacy_dir(&legacy);
+    }
     let store = core::settings::Store::load();
     i18n::set(i18n::resolve(&store.values.language));
-    let relaunched = std::env::var_os(core::update::RELAUNCH_VAR).is_some();
     let Some(instance) = tray::Instance::claim(&core::settings::data_dir(), relaunched) else {
-        log::info!("Harmony is already running: its window was asked to show");
+        log::info!("Ciranda is already running: its window was asked to show");
         return;
     };
 
-    // Closing the window never closes it (see `ui::tray`): it hides, or Harmony quits with it
+    // Closing the window never closes it (see `ui::tray`): it hides, or Ciranda quits with it
     // still open so a call is left properly. Quitting when it is gone covers the platforms
     // where it can be closed some other way.
     gpui_platform::application().with_assets(icons::Assets).with_quit_mode(QuitMode::LastWindowClosed).run(move |cx: &mut gpui::App| {
@@ -66,8 +73,8 @@ fn main() {
 
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, first_size(cx), cx))),
-            titlebar: Some(TitlebarOptions { title: Some("Harmony".into()), ..Default::default() }),
-            app_id: Some("harmony".into()),
+            titlebar: Some(TitlebarOptions { title: Some("Ciranda".into()), ..Default::default() }),
+            app_id: Some("ciranda".into()),
             window_min_size: Some(size(gpui::px(640.), gpui::px(480.))),
             window_background: WindowBackgroundAppearance::Opaque,
             ..Default::default()

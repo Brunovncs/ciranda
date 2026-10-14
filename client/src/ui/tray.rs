@@ -51,7 +51,7 @@ fn hwnd(window: &Window) -> Option<isize> {
 }
 
 /// The window's close button. With the icon there and the setting on, the window only hides;
-/// otherwise Harmony quits, keeping the window until then so a call is left properly.
+/// otherwise Ciranda quits, keeping the window until then so a call is left properly.
 fn on_close(window: &mut Window, cx: &mut App) -> bool {
     let hide = cx.global::<TrayState>().tray.is_some() && prefs(cx).close_to_tray;
     let Some(hwnd) = hwnd(window).filter(|_| hide) else {
@@ -63,7 +63,7 @@ fn on_close(window: &mut Window, cx: &mut App) -> bool {
         set_prefs(cx, |p| p.tray_notice_seen = true);
         if let Some(tray) = &cx.global::<TrayState>().tray {
             tray.notify(
-                tr!("Harmony is still running in the tray", "O Harmony continua rodando na bandeja"),
+                tr!("Ciranda is still running in the tray", "A Ciranda continua rodando na bandeja"),
                 tr!(
                     "Calls and messages keep going. Click the icon to open it again, or right-click it to quit.",
                     "Chamadas e mensagens continuam. Clique no ícone para abrir de novo, ou com o botão direito para sair."
@@ -114,12 +114,12 @@ fn call_state(cx: &App) -> Option<(bool, bool)> {
     Some((call.muted, call.deafened))
 }
 
-/// "Harmony", then the server and the call, one to a line.
+/// "Ciranda", then the server and the call, one to a line.
 fn tip(cx: &App) -> String {
-    let Some(view) = server_view(cx) else { return "Harmony".into() };
+    let Some(view) = server_view(cx) else { return "Ciranda".into() };
     let view = view.read(cx);
     let session = view.session.read(cx);
-    let mut tip = format!("Harmony\n{}", session.server_name);
+    let mut tip = format!("Ciranda\n{}", session.server_name);
     if let Some(call) = &view.call {
         let call = call.read(cx);
         let channel = session.place_name(call.place);

@@ -71,7 +71,7 @@ pub struct Settings {
     pub custom_backgrounds: Vec<String>,
     /// "en", "pt", or empty to follow the system.
     pub language: String,
-    /// Closing the window leaves Harmony running in the notification area.
+    /// Closing the window leaves Ciranda running in the notification area.
     pub close_to_tray: bool,
     /// The notice saying so has been shown, the first time the window closed to it.
     pub tray_notice_seen: bool,
@@ -428,7 +428,7 @@ pub enum Background {
     Blur {
         strength: u32,
     },
-    /// One of the pictures that ship with Harmony, by name.
+    /// One of the pictures that ship with Ciranda, by name.
     Builtin {
         name: String,
     },
@@ -490,14 +490,39 @@ impl Default for Settings {
     }
 }
 
-/// `%APPDATA%\Harmony`, where Electron kept `userData`. `HARMONY_DATA_DIR` moves it, for
-/// running more than one copy side by side.
+/// `%APPDATA%\Ciranda`, or `%APPDATA%\Harmony` until `adopt_legacy_dir` has moved it.
+/// `CIRANDA_DATA_DIR` moves it, for running more than one copy side by side.
 pub fn data_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("HARMONY_DATA_DIR") {
+    if let Some(dir) = std::env::var_os("CIRANDA_DATA_DIR") {
         return PathBuf::from(dir);
     }
     let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
-    base.join("Harmony")
+    legacy_dir_in(&base).unwrap_or_else(|| base.join("Ciranda"))
+}
+
+/// `%APPDATA%\Harmony`, where Harmony (and Electron's `userData` before it) kept everything, when
+/// it is there and `%APPDATA%\Ciranda` is not yet.
+pub fn legacy_dir() -> Option<PathBuf> {
+    if std::env::var_os("CIRANDA_DATA_DIR").is_some() {
+        return None;
+    }
+    legacy_dir_in(&dirs::config_dir()?)
+}
+
+fn legacy_dir_in(base: &Path) -> Option<PathBuf> {
+    let legacy = base.join("Harmony");
+    (legacy.is_dir() && !base.join("Ciranda").exists()).then_some(legacy)
+}
+
+/// Renames `%APPDATA%\Harmony` to `%APPDATA%\Ciranda`: settings, sign-ins, keys and the media cache
+/// move together. A file still open there (Pedro's Electron client, say) makes it fail, and
+/// `data_dir` keeps using the old folder until a later start manages it.
+pub fn adopt_legacy_dir(legacy: &Path) {
+    let Some(dir) = legacy.parent().map(|base| base.join("Ciranda")) else { return };
+    match std::fs::rename(legacy, &dir) {
+        Ok(()) => log::info!("settings moved from {} to {}", legacy.display(), dir.display()),
+        Err(e) => log::warn!("settings stay in {}: {e}", legacy.display()),
+    }
 }
 
 pub struct Store {
@@ -674,7 +699,7 @@ mod tests {
 
     #[test]
     fn unknown_keys_survive_a_save() {
-        let dir = std::env::temp_dir().join(format!("harmony-settings-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ciranda-settings-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("settings.json");
         std::fs::write(&path, r#"{"serverUrl":"pi.local:8080","quality":"high","uiScale":400}"#).unwrap();
@@ -689,7 +714,7 @@ mod tests {
     }
 
     fn scratch(name: &str, contents: &str) -> (PathBuf, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("harmony-settings-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ciranda-settings-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("settings.json");
         std::fs::write(&path, contents).unwrap();
@@ -992,5 +1017,27 @@ mod tests {
         assert_eq!(s.muted_channels.values().flatten().count(), 1, "muting twice is once");
         s.set_channel_muted("https://a.example:8444", 3, false);
         assert!(s.muted_channels.is_empty(), "nothing left behind for a server with none");
+    }
+
+    #[test]
+    fn harmonys_folder_becomes_cirandas() {
+        let base = std::env::temp_dir().join(format!("ciranda-appdata-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(legacy_dir_in(&base), None, "nothing to move on a first install");
+
+        let legacy = base.join("Harmony");
+        std::fs::create_dir_all(legacy.join("keys")).unwrap();
+        std::fs::write(legacy.join("settings.json"), r#"{"username":"predo"}"#).unwrap();
+        assert_eq!(legacy_dir_in(&base), Some(legacy.clone()));
+
+        adopt_legacy_dir(&legacy);
+        assert_eq!(legacy_dir_in(&base), None, "moved once");
+        assert!(!legacy.exists());
+        assert!(base.join("Ciranda").join("keys").is_dir());
+        assert_eq!(Store::load_from(base.join("Ciranda").join("settings.json")).values.username, "predo");
+
+        std::fs::create_dir_all(&legacy).unwrap();
+        assert_eq!(legacy_dir_in(&base), None, "a Harmony folder made later is left alone");
+        let _ = std::fs::remove_dir_all(base);
     }
 }

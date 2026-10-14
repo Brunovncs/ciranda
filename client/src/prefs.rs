@@ -77,7 +77,7 @@ pub fn set_prefs(cx: &mut App, f: impl FnOnce(&mut Settings)) {
     });
 }
 
-/// Writes a level still settling before Harmony quits.
+/// Writes a level still settling before Ciranda quits.
 pub fn init(cx: &mut App) {
     cx.on_app_quit(|cx| {
         let p = cx.global_mut::<Prefs>();

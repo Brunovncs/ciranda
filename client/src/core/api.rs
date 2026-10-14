@@ -102,7 +102,7 @@ pub struct Api {
 
 impl Api {
     pub fn new() -> Api {
-        let http = reqwest::Client::builder().user_agent(concat!("Harmony/", env!("CARGO_PKG_VERSION"))).build().expect("http client");
+        let http = reqwest::Client::builder().user_agent(concat!("Ciranda/", env!("CARGO_PKG_VERSION"))).build().expect("http client");
         Api { http, creds: Default::default() }
     }
 
@@ -709,8 +709,8 @@ pub fn friendly(code: ErrorCode, body: &Value) -> Option<String> {
         E::Timeout => tr!("The server didn't answer. Try again.", "O servidor não respondeu. Tente de novo."),
         E::NoKey => tr!("Set up private messages first.", "Ative as mensagens privadas primeiro."),
         E::PeerHasNoKey => tr!(
-            "They can't receive private messages yet: they need to update Harmony and open it once.",
-            "Essa pessoa ainda não pode receber mensagens privadas: ela precisa atualizar o Harmony e abri-lo uma vez."
+            "They can't receive private messages yet: they need to update Ciranda and open it once.",
+            "Essa pessoa ainda não pode receber mensagens privadas: ela precisa atualizar a Ciranda e abri-la uma vez."
         ),
         E::StaleKey => tr!("A security key changed. Try again.", "Uma chave de segurança mudou. Tente de novo."),
         E::Blocked => tr!("You can't send messages in this conversation.", "Não é possível enviar mensagens nesta conversa."),
@@ -736,11 +736,11 @@ mod tests {
 
     #[test]
     fn only_plain_http_across_the_internet_is_in_the_clear() {
-        for open in ["harmony.example.com:8080", "http://203.0.113.7:8080", "http://[2001:db8::1]:8080", "100.128.0.1"] {
+        for open in ["ciranda.example.com:8080", "http://203.0.113.7:8080", "http://[2001:db8::1]:8080", "100.128.0.1"] {
             assert!(sends_in_the_clear(open), "{open}");
         }
         for fine in [
-            "https://harmony.example.com",
+            "https://ciranda.example.com",
             "pi.local:8080",
             "rockpi:8080",
             "localhost:8080",

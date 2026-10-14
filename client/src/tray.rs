@@ -1,8 +1,8 @@
-//! The notification-area icon, and one Harmony at a time. While the icon is there, closing the
+//! The notification-area icon, and one Ciranda at a time. While the icon is there, closing the
 //! window only hides it: the session and any call go on, a click on the icon brings the window
-//! back and its menu quits for real. As in OpenController, starting Harmony again shows the
+//! back and its menu quits for real. As in OpenController, starting Ciranda again shows the
 //! running copy's window instead; "one" is per settings folder, so copies started with their own
-//! `HARMONY_DATA_DIR` still run side by side.
+//! `CIRANDA_DATA_DIR` still run side by side.
 //!
 //! Plain Win32. The icon lives on a thread of its own with a hidden window for the shell's
 //! messages, so its menu, which runs a modal loop until it closes, never holds up the window.
@@ -87,19 +87,29 @@ mod platform {
         buf[n] = 0;
     }
 
-    /// The settings folder's claim: a mutex this (the main) thread holds until Harmony exits,
+    /// The settings folder's claim: a mutex this (the main) thread holds until Ciranda exits,
     /// and the event another start signals to have the window shown.
     pub struct Instance {
         show: Option<isize>,
     }
 
     impl Instance {
-        /// `None` when another Harmony runs on this settings folder: it has been asked to show its
-        /// window and this one should exit. After an update restarts Harmony (`wait`), the copy
+        /// `None` when another Ciranda runs on this settings folder: it has been asked to show its
+        /// window and this one should exit. After an update restarts Ciranda (`wait`), the copy
         /// being replaced is given time to finish quitting first.
         pub fn claim(data_dir: &Path, wait: bool) -> Option<Instance> {
+            Instance::claim_as("Ciranda", data_dir, wait)
+        }
+
+        /// The claim a Harmony up to 4.1.1 holds on its folder, so the folder is moved only once
+        /// that copy has quit: after the update to Ciranda it is still quitting as this one starts.
+        pub fn claim_legacy(data_dir: &Path, wait: bool) -> Option<Instance> {
+            Instance::claim_as("Harmony", data_dir, wait)
+        }
+
+        fn claim_as(app: &str, data_dir: &Path, wait: bool) -> Option<Instance> {
             let hash = hex::encode(Sha256::digest(data_dir.to_string_lossy().to_lowercase().as_bytes()));
-            let name = format!(r"Local\Harmony-{}", &hash[..16]);
+            let name = format!(r"Local\{app}-{}", &hash[..16]);
             let (mutex, show) = (wide(&name), wide(&format!("{name}-show")));
             // SAFETY: plain Win32 calls with nul-terminated names that outlive them. The handles
             // stay open for the life of the process.
@@ -127,7 +137,7 @@ mod platform {
         /// Sends `Event::Open` each time another start asks for the window.
         pub fn on_show(&self, events: async_channel::Sender<Event>) {
             let Some(show) = self.show else { return };
-            let spawned = std::thread::Builder::new().name("harmony-instance".into()).spawn(move || {
+            let spawned = std::thread::Builder::new().name("ciranda-instance".into()).spawn(move || {
                 // SAFETY: the event stays open for the life of the process.
                 while unsafe { WaitForSingleObject(HANDLE(show as _), INFINITE) } == WAIT_OBJECT_0 {
                     if events.send_blocking(Event::Open).is_err() {
@@ -174,7 +184,7 @@ mod platform {
     impl Tray {
         pub fn start(events: async_channel::Sender<Event>) -> Option<Tray> {
             let (ready, hwnd) = std::sync::mpsc::channel();
-            std::thread::Builder::new().name("harmony-tray".into()).spawn(move || run(events, ready)).ok()?;
+            std::thread::Builder::new().name("ciranda-tray".into()).spawn(move || run(events, ready)).ok()?;
             hwnd.recv().ok().flatten().map(|hwnd| Tray { hwnd })
         }
 
@@ -265,7 +275,7 @@ mod platform {
                 let _ = ready.send(None);
                 return;
             };
-            // Resource 1 is Harmony's own icon, at the size the notification area draws.
+            // Resource 1 is Ciranda's own icon, at the size the notification area draws.
             let icon = LoadImageW(
                 Some(module.into()),
                 PCWSTR(1 as _),
@@ -277,11 +287,11 @@ mod platform {
             .map_or(0, |h| h.0 as isize);
             let _ = SHARED.set(Shared {
                 events,
-                pending: Mutex::new(Pending { tip: "Harmony".into(), ..Default::default() }),
+                pending: Mutex::new(Pending { tip: "Ciranda".into(), ..Default::default() }),
                 icon,
                 taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
             });
-            let class = w!("HarmonyTray");
+            let class = w!("CirandaTray");
             let wc = WNDCLASSW { lpfnWndProc: Some(window_proc), hInstance: module.into(), lpszClassName: class, ..Default::default() };
             RegisterClassW(&wc);
             // A real top-level window, never shown, rather than a message-only one: only those
@@ -289,7 +299,7 @@ mod platform {
             let hwnd = match CreateWindowExW(
                 WS_EX_TOOLWINDOW,
                 class,
-                w!("Harmony tray"),
+                w!("Ciranda tray"),
                 WS_POPUP,
                 0,
                 0,
@@ -383,7 +393,7 @@ mod platform {
             let separator = || {
                 let _ = AppendMenuW(m, MF_SEPARATOR, 0, PCWSTR::null());
             };
-            item(MENU_ITEM_FLAGS(0), OPEN, tr!("Open Harmony", "Abrir Harmony"));
+            item(MENU_ITEM_FLAGS(0), OPEN, tr!("Open Ciranda", "Abrir a Ciranda"));
             let _ = SetMenuDefaultItem(m, OPEN as u32, 0);
             if let Some((muted, deafened)) = menu.call {
                 let check = |on: bool| if on { MF_CHECKED } else { MENU_ITEM_FLAGS(0) };
@@ -392,7 +402,7 @@ mod platform {
                 item(check(deafened), DEAFEN, tr!("Deafen", "Desativar o som"));
             }
             separator();
-            item(MENU_ITEM_FLAGS(0), QUIT, tr!("Quit Harmony", "Sair do Harmony"));
+            item(MENU_ITEM_FLAGS(0), QUIT, tr!("Quit Ciranda", "Sair da Ciranda"));
             // Without the foreground the menu would not close when clicking elsewhere.
             let _ = SetForegroundWindow(hwnd);
             let (x, y) = ANCHOR.get();
@@ -421,6 +431,10 @@ mod platform {
 
     impl Instance {
         pub fn claim(_: &Path, _: bool) -> Option<Instance> {
+            Some(Instance)
+        }
+
+        pub fn claim_legacy(_: &Path, _: bool) -> Option<Instance> {
             Some(Instance)
         }
 

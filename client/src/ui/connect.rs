@@ -337,8 +337,8 @@ async fn sign_in(api: &Api, mode: Mode, nickname: &str, password: &str, owner_ke
     if health.has_accounts.is_none() {
         return Err(fail(
             tr!(
-                "This server is older than accounts. Update it to use this version of Harmony.",
-                "Este servidor é de uma versão sem contas. Atualize-o para usar esta versão do Harmony."
+                "This server is older than accounts. Update it to use this version of Ciranda.",
+                "Este servidor é de uma versão sem contas. Atualize-o para usar esta versão da Ciranda."
             )
             .into(),
             &health,
@@ -616,7 +616,7 @@ impl Render for ConnectView {
                     .border_color(t.stroke)
                     .shadow_lg()
                     .child(div().flex().items_center().gap(px(14.)).child(crate::ui::brand_mark(40., &t)).child(
-                        div().flex().flex_col().child(display("Harmony", t.text)).child(body(
+                        div().flex().flex_col().child(display("Ciranda", t.text)).child(body(
                             tr!(
                                 "Voice, screens and chat for your group, on a server you run.",
                                 "Voz, telas e chat para o seu grupo, num servidor que é seu."
@@ -881,7 +881,7 @@ impl AddServer {
             }
             None if self.probed => Some(row(
                 t.text3,
-                tr!("No Harmony server answered there yet.", "Nenhum servidor Harmony respondeu aí ainda.").into(),
+                tr!("No server answered there yet.", "Nenhum servidor respondeu aí ainda.").into(),
                 t.text3,
             )),
             None => None,

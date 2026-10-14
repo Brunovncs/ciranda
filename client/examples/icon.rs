@@ -1,4 +1,4 @@
-//! Draws Harmony's icon (five bars of a sound wave on a rounded square) into
+//! Draws Ciranda's icon (five bars of a sound wave on a rounded square) into
 //! `assets/icon.ico` and `assets/icon.png`.
 //!
 //!     cargo run --release --example icon

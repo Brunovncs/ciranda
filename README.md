@@ -1,21 +1,24 @@
-# Harmony
+# Ciranda
 
 **Self-hosted, low-latency screen sharing and voice chat for a group of friends.**
 A small Discord you run yourself: voice channels with screen and camera sharing,
 text channels, and sub-second latency, because the server only relays video and
 never re-encodes it.
 
-This is a fork of [Harmony by Pedro Lucas Miguel](https://github.com/PedroLucasMiguel/harmony).
-Pedro built the project: the server, the protocol and the original Electron
-client. This fork keeps his server, with a few small additions that stay
-compatible, and replaces the client with a native one written in Rust on
-[GPUI](https://www.gpui.rs/), the UI framework behind the Zed editor.
+Ciranda is a fork of [Harmony by Pedro Lucas Miguel](https://github.com/PedroLucasMiguel/harmony),
+and was called Harmony itself up to 4.1.1. Pedro built the project: the server,
+the protocol and the original Electron client. Ciranda keeps his server, with a
+few small additions that stay compatible, and replaces the client with a native
+one written in Rust on [GPUI](https://www.gpui.rs/), the UI framework behind the
+Zed editor.
 
 ## What is different in this fork
 
-The client is one native `harmony.exe`, with no browser engine inside. It talks
-to the same server as Pedro's version and reads the same settings file, so an
-upgrade keeps your server, your sign-in and your preferences.
+The client is one native `ciranda.exe`, with no browser engine inside. It talks
+to the same server as Pedro's version, and on its first start it moves the
+settings folder of Harmony (`%APPDATA%\Harmony`, Electron or native) to
+`%APPDATA%\Ciranda`, so an upgrade keeps your servers, your sign-ins, your
+private-message keys and your preferences.
 
 The rest is new. A rail on the left keeps every server you joined, one click
 apart. Admins and the owner get a server settings page, and what only the owner
@@ -71,15 +74,15 @@ With [Rust](https://rustup.rs/) and the Visual Studio Build Tools (C++
 workload) installed:
 
 ```bash
-cargo build --release --manifest-path client/Cargo.toml   # -> client/target/release/harmony.exe
+cargo build --release --manifest-path client/Cargo.toml   # -> client/target/release/ciranda.exe
 ```
 
-Or download `harmony-<version>-windows-x64.exe` from the
-[latest release](https://github.com/Brunovncs/harmony/releases/latest) and keep
+Or download `ciranda-<version>-windows-x64.exe` from the
+[latest release](https://github.com/Brunovncs/ciranda/releases/latest) and keep
 it in a folder you can write to. When a newer release is out, an Update button
 shows at the top of the window. It downloads the new program, checks its
-SHA-256, swaps it in and restarts Harmony, waiting for your voice call to end if
-you are in one. Harmony asks GitHub for the latest release when it opens and
+SHA-256, swaps it in and restarts Ciranda, waiting for your voice call to end if
+you are in one. Ciranda asks GitHub for the latest release when it opens and
 every 6 hours; "Check for updates" in Settings, Advanced, turns that off. A build
 made with `cargo run` never replaces itself.
 
@@ -99,8 +102,9 @@ TLS, dynamic IPs, ports and troubleshooting are covered in
 
 ## Credits and license
 
-Harmony was created by [Pedro Lucas Miguel](https://github.com/PedroLucasMiguel).
-The GPUI client and the changes in this fork are by
+Harmony, which Ciranda is built on, was created by
+[Pedro Lucas Miguel](https://github.com/PedroLucasMiguel). The GPUI client and
+the changes in this fork are by
 [Brunovncs](https://github.com/Brunovncs). Third-party material in the client is
 listed in [client/THIRD_PARTY_NOTICES.md](client/THIRD_PARTY_NOTICES.md).
 

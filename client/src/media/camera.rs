@@ -50,7 +50,7 @@ pub fn devices() -> Vec<Device> {
         .collect()
 }
 
-/// The pictures that ship with Harmony, by the name settings store.
+/// The pictures that ship with Ciranda, by the name settings store.
 pub const BUILTIN: [(&str, &str, &[u8]); 6] = [
     ("aurora", "Aurora", include_bytes!("../../assets/backgrounds/aurora.jpg")),
     ("dusk", "Dusk", include_bytes!("../../assets/backgrounds/dusk.jpg")),
@@ -105,7 +105,7 @@ impl Capture {
         let (src, prev, st, bg, err, device) =
             (source.clone(), preview.clone(), stop.clone(), background.clone(), error.clone(), device.to_string());
         std::thread::Builder::new()
-            .name("harmony-camera".into())
+            .name("ciranda-camera".into())
             .spawn(move || {
                 if let Err(e) = run(&device, src, prev, st, bg) {
                     log::warn!("camera: {e}");
@@ -320,7 +320,7 @@ impl Masker {
         let spare = Arc::new(Mutex::new(None));
         let mask = Arc::new(Mutex::new(None));
         let (out, waiting, returned) = (mask.clone(), idle.clone(), spare.clone());
-        std::thread::Builder::new().name("harmony-segment".into()).spawn(move || {
+        std::thread::Builder::new().name("ciranda-segment".into()).spawn(move || {
             loop {
                 waiting.store(true, Ordering::Release);
                 let Ok(rgba) = rx.recv() else { break };
@@ -359,7 +359,7 @@ impl Masker {
     }
 }
 
-/// With `HARMONY_VIDEO_STATS` set: frames from the camera and frames sent, and where the time
+/// With `CIRANDA_VIDEO_STATS` set: frames from the camera and frames sent, and where the time
 /// per frame goes, logged every few seconds.
 struct Meter {
     since: Instant,

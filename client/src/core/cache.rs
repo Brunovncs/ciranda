@@ -78,7 +78,7 @@ impl Cache {
     pub fn open(dir: PathBuf, budget_mb: u64) -> Cache {
         let cache = Cache::load(dir, budget_mb);
         let c = cache.clone();
-        if let Err(e) = std::thread::Builder::new().name("harmony-cache".into()).spawn(move || c.reconcile()) {
+        if let Err(e) = std::thread::Builder::new().name("ciranda-cache".into()).spawn(move || c.reconcile()) {
             log::warn!("cache check did not start: {e}");
         }
         cache
@@ -316,7 +316,7 @@ mod tests {
     use super::*;
 
     fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("harmony-cache-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ciranda-cache-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }

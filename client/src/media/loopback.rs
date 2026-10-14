@@ -1,5 +1,5 @@
 //! What the computer is playing, for a screen share's sound, through Windows' process loopback
-//! (Windows 10 2004 and later): everything except Harmony's own process tree, so viewers don't
+//! (Windows 10 2004 and later): everything except Ciranda's own process tree, so viewers don't
 //! hear the call back, or only one application's, for a window share.
 
 use libwebrtc::audio_frame::AudioFrame;
@@ -36,7 +36,7 @@ impl Loopback {
         let stop = Arc::new(AtomicBool::new(false));
         let (s, st) = (source.clone(), stop.clone());
         std::thread::Builder::new()
-            .name("harmony-loopback".into())
+            .name("ciranda-loopback".into())
             .spawn(move || {
                 #[cfg(windows)]
                 if let Err(e) = imp::run(mode, &s, &st) {
@@ -118,7 +118,7 @@ mod imp {
         };
         // Never dropped: PROPVARIANT's drop is PropVariantClear, which hands a VT_BLOB's data to
         // CoTaskMemFree, and this blob points at `params` on the stack. Freeing it corrupted the
-        // heap, and Harmony crashed as the share's sound stopped.
+        // heap, and Ciranda crashed as the share's sound stopped.
         let prop = std::mem::ManuallyDrop::new(PROPVARIANT {
             Anonymous: PROPVARIANT_0 {
                 Anonymous: std::mem::ManuallyDrop::new(PROPVARIANT_0_0 {

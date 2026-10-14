@@ -61,7 +61,7 @@ impl Focusable for ServerAdmin {
     }
 }
 
-/// What stands before the server's name in the top bar: its picture, or the Harmony mark.
+/// What stands before the server's name in the top bar: its picture, or the Ciranda mark.
 pub fn mark(picture: Option<Arc<RenderImage>>, t: &Theme) -> AnyElement {
     match picture {
         Some(image) => img(image).flex_none().size(px(24.)).rounded(px(24. * 0.24)).into_any_element(),

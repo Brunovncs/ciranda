@@ -1,7 +1,7 @@
-//! Whether a newer Harmony is out, asked of GitHub's API, and putting it in place of the running
-//! copy. A release carries `harmony-<version>-windows-x64.exe` and that file's SHA-256; the new
+//! Whether a newer Ciranda is out, asked of GitHub's API, and putting it in place of the running
+//! copy. A release carries `ciranda-<version>-windows-x64.exe` and that file's SHA-256; the new
 //! program is downloaded next to the running one, checked, and swapped in: Windows lets a running
-//! program be renamed though not overwritten, so the running copy steps aside to `harmony.exe.old`
+//! program be renamed though not overwritten, so the running copy steps aside to `ciranda.exe.old`
 //! and the next start deletes it.
 
 use sha2::{Digest, Sha256};
@@ -10,15 +10,22 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub const RELEASES_API: &str = "https://api.github.com/repos/Brunovncs/harmony/releases/latest";
-pub const RELEASES_PAGE: &str = "https://github.com/Brunovncs/harmony/releases/latest";
+pub const RELEASES_API: &str = "https://api.github.com/repos/Brunovncs/ciranda/releases/latest";
+pub const RELEASES_PAGE: &str = "https://github.com/Brunovncs/ciranda/releases/latest";
 
 /// Where to ask instead of GitHub: a local server, to try an update end to end.
-const URL_VAR: &str = "HARMONY_UPDATE_URL";
+const URL_VAR: &str = "CIRANDA_UPDATE_URL";
 /// The version to claim instead of this one, to try updating from an older one.
-const PRETEND_VAR: &str = "HARMONY_PRETEND_VERSION";
+const PRETEND_VAR: &str = "CIRANDA_PRETEND_VERSION";
 /// Set on the copy an update starts, while the one it replaces is still quitting.
-pub const RELAUNCH_VAR: &str = "HARMONY_RELAUNCHED";
+pub const RELAUNCH_VAR: &str = "CIRANDA_RELAUNCHED";
+/// What Harmony up to 4.1.1 sets instead, on the Ciranda it updates to.
+const LEGACY_RELAUNCH_VAR: &str = "HARMONY_RELAUNCHED";
+
+/// This copy was started by an update, while the one it replaces is still quitting.
+pub fn relaunched() -> bool {
+    std::env::var_os(RELAUNCH_VAR).is_some() || std::env::var_os(LEGACY_RELAUNCH_VAR).is_some()
+}
 
 const ASSET_SUFFIX: &str = "-windows-x64.exe";
 
@@ -74,7 +81,7 @@ pub fn parse(json: &[u8]) -> Result<Release, String> {
 
 fn client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
-        .user_agent(concat!("Harmony/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("Ciranda/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(15))
         .read_timeout(Duration::from_secs(30))
         .build()
@@ -106,7 +113,7 @@ pub async fn check() -> Result<Option<Release>, String> {
     Ok(is_newer(&r.version, &current()).then_some(r))
 }
 
-/// `harmony.exe.<ext>`, beside the program.
+/// `ciranda.exe.<ext>`, beside the program.
 pub fn beside(exe: &Path, ext: &str) -> PathBuf {
     let mut s = OsString::from(exe.as_os_str());
     s.push(".");
@@ -210,8 +217,8 @@ mod tests {
     #[test]
     fn reads_a_release() {
         let json = br#"{"tag_name":"v4.1.0","html_url":"https://example/v4.1.0","body":" Faster joins. ","assets":[
-            {"name":"harmony-4.1.0-windows-x64.exe","browser_download_url":"https://example/exe"},
-            {"name":"harmony-4.1.0-windows-x64.exe.sha256","browser_download_url":"https://example/sha"}]}"#;
+            {"name":"ciranda-4.1.0-windows-x64.exe","browser_download_url":"https://example/exe"},
+            {"name":"ciranda-4.1.0-windows-x64.exe.sha256","browser_download_url":"https://example/sha"}]}"#;
         let r = parse(json).unwrap();
         assert_eq!(r.version, "4.1.0");
         assert_eq!(r.page, "https://example/v4.1.0");
@@ -226,9 +233,9 @@ mod tests {
 
     #[test]
     fn swaps_and_cleans_up() {
-        let dir = std::env::temp_dir().join(format!("harmony-update-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ciranda-update-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let exe = dir.join("harmony.exe");
+        let exe = dir.join("ciranda.exe");
         std::fs::write(&exe, "old").unwrap();
         let new = beside(&exe, "new");
         std::fs::write(&new, "new").unwrap();

@@ -80,7 +80,7 @@ impl Resolution {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Sound {
-    /// What the computer plays, less Harmony itself.
+    /// What the computer plays, less Ciranda itself.
     System,
     /// Only the shared window's application.
     App,
@@ -135,7 +135,7 @@ pub fn sources(kind: SourceKind) -> Vec<ScreenSource> {
             SourceKind::Screen => trf!("Screen {}", "Tela {}", i + 1),
             SourceKind::Window => src.title(),
         };
-        if kind == SourceKind::Window && (title.trim().is_empty() || title == "Harmony") {
+        if kind == SourceKind::Window && (title.trim().is_empty() || title == "Ciranda") {
             continue;
         }
         out.push(ScreenSource { id: src.id(), kind, title, size: None });
@@ -164,7 +164,7 @@ pub fn stills(kind: SourceKind, ids: Vec<u64>) -> async_channel::Receiver<(u64, 
                 }
             }
         };
-        if let Err(e) = std::thread::Builder::new().name("harmony-still".into()).spawn(work) {
+        if let Err(e) = std::thread::Builder::new().name("ciranda-still".into()).spawn(work) {
             log::warn!("no thread for screen stills: {e}");
         }
     }
@@ -310,7 +310,7 @@ impl ScreenCapture {
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
         let (src, prev, st, c) = (source.clone(), preview.clone(), stop.clone(), choice.clone());
-        std::thread::Builder::new().name("harmony-screen".into()).spawn(move || run(c, rx, src, prev, st)).ok();
+        std::thread::Builder::new().name("ciranda-screen".into()).spawn(move || run(c, rx, src, prev, st)).ok();
         let sound = loopback_for(&choice).map(Loopback::start);
         let sound_source = sound.as_ref().map(|l| l.source.clone());
         ScreenCapture {

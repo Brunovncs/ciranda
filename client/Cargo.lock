@@ -971,6 +971,52 @@ dependencies = [
 ]
 
 [[package]]
+name = "ciranda"
+version = "4.2.0"
+dependencies = [
+ "anyhow",
+ "async-channel",
+ "base64 0.22.1",
+ "chacha20poly1305",
+ "chrono",
+ "cpal",
+ "dirs 7.0.0",
+ "embed-resource",
+ "emojis",
+ "env_logger",
+ "futures",
+ "getrandom 0.2.17",
+ "gpui-pre",
+ "gpui-pre-platform",
+ "hex",
+ "hkdf",
+ "image",
+ "libwebrtc",
+ "log",
+ "mimalloc",
+ "nokhwa",
+ "parking_lot",
+ "raw-window-handle",
+ "reqwest 0.13.5",
+ "rtrb",
+ "serde",
+ "serde_json",
+ "sha2",
+ "smallvec",
+ "symphonia",
+ "tokio",
+ "tokio-tungstenite",
+ "tract-onnx",
+ "unicode-segmentation",
+ "url",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
+ "windows-sys 0.61.2",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
 name = "clang-sys"
 version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2959,52 +3005,6 @@ dependencies = [
  "core_maths",
  "read-fonts 0.37.0",
  "smallvec",
-]
-
-[[package]]
-name = "harmony"
-version = "4.1.1"
-dependencies = [
- "anyhow",
- "async-channel",
- "base64 0.22.1",
- "chacha20poly1305",
- "chrono",
- "cpal",
- "dirs 7.0.0",
- "embed-resource",
- "emojis",
- "env_logger",
- "futures",
- "getrandom 0.2.17",
- "gpui-pre",
- "gpui-pre-platform",
- "hex",
- "hkdf",
- "image",
- "libwebrtc",
- "log",
- "mimalloc",
- "nokhwa",
- "parking_lot",
- "raw-window-handle",
- "reqwest 0.13.5",
- "rtrb",
- "serde",
- "serde_json",
- "sha2",
- "smallvec",
- "symphonia",
- "tokio",
- "tokio-tungstenite",
- "tract-onnx",
- "unicode-segmentation",
- "url",
- "windows 0.62.2",
- "windows-core 0.62.2",
- "windows-sys 0.61.2",
- "x25519-dalek",
- "zeroize",
 ]
 
 [[package]]

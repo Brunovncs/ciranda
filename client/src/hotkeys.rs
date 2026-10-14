@@ -108,8 +108,8 @@ impl Refusal {
         match self {
             Refusal::Unusable => tr!("That key can't be used as a hotkey.", "Essa tecla não pode ser usada como atalho."),
             Refusal::NeedsModifier => tr!(
-                "Add Ctrl or Alt. On its own this key would stop working in every other program while Harmony is open.",
-                "Adicione Ctrl ou Alt. Sozinha, essa tecla pararia de funcionar em todos os outros programas enquanto o Harmony estiver aberto."
+                "Add Ctrl or Alt. On its own this key would stop working in every other program while Ciranda is open.",
+                "Adicione Ctrl ou Alt. Sozinha, essa tecla pararia de funcionar em todos os outros programas enquanto a Ciranda estiver aberta."
             ),
         }
     }
@@ -284,7 +284,7 @@ mod platform {
             .fold(MOD_NOREPEAT, |a, m| a | m.1)
     }
 
-    /// While recording, every key pressed in Harmony's window passes here first. One another
+    /// While recording, every key pressed in Ciranda's window passes here first. One another
     /// program holds is taken and reported (it would otherwise go to that program and the
     /// recorder would wait forever); everything else goes on to the window.
     unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -323,7 +323,7 @@ mod platform {
             let pending: Arc<Mutex<Vec<(HotkeyAction, Combo)>>> = Arc::default();
             let (ready, thread) = std::sync::mpsc::channel();
             let p = pending.clone();
-            std::thread::Builder::new().name("harmony-hotkeys".into()).spawn(move || run(p, events, ready)).ok()?;
+            std::thread::Builder::new().name("ciranda-hotkeys".into()).spawn(move || run(p, events, ready)).ok()?;
             Some(Registrar { thread: thread.recv().ok()?, pending })
         }
 

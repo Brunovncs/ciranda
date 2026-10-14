@@ -89,10 +89,10 @@ enum Feed {
     Clip(Arc<[i16]>, AtomicUsize),
 }
 
-/// `HARMONY_AUDIO_DEBUG` is set; looked up once, since it is asked every 10 ms for each stream.
+/// `CIRANDA_AUDIO_DEBUG` is set; looked up once, since it is asked every 10 ms for each stream.
 fn audio_debug() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("HARMONY_AUDIO_DEBUG").is_some())
+    *ON.get_or_init(|| std::env::var_os("CIRANDA_AUDIO_DEBUG").is_some())
 }
 
 impl Source {
@@ -601,11 +601,11 @@ impl Audio {
         let (tx, rx) = mpsc::channel();
         {
             let (mixer, mic, near) = (mixer.clone(), mic.clone(), near.clone());
-            std::thread::Builder::new().name("harmony-audio".into()).spawn(move || device_thread(rx, mixer, mic, near)).ok();
+            std::thread::Builder::new().name("ciranda-audio".into()).spawn(move || device_thread(rx, mixer, mic, near)).ok();
         }
         {
             let (mixer, mic, near) = (mixer.clone(), mic.clone(), near.clone());
-            std::thread::Builder::new().name("harmony-mic".into()).spawn(move || dsp_thread(mixer, mic, near)).ok();
+            std::thread::Builder::new().name("ciranda-mic".into()).spawn(move || dsp_thread(mixer, mic, near)).ok();
         }
         let _ = tx.send(Command::Output(String::new()));
         Audio { mixer, mic, commands: tx, input_id: Mutex::new(String::new()) }
@@ -1314,10 +1314,10 @@ mod tests {
         std::fs::write(path, w).unwrap();
     }
 
-    /// Set `HARMONY_CUE_WAVS` to a folder to get every cue, and the worst overlap, as WAV files.
+    /// Set `CIRANDA_CUE_WAVS` to a folder to get every cue, and the worst overlap, as WAV files.
     #[test]
     fn cues_are_loud_and_two_together_do_not_clip() {
-        let wavs = std::env::var_os("HARMONY_CUE_WAVS").map(std::path::PathBuf::from);
+        let wavs = std::env::var_os("CIRANDA_CUE_WAVS").map(std::path::PathBuf::from);
         use Cue::*;
         for kind in [Join, Leave, Connect, Disconnect, StreamStart, StreamStop, Mute, Unmute, Deafen, Undeafen, Mention] {
             let s = render(kind, 1.);

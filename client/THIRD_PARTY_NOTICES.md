@@ -1,6 +1,6 @@
 # Third-party material in the client
 
-Everything here ships inside `harmony.exe`.
+Everything here ships inside `ciranda.exe`.
 
 | What | Where | Licence |
 | --- | --- | --- |
@@ -12,7 +12,7 @@ Everything here ships inside `harmony.exe`.
 | libwebrtc, by the WebRTC project, through LiveKit's `libwebrtc` and `webrtc-sys` crates | linked in; `webrtc-sys` vendored in `vendor/webrtc-sys` with a Media Foundation encoder added | BSD 3-Clause (libwebrtc), Apache 2.0 (bindings) |
 | GPUI, by Zed Industries, as published by the gpui-kit maintainers (`gpui-pre`, `gpui-pre-windows`) | vendored in `vendor/` with video surfaces added on Windows (see `vendor/GPUI_VENDORED.md`) | Apache 2.0 |
 
-Harmony's own icon (`assets/icon.ico` and `assets/icon.png`) is drawn in code by `examples/icon.rs`,
+Ciranda's own icon (`assets/icon.ico` and `assets/icon.png`) is drawn in code by `examples/icon.rs`,
 and the camera backgrounds in `assets/backgrounds/` by `examples/backgrounds.rs`. They, and the
 `soundboard` and `blur` shapes in `src/icons.rs`, are original to this repository and
 covered by its MIT licence.

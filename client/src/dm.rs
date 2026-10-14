@@ -418,7 +418,7 @@ mod tests {
     use super::*;
 
     fn temp_file() -> KeyFile {
-        KeyFile::open_at(std::env::temp_dir().join(format!("harmony-vault-{}.json", hex::encode(crypto::random::<8>()))))
+        KeyFile::open_at(std::env::temp_dir().join(format!("ciranda-vault-{}.json", hex::encode(crypto::random::<8>()))))
     }
 
     /// Two people with keys published, and the directory each sees.

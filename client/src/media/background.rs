@@ -27,7 +27,7 @@ impl Segmenter {
             .model_for_read(&mut std::io::Cursor::new(MODEL))?;
         let input = model.input_fact(0)?.clone();
         log::debug!("segmenter input fact: {input:?}");
-        if std::env::var_os("HARMONY_MODEL_DEBUG").is_some() {
+        if std::env::var_os("CIRANDA_MODEL_DEBUG").is_some() {
             eprintln!("segmenter input fact: {input:?}; outputs {:?}", model.output_fact(0));
         }
         let shape: Vec<Option<usize>> = input

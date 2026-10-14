@@ -213,7 +213,7 @@ pub fn add_emoji(session: Entity<Session>, window: &mut Window, cx: &mut App) {
         let Some(path) = paths.into_iter().next() else { return };
         let png = (|| -> Result<Vec<u8>, String> {
             let img = image::open(&path).map_err(|_| {
-                tr!("That file is not a picture Harmony can read.", "Esse arquivo não é uma imagem que o Harmony consiga ler.").to_string()
+                tr!("That file is not a picture Ciranda can read.", "Esse arquivo não é uma imagem que a Ciranda consiga ler.").to_string()
             })?;
             let img =
                 if img.width() > 128 || img.height() > 128 { img.resize(128, 128, image::imageops::FilterType::Lanczos3) } else { img };

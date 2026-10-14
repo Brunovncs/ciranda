@@ -21,7 +21,7 @@ pub fn runtime() -> &'static tokio::runtime::Runtime {
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(3)
-            .thread_name("harmony-net")
+            .thread_name("ciranda-net")
             .enable_all()
             .build()
             .expect("tokio runtime")

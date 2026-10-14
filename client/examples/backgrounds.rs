@@ -1,4 +1,4 @@
-//! Draws the camera backgrounds that ship with Harmony into `assets/backgrounds/`. They are made
+//! Draws the camera backgrounds that ship with Ciranda into `assets/backgrounds/`. They are made
 //! here rather than downloaded, so they carry no licence of their own and can be remade.
 //!
 //!     cargo run --release --example backgrounds
@@ -185,7 +185,7 @@ fn bokeh() -> RgbImage {
     })
 }
 
-/// A field of soft pixels in Harmony's violet, a nod to Texel.
+/// A field of soft pixels in Ciranda's violet, a nod to Texel.
 fn pixels() -> RgbImage {
     finish(|u, v| {
         let cells = 40.;

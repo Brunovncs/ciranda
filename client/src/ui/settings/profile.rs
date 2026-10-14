@@ -348,7 +348,7 @@ impl Settings {
             )))
             .child(div().flex().gap(px(10.)).child(tile(tr!("Voice", "Voz"), voice_value, voice_note, t)).child(tile(
                 tr!("App", "Aplicativo"),
-                format!("Harmony {}", env!("CARGO_PKG_VERSION")),
+                format!("Ciranda {}", env!("CARGO_PKG_VERSION")),
                 tr!("The version on this computer", "A versão neste computador"),
                 t,
             )))

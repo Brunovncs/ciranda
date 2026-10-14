@@ -1,8 +1,9 @@
 name: Release
 
 # Push a tag like v4.0.1, matching the version in client/Cargo.toml, to build the Windows client
-# and publish it as a release. The release carries harmony-<version>-windows-x64.exe and its
-# SHA-256, the two files the client's updater looks for; the notes are GitHub's list of what
+# and publish it as a release. The release carries ciranda-<version>-windows-x64.exe and its
+# SHA-256, the two files the client's updater looks for (by their -windows-x64.exe ending, so
+# Harmony 4.1.1 and earlier find them too); the notes are GitHub's list of what
 # changed since the last tag. Nothing is signed by a vendor: SmartScreen warns on first launch.
 on:
   push:
@@ -46,9 +47,9 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
-          $name = "harmony-${{ needs.version.outputs.version }}-windows-x64.exe"
+          $name = "ciranda-${{ needs.version.outputs.version }}-windows-x64.exe"
           New-Item -ItemType Directory ..\dist | Out-Null
-          Copy-Item target\release\harmony.exe "..\dist\$name"
+          Copy-Item target\release\ciranda.exe "..\dist\$name"
           (Get-FileHash "..\dist\$name" -Algorithm SHA256).Hash.ToLower() + "  $name" | Out-File -Encoding ascii "..\dist\$name.sha256"
       - uses: actions/upload-artifact@v4
         with:
@@ -69,6 +70,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" dist/* \
-            --title "Harmony ${{ needs.version.outputs.version }}" \
+            --title "Ciranda ${{ needs.version.outputs.version }}" \
             --generate-notes \
             --verify-tag

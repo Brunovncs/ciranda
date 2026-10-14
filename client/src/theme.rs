@@ -2,7 +2,7 @@
 //! something needs attention: speaking, live, muted, an error. Panes are rounded cards a step
 //! above the page, with hairline edges instead of heavy shadows.
 //!
-//! The palettes are Harmony's own (Midnight, Dark, Onyx…, plus a custom one built from four
+//! The palettes are Ciranda's own (Midnight, Dark, Onyx…, plus a custom one built from four
 //! colours) and a System palette that follows Windows: light or dark, and its accent colour.
 
 use gpui::{Hsla, Rgba, WindowAppearance, rgb};
@@ -75,7 +75,7 @@ pub mod radius {
 /// The gap between panes and around the window's edge.
 pub const GUTTER: f32 = 10.;
 
-/// A palette as Harmony defines one.
+/// A palette as Ciranda defines one.
 #[derive(Clone, Copy)]
 struct Palette {
     bg: u32,

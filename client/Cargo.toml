@@ -1,14 +1,14 @@
 [package]
-name = "harmony"
-description = "Harmony desktop client: voice, screen sharing and text chat for a group of friends"
-version = "4.1.1"
+name = "ciranda"
+description = "Ciranda desktop client: voice, screen sharing and text chat for a group of friends"
+version = "4.2.0"
 edition = "2024"
 rust-version = "1.97"
 license = "MIT"
 authors = ["Pedro Lucas Miguel"]
 
 [[bin]]
-name = "harmony"
+name = "ciranda"
 path = "src/main.rs"
 
 [dependencies]

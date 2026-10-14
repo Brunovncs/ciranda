@@ -1,7 +1,8 @@
-# Deploying Harmony
+# Deploying Ciranda
 
 Everything needed to stand the server up on any 64-bit Linux box and to compile
-the client. Read [README.md](README.md) first if you want to know *why* it is
+the client. The server is Pedro's Harmony server, so its names stay Harmony: the
+`harmony` user, the `HARMONY_*` variables, `/etc/harmony` and `/var/lib/harmony`. Read [README.md](README.md) first if you want to know *why* it is
 shaped this way — this file is the procedure.
 
 > [!WARNING]
@@ -463,7 +464,9 @@ The client is a native Windows app written in Rust, with [GPUI](https://www.gpui
 for the window and Google's libwebrtc (through LiveKit's Rust bindings) for the
 media. It talks to the same server, over the same API, as the Electron client of
 3.x did, and reads the same `settings.json`, so an upgrade keeps the server, the
-sign-in and every preference.
+sign-in and every preference. Up to 4.1.1 it was called Harmony and kept that
+file in `%APPDATA%\Harmony`; Ciranda moves the folder to `%APPDATA%\Ciranda` on its
+first start.
 
 ## Building
 
@@ -473,13 +476,13 @@ prebuilt for MSVC only, which is why the GNU toolchain will not do.
 
 ```bash
 cargo run --manifest-path client/Cargo.toml                    # run it
-cargo build --release --manifest-path client/Cargo.toml        # client/target/release/harmony.exe
+cargo build --release --manifest-path client/Cargo.toml        # client/target/release/ciranda.exe
 ```
 
 The first build downloads libwebrtc (about 200 MB) and takes several minutes;
 later ones take seconds. `.cargo/config.toml` at the repository root links
 everything against the static C runtime, which libwebrtc requires. The release
-binary is one `harmony.exe` of about 66 MB with nothing beside it: fonts, icons,
+binary is one `ciranda.exe` of about 66 MB with nothing beside it: fonts, icons,
 the camera backgrounds and the segmentation model are all inside.
 
 Without `fxc.exe` (it comes with the Windows SDK), build with
@@ -495,7 +498,7 @@ speakers play as its reference. That is what makes per-person volume up to 350%,
 deafening that spares the soundpad, and the noise gate possible.
 
 **Screen sound.** Through Windows' process loopback (Windows 10 2004 or later):
-a screen share sends everything the computer plays except Harmony itself, so
+a screen share sends everything the computer plays except Ciranda itself, so
 viewers never hear the call back; a window share can send only that
 application's sound.
 

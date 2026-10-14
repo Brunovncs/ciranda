@@ -1,0 +1,29 @@
+1 ICON "icon.ico"
+
+#define STR_(x) #x
+#define STR(x) STR_(x)
+#define VERSION_STR STR(VERSION_MAJOR) "." STR(VERSION_MINOR) "." STR(VERSION_PATCH)
+
+1 VERSIONINFO
+FILEVERSION VERSION_MAJOR, VERSION_MINOR, VERSION_PATCH, 0
+PRODUCTVERSION VERSION_MAJOR, VERSION_MINOR, VERSION_PATCH, 0
+FILEOS 0x40004
+FILETYPE 0x1
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "Ciranda"
+            VALUE "FileDescription", "Ciranda"
+            VALUE "FileVersion", VERSION_STR
+            VALUE "ProductName", "Ciranda"
+            VALUE "ProductVersion", VERSION_STR
+            VALUE "OriginalFilename", "ciranda.exe"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

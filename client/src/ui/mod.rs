@@ -54,7 +54,7 @@ impl Focusable for Root {
 /// The theme the settings ask for, on this window.
 pub fn theme_for(window: &Window, cx: &App) -> Theme {
     let p = prefs(cx);
-    let forced = std::env::var("HARMONY_THEME").ok();
+    let forced = std::env::var("CIRANDA_THEME").ok();
     let custom = p.custom_theme.as_ref().and_then(CustomColors::from_settings);
     Theme::new(forced.as_deref().unwrap_or(&p.theme), window.appearance(), custom.as_ref())
 }
@@ -121,7 +121,7 @@ impl Root {
     }
 }
 
-/// The Harmony mark: a microphone on a stand inside a rounded square, in the accent, as the app
+/// The Ciranda mark: a microphone on a stand inside a rounded square, in the accent, as the app
 /// icon draws it.
 pub fn brand_mark(size: f32, t: &Theme) -> gpui::Div {
     let bar = |h: f32| div().w(px(size * 0.085)).h(px(size * h)).rounded(px(size * 0.05)).bg(t.on_accent);

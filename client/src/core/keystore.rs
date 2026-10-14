@@ -145,7 +145,7 @@ mod tests {
     use super::*;
 
     fn temp_file() -> PathBuf {
-        std::env::temp_dir().join(format!("harmony-keys-{}.json", hex::encode(super::super::crypto::random::<8>())))
+        std::env::temp_dir().join(format!("ciranda-keys-{}.json", hex::encode(super::super::crypto::random::<8>())))
     }
 
     #[test]

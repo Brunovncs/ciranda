@@ -86,10 +86,10 @@ impl Focusable for Backup {
 impl Backup {
     fn save(&mut self, cx: &mut Context<Self>) {
         let dir = dirs::document_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-        let target = cx.prompt_for_new_path(&dir, Some("harmony-chave-de-recuperacao.txt"));
+        let target = cx.prompt_for_new_path(&dir, Some("ciranda-chave-de-recuperacao.txt"));
         let text = format!(
             "{}\r\n\r\n{}\r\n\r\n{}\r\n",
-            tr!("Harmony recovery key", "Chave de recuperação do Harmony"),
+            tr!("Ciranda recovery key", "Chave de recuperação da Ciranda"),
             self.key,
             tr!(
                 "It opens your private messages on another computer. Keep it to yourself.",

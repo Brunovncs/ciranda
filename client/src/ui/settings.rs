@@ -792,8 +792,8 @@ impl Settings {
             .gap(px(18.))
             .child(body(
                 tr!(
-                    "These work anywhere, even while a game has focus, and only while you are in a call. A combination bound here is taken from every other program while Harmony is open, so use Ctrl or Alt, or an F-key.",
-                    "Funcionam em qualquer lugar, até com um jogo em primeiro plano, e só enquanto você está em uma chamada. Uma combinação definida aqui deixa de funcionar nos outros programas enquanto o Harmony estiver aberto, então use Ctrl ou Alt, ou uma tecla F."
+                    "These work anywhere, even while a game has focus, and only while you are in a call. A combination bound here is taken from every other program while Ciranda is open, so use Ctrl or Alt, or an F-key.",
+                    "Funcionam em qualquer lugar, até com um jogo em primeiro plano, e só enquanto você está em uma chamada. Uma combinação definida aqui deixa de funcionar nos outros programas enquanto a Ciranda estiver aberta, então use Ctrl ou Alt, ou uma tecla F."
                 ),
                 t.text2,
             ))
@@ -820,8 +820,8 @@ impl Settings {
                     "close-to-tray",
                     tr!("Close to the tray", "Fechar para a bandeja"),
                     tr!(
-                        "Closing the window keeps Harmony running by the clock, calls included. Quit from its icon there.",
-                        "Fechar a janela deixa o Harmony rodando ao lado do relógio, inclusive em chamadas. Para sair, use o ícone dele ali."
+                        "Closing the window keeps Ciranda running by the clock, calls included. Quit from its icon there.",
+                        "Fechar a janela deixa a Ciranda rodando ao lado do relógio, inclusive em chamadas. Para sair, use o ícone dela ali."
                     ),
                     p.close_to_tray,
                     t,
@@ -875,8 +875,8 @@ impl Settings {
             .child(crate::ui::updates::settings_row(t, cx))
             .child(caption(
                 trf!(
-                    "Harmony {} · settings in {}",
-                    "Harmony {} · configurações em {}",
+                    "Ciranda {} · settings in {}",
+                    "Ciranda {} · configurações em {}",
                     env!("CARGO_PKG_VERSION"),
                     crate::core::settings::data_dir().display()
                 ),

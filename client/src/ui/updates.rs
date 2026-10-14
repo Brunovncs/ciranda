@@ -1,5 +1,5 @@
 //! "Update" at the top of the window when GitHub has a newer release. A click downloads the new
-//! program, checks it and swaps it in, then Harmony starts again on its own. In a voice call it
+//! program, checks it and swaps it in, then Ciranda starts again on its own. In a voice call it
 //! waits: the new version is put in place at once, and the restart happens when the call ends,
 //! or now if the person says so. A development build only opens the release's page, so it never
 //! replaces the program cargo built.
@@ -75,8 +75,8 @@ impl Updater {
                     cx.update(|cx| {
                         overlay::toast(
                             trf!(
-                                "Harmony was updated to version {}.",
-                                "O Harmony foi atualizado para a versão {}.",
+                                "Ciranda was updated to version {}.",
+                                "A Ciranda foi atualizada para a versão {}.",
                                 env!("CARGO_PKG_VERSION")
                             ),
                             cx,
@@ -135,10 +135,10 @@ impl Updater {
             State::Ready(r) => {
                 let this = cx.entity();
                 Ask::confirm_action(
-                    tr!("Restart Harmony now?", "Reiniciar o Harmony agora?"),
+                    tr!("Restart Ciranda now?", "Reiniciar a Ciranda agora?"),
                     trf!(
-                        "Harmony {} is ready. Restarting now takes you out of the voice call; otherwise it restarts by itself when you leave.",
-                        "O Harmony {} está pronto. Reiniciar agora tira você da chamada de voz; senão ele reinicia sozinho quando você sair.",
+                        "Ciranda {} is ready. Restarting now takes you out of the voice call; otherwise it restarts by itself when you leave.",
+                        "A Ciranda {} está pronta. Reiniciar agora tira você da chamada de voz; senão ela reinicia sozinha quando você sair.",
                         r.version
                     ),
                     tr!("Leave the call and restart", "Sair da chamada e reiniciar"),
@@ -272,7 +272,7 @@ fn excerpt(notes: &str) -> String {
 }
 
 fn about(r: &Release) -> String {
-    let head = trf!("Harmony {} is out.", "O Harmony {} já está disponível.", r.version);
+    let head = trf!("Ciranda {} is out.", "A Ciranda {} já está disponível.", r.version);
     match excerpt(&r.notes) {
         notes if notes.is_empty() => head,
         notes => format!("{head}\n\n{notes}"),
@@ -325,8 +325,8 @@ pub fn button(cx: &App) -> Option<AnyElement> {
             let installs = SELF_UPDATE && r.exe.is_some();
             let hint = if installs {
                 tr!(
-                    "Click to update. Harmony restarts by itself, after your call if you're in one.",
-                    "Clique para atualizar. O Harmony reinicia sozinho, depois da sua chamada se você estiver em uma."
+                    "Click to update. Ciranda restarts by itself, after your call if you're in one.",
+                    "Clique para atualizar. A Ciranda reinicia sozinha, depois da sua chamada se você estiver em uma."
                 )
             } else {
                 tr!(
@@ -359,13 +359,13 @@ pub fn button(cx: &App) -> Option<AnyElement> {
                 "Atualizando {}%",
                 (done * 100.).round() as u32
             )))
-            .tooltip(tip(trf!("Downloading Harmony {}…", "Baixando o Harmony {}…", r.version), &t))
+            .tooltip(tip(trf!("Downloading Ciranda {}…", "Baixando a Ciranda {}…", r.version), &t))
             .into_any_element(),
         State::Ready(r) => clickable(pill("update-ready", "restart", tr!("Restart", "Reiniciar"), t.on_accent, t.accent, t.accent))
             .tooltip(tip(
                 trf!(
-                    "Harmony {} is ready. It restarts by itself when you leave the call, or click to restart now.",
-                    "O Harmony {} está pronto. Ele reinicia sozinho quando você sair da chamada, ou clique para reiniciar agora.",
+                    "Ciranda {} is ready. It restarts by itself when you leave the call, or click to restart now.",
+                    "A Ciranda {} está pronta. Ela reinicia sozinha quando você sair da chamada, ou clique para reiniciar agora.",
                     r.version
                 ),
                 &t,
@@ -383,7 +383,7 @@ pub fn button(cx: &App) -> Option<AnyElement> {
             t.tint(t.critical),
             t.critical.opacity(0.4),
         ))
-        .tooltip(tip(trf!("Harmony {} could not be installed: {}", "Não foi possível instalar o Harmony {}: {}", r.version, e), &t))
+        .tooltip(tip(trf!("Ciranda {} could not be installed: {}", "Não foi possível instalar a Ciranda {}: {}", r.version, e), &t))
         .into_any_element(),
         State::Idle | State::Current => return None,
     };
@@ -404,12 +404,12 @@ pub fn settings_row(t: &Theme, cx: &mut App) -> AnyElement {
         _ if checking => (tr!("Checking…", "Verificando…").to_string(), t.text2),
         (State::Idle | State::Current, Some(e)) => (trf!("Couldn't check: {}", "Não foi possível verificar: {}", e), t.caution),
         (State::Current, None) => (trf!("{} is the latest version.", "A {} é a versão mais recente.", update::current()), t.success),
-        (State::Idle, None) => (trf!("This is Harmony {}.", "Este é o Harmony {}.", update::current()), t.text2),
+        (State::Idle, None) => (trf!("This is Ciranda {}.", "Esta é a Ciranda {}.", update::current()), t.text2),
         (State::Failed(r, e), _) => {
-            (trf!("Harmony {} could not be installed: {}", "Não foi possível instalar o Harmony {}: {}", r.version, e), t.critical)
+            (trf!("Ciranda {} could not be installed: {}", "Não foi possível instalar a Ciranda {}: {}", r.version, e), t.critical)
         }
         (_, _) => (
-            release.as_ref().map(|r| trf!("Harmony {} is out.", "O Harmony {} já está disponível.", r.version)).unwrap_or_default(),
+            release.as_ref().map(|r| trf!("Ciranda {} is out.", "A Ciranda {} já está disponível.", r.version)).unwrap_or_default(),
             t.accent,
         ),
     };
@@ -445,8 +445,8 @@ pub fn settings_row(t: &Theme, cx: &mut App) -> AnyElement {
                         .child(body(tr!("Check for updates", "Procurar atualizações"), t.text))
                         .child(caption(
                             tr!(
-                                "Asks GitHub for a newer version when Harmony opens and every 6 hours. Nothing about you is sent.",
-                                "Pergunta ao GitHub por uma versão nova quando o Harmony abre e a cada 6 horas. Nada sobre você é enviado."
+                                "Asks GitHub for a newer version when Ciranda opens and every 6 hours. Nothing about you is sent.",
+                                "Pergunta ao GitHub por uma versão nova quando a Ciranda abre e a cada 6 horas. Nada sobre você é enviado."
                             ),
                             t.text2,
                         )),

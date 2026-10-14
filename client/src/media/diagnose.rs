@@ -34,7 +34,7 @@ pub async fn run(api: Api, report: impl Fn(Step) + Send + Sync) -> Outcome {
     let fail = |verdict: &str| Outcome { ok: false, verdict: verdict.into() };
     // Each name is picked once, so a step's start and end match even if the language changes
     // halfway.
-    let reach = tr!("Reach the Harmony server", "Acessar o servidor do Harmony");
+    let reach = tr!("Reach the server", "Acessar o servidor");
     let media = tr!("Media server is running", "Servidor de mídia no ar");
     let reserve = tr!("Reserve a test stream", "Reservar uma transmissão de teste");
     let stun = tr!("Gather this computer's network addresses", "Reunir os endereços de rede deste computador");

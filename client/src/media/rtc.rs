@@ -103,10 +103,10 @@ pub fn hardware_encoder_running() -> bool {
     HARDWARE_RUNNING.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Whether to log video frame rates and timings (`HARMONY_VIDEO_STATS`).
+/// Whether to log video frame rates and timings (`CIRANDA_VIDEO_STATS`).
 pub fn video_stats() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("HARMONY_VIDEO_STATS").is_some())
+    *ON.get_or_init(|| std::env::var_os("CIRANDA_VIDEO_STATS").is_some())
 }
 
 pub fn factory() -> &'static PeerConnectionFactory {
@@ -266,7 +266,7 @@ impl Link {
         })
     }
 
-    /// With `HARMONY_VIDEO_STATS` set, logs what the video encoder or decoder of this connection
+    /// With `CIRANDA_VIDEO_STATS` set, logs what the video encoder or decoder of this connection
     /// is doing, for working out where frames go missing.
     pub async fn log_video_stats(&self) {
         if !video_stats() {
@@ -520,7 +520,7 @@ async fn negotiate(
             return Err(e);
         }
     };
-    if std::env::var_os("HARMONY_SDP_DEBUG").is_some() {
+    if std::env::var_os("CIRANDA_SDP_DEBUG").is_some() {
         log::info!("offer to {url}:\n{sdp}\nanswer:\n{answer}");
     }
     let answer = SessionDescription::parse(&answer, SdpType::Answer).map_err(|e| fail(e.description))?;

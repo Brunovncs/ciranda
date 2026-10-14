@@ -108,7 +108,7 @@ fn shown(e: &Emoji) -> bool {
     e.unicode_version() <= NEWEST
 }
 
-/// Harmony's six sections, in picker order. Default skin tones only: the variants are reachable
+/// Ciranda's six sections, in picker order. Default skin tones only: the variants are reachable
 /// by name but would multiply the grid by six.
 pub fn sections() -> &'static [Section] {
     static SECTIONS: OnceLock<Vec<Section>> = OnceLock::new();
@@ -268,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn groups_map_onto_harmony_sections() {
+    fn groups_map_onto_ciranda_sections() {
         assert_eq!(section_index("\u{1F600}"), 0);
         assert_eq!(section_index("\u{1F44D}"), 0);
         assert_eq!(section_index("\u{1F355}"), 1);
