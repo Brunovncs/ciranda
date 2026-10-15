@@ -14,6 +14,7 @@ use crate::prefs::{prefs, set_prefs};
 use crate::session::Session;
 use crate::theme::{MONO, Theme, current, px, radius};
 use crate::ui::hotkeys::Recorder;
+use crate::ui::ink::{self, InkLayer, Share};
 use crate::ui::overlay::{self, Dismiss, menu_card, menu_item, menu_rule};
 use crate::widgets::*;
 use gpui::prelude::FluentBuilder;
@@ -244,6 +245,7 @@ impl ServerView {
         let vh = f32::from(window.viewport_size().height) / crate::theme::scale();
         let side = 268. + if prefs(cx).show_members && vw > 900. { 232. } else { 0. } + 40.;
         let (w, h) = ((vw - side).max(320.) - 32., (vh - 48. - 52. - 40.).max(240.));
+        self.ink_layers.retain(|id, _| tiles.iter().any(|t| t.entity_id() == *id));
         let focused = self.focused_tile.clone().filter(|f| tiles.contains(f));
         if let Some(f) = focused {
             let others: Vec<Entity<Tile>> = tiles.iter().filter(|x| **x != f).cloned().collect();
@@ -303,6 +305,8 @@ impl ServerView {
         let (t1, t2, t3) = (tile.clone(), tile.clone(), tile.clone());
         let voice = voice.cloned();
         let lit = kind == TileKind::Camera && self.call_place(cx).is_some_and(|p| self.is_speaking(p, user, cx));
+        let ink = if kind == TileKind::Screen { self.ink_layer(tile, cx) } else { None };
+        let screen_tools = self.screen_tools(kind, local, id, t, cx);
         let el = div()
             .id(("tile", id))
             .group(group.clone())
@@ -317,6 +321,7 @@ impl ServerView {
             .border_color(t.stroke)
             // Its own view: a new frame redraws the picture alone.
             .child(tile.clone().cached(StyleRefinement::default().size_full()))
+            .children(ink)
             .child(
                 div()
                     .absolute()
@@ -353,6 +358,7 @@ impl ServerView {
                     .bg(gpui::black().opacity(0.55))
                     .invisible()
                     .group_hover(group, |s| s.visible())
+                    .children(screen_tools)
                     .when(local && kind == TileKind::Screen, |d| {
                         d.child(
                             tool_button(("change-share", id), "screen-share", false, gpui::white(), t)
@@ -488,6 +494,8 @@ impl ServerView {
         let name = self.session.read(cx).display_name(Some(user), None);
         let shown = self.theater_controls_shown();
         let white = gpui::white();
+        let ink = if kind == TileKind::Screen { self.ink_layer(tile, cx) } else { None };
+        let screen_tools = self.screen_tools(kind, local, 0, t, cx);
 
         let label = div()
             .absolute()
@@ -634,6 +642,7 @@ impl ServerView {
                         this.leave_voice(cx);
                     })),
             )
+            .when(!screen_tools.is_empty(), |d| d.child(rule()).children(screen_tools))
             .child(rule())
             .child(
                 button("theater-monitor", if fullscreen { "minimize" } else { "maximize" }, false, white)
@@ -692,6 +701,7 @@ impl ServerView {
             .size_full()
             .bg(gpui::black())
             .child(tile.clone().cached(StyleRefinement::default().size_full()))
+            .children(ink)
             .when(shown, |d| d.child(label).child(div().absolute().left_0().right_0().bottom(px(22.)).flex().justify_center().child(bar)))
             .on_mouse_move(cx.listener(|this, _: &gpui::MouseMoveEvent, _, cx| this.theater_poke(cx)))
             .on_click(cx.listener(|this, e: &gpui::ClickEvent, window, cx| {
@@ -702,6 +712,76 @@ impl ServerView {
                 }
             }))
             .into_any_element()
+    }
+
+    /// The drawings over a screen share's tile, made the first time it is drawn.
+    fn ink_layer(&mut self, tile: &Entity<Tile>, cx: &mut Context<Self>) -> Option<Entity<InkLayer>> {
+        let place = self.call_place(cx)?;
+        let tl = tile.read(cx);
+        let mid = if tl.local { self.call.as_ref()?.read(cx).mid? } else { tl.mid };
+        let frame = tl.frame.as_ref().map(|f| (f.width() as f32, f.height() as f32));
+        let drawable = !tl.local;
+        let share = Share { place, mid };
+        let session = self.session.clone();
+        let layer = self.ink_layers.entry(tile.entity_id()).or_insert_with(|| cx.new(|cx| InkLayer::new(session, share, cx))).clone();
+        layer.update(cx, |l, _| {
+            l.share = share;
+            l.drawable = drawable;
+            if let Some(f) = frame {
+                l.frame = f;
+            }
+        });
+        Some(layer)
+    }
+
+    /// The buttons a screen share has besides the usual: the pen on someone else's, and on
+    /// yours, saving a replay and wiping the drawings.
+    fn screen_tools(&mut self, kind: TileKind, local: bool, id: u64, t: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut out = Vec::new();
+        if kind != TileKind::Screen {
+            return out;
+        }
+        let white = gpui::white();
+        let board = ink::board(cx);
+        if !local {
+            let on = board.read(cx).pen;
+            out.push(
+                tool_button(("ink-pen", id), "pen", on, if on { t.accent } else { white }, t)
+                    .tooltip(tip(
+                        if on {
+                            tr!("Stop drawing", "Parar de rabiscar")
+                        } else {
+                            tr!("Draw on this screen: everyone in the call sees it", "Rabiscar nesta tela: todos na call veem")
+                        },
+                        t,
+                    ))
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        let board = ink::board(cx);
+                        board.update(cx, |b, cx| b.set_pen(!b.pen, cx));
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+            return out;
+        }
+        if crate::media::replay::recording() {
+            let seconds = prefs(cx).replay_seconds;
+            out.push(
+                tool_button(("replay-save", id), "film", false, white, t)
+                    .tooltip(tip(trf!("Save the last {} s", "Salvar os últimos {} s", seconds), t))
+                    .on_click(cx.listener(|this, _, _, cx| this.save_replay(cx)))
+                    .into_any_element(),
+            );
+        }
+        if self.my_share(cx).is_some_and(|s| board.read(cx).any_on(s)) {
+            out.push(
+                tool_button(("ink-clear", id), "eraser", false, white, t)
+                    .tooltip(tip(tr!("Wipe the drawings on your screen", "Apagar os rabiscos na sua tela"), t))
+                    .on_click(cx.listener(|this, _, _, cx| this.clear_my_ink(cx)))
+                    .into_any_element(),
+            );
+        }
+        out
     }
 
     pub fn open_soundpad(&mut self, at: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {

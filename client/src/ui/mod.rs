@@ -4,7 +4,10 @@
 pub mod camera;
 pub mod connect;
 mod elsewhere;
+pub mod float;
+pub mod game_overlay;
 pub mod hotkeys;
+pub mod ink;
 pub mod overlay;
 mod rail;
 pub mod server;

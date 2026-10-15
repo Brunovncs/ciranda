@@ -755,6 +755,17 @@ impl Session {
                 cx.emit(SessionEvent::SignedOut(SignOutReason::Removed));
                 return false;
             }
+            "ink" => {
+                let place = match (v.get("conversationId").and_then(Value::as_i64), v.get("channelId").and_then(Value::as_i64)) {
+                    (Some(id), _) => Place::Call(id),
+                    (None, Some(id)) => Place::Channel(id),
+                    _ => return false,
+                };
+                let mid = v.get("mid").and_then(Value::as_i64);
+                let sharer = self.roster(place).and_then(|r| r.iter().find(|m| Some(m.mid) == mid)).map(|m| m.user_id);
+                crate::ui::ink::receive(place, sharer, &v, cx);
+                return false;
+            }
             "soundpad:play" => {
                 let hash = v.get("hash").and_then(Value::as_str).unwrap_or("").to_string();
                 cx.emit(SessionEvent::SoundpadPlay { hash });

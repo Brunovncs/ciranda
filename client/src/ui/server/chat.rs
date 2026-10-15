@@ -428,14 +428,73 @@ impl ChatView {
     fn attach(&mut self, kind: files::Kind, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             let Some(path) = files::pick(kind, cx).await else { return };
-            let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "file".into());
-            let bytes = std::fs::read(&path);
-            let _ = this.update(cx, |this, cx| match bytes {
-                Ok(b) => this.set_pending(b, content_type_for(&name), name, cx),
-                Err(e) => overlay::toast(trf!("Could not read that file: {}", "Não foi possível ler esse arquivo: {}", e), cx),
-            });
+            let _ = this.update(cx, |this, cx| this.attach_path(&path, cx));
         })
         .detach();
+    }
+
+    /// A file on disk, picked, dropped or copied. One too big is turned away before it is read.
+    fn attach_path(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "file".into());
+        if std::fs::metadata(path).is_ok_and(|m| m.len() > MAX_UPLOAD as u64) {
+            overlay::toast(tr!("Files can be up to 25 MB.", "Os arquivos podem ter até 25 MB."), cx);
+            return;
+        }
+        match std::fs::read(path) {
+            Ok(b) => self.set_pending(b, content_type_for(&name), name, cx),
+            Err(e) => overlay::toast(trf!("Could not read that file: {}", "Não foi possível ler esse arquivo: {}", e), cx),
+        }
+    }
+
+    /// A copied picture or file attached as if picked; false when the clipboard holds neither.
+    fn attach_copied(&mut self, item: &ClipboardItem, cx: &mut Context<Self>) -> bool {
+        for entry in item.entries() {
+            match entry {
+                ClipboardEntry::Image(image) => {
+                    let image = image.clone();
+                    let stamp = Local::now().format("%Y%m%dT%H%M%S").to_string();
+                    let picture = cx.background_executor().spawn(async move { sendable_picture(image) });
+                    cx.spawn(async move |this, cx| {
+                        let picture = picture.await;
+                        let _ = this.update(cx, |this, cx| match picture {
+                            Ok((bytes, ext)) => {
+                                let name = format!("pasted-{stamp}.{ext}");
+                                this.set_pending(bytes, content_type_for(&name), name, cx);
+                            }
+                            Err(e) => {
+                                log::warn!("pasted picture: {e:#}");
+                                overlay::toast(tr!("Couldn't read the copied picture.", "Não foi possível ler a imagem copiada."), cx);
+                            }
+                        });
+                    })
+                    .detach();
+                    return true;
+                }
+                ClipboardEntry::ExternalPaths(paths) => {
+                    if let Some(path) = paths.paths().first() {
+                        self.attach_path(path, cx);
+                        return true;
+                    }
+                }
+                ClipboardEntry::String(_) => {}
+            }
+        }
+        false
+    }
+
+    /// Ctrl+V in the box, caught on its way there: the box's own paste runs before any key
+    /// listener and knows only text. A copied picture or file is attached; text, even beside a
+    /// picture (a spreadsheet's cells), goes on to the box.
+    fn on_paste(&mut self, _: &crate::text_field::Paste, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.mode, Some(Mode::Edit(_))) || !self.composer.focus_handle(cx).is_focused(window) {
+            return;
+        }
+        if let Some(item) = cx.read_from_clipboard()
+            && !has_text(&item)
+            && self.attach_copied(&item, cx)
+        {
+            cx.stop_propagation();
+        }
     }
 
     fn set_pending(&mut self, bytes: Vec<u8>, content_type: String, name: String, cx: &mut Context<Self>) {
@@ -460,21 +519,20 @@ impl ChatView {
         cx.notify();
     }
 
-    /// Ctrl+V with a picture on the clipboard attaches it.
+    /// Ctrl+V anywhere in the chat but the box (which goes through `on_paste`) attaches a copied
+    /// picture or file too.
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let k = &ev.keystroke;
         if k.modifiers.control
             && k.key == "v"
+            && !matches!(self.mode, Some(Mode::Edit(_)))
+            && self.writable(cx)
             && let Some(item) = cx.read_from_clipboard()
+            && !has_text(&item)
+            && self.attach_copied(&item, cx)
         {
-            for entry in item.entries() {
-                if let ClipboardEntry::Image(image) = entry {
-                    let name = format!("pasted-{}.{}", Local::now().format("%Y%m%dT%H%M%S"), image_ext(image.format));
-                    self.set_pending(image.bytes.clone(), content_type_for(&name), name, cx);
-                    cx.stop_propagation();
-                    return;
-                }
-            }
+            cx.stop_propagation();
+            return;
         }
         if self.mention.is_none() && !k.modifiers.modified() {
             match k.key.as_str() {
@@ -783,7 +841,11 @@ impl ChatView {
                 "clipboard",
                 tr!("Paste the copied picture", "Colar a imagem copiada"),
                 false,
-                act(&this, |v, _, cx| v.paste_image(cx)),
+                act(&this, |v, _, cx| {
+                    if let Some(item) = cx.read_from_clipboard() {
+                        v.attach_copied(&item, cx);
+                    }
+                }),
             ));
         }
         items.push(MenuEntry::rule());
@@ -816,18 +878,6 @@ impl ChatView {
             })
         });
         overlay::open_dialog(picker, window, cx);
-    }
-
-    /// The picture on the clipboard, as Ctrl+V would attach it.
-    fn paste_image(&mut self, cx: &mut Context<Self>) {
-        let Some(item) = cx.read_from_clipboard() else { return };
-        for entry in item.entries() {
-            if let ClipboardEntry::Image(image) = entry {
-                let name = format!("pasted-{}.{}", Local::now().format("%Y%m%dT%H%M%S"), image_ext(image.format));
-                self.set_pending(image.bytes.clone(), content_type_for(&name), name, cx);
-                return;
-            }
-        }
     }
 
     /// A fenced block around the selection, or an empty one, with the caret inside.
@@ -2012,6 +2062,7 @@ impl Render for ChatView {
             .capture_key_down(cx.listener(Self::on_key))
             .capture_action(cx.listener(Self::on_up))
             .capture_action(cx.listener(Self::on_down))
+            .capture_action(cx.listener(Self::on_paste))
             .group("chat-drop")
             .relative()
             .flex()
@@ -2020,11 +2071,7 @@ impl Render for ChatView {
             .when(writable, |d| {
                 d.on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _, cx| {
                     if let Some(path) = paths.paths().first() {
-                        let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "file".into());
-                        match std::fs::read(path) {
-                            Ok(b) => this.set_pending(b, content_type_for(&name), name, cx),
-                            Err(e) => overlay::toast(trf!("Could not read that file: {}", "Não foi possível ler esse arquivo: {}", e), cx),
-                        }
+                        this.attach_path(path, cx);
                     }
                 }))
             })
@@ -2168,13 +2215,29 @@ fn summary(body: &str, attachment: Option<&str>, media: Option<MediaType>, s: &S
     }
 }
 
-fn image_ext(format: gpui::ImageFormat) -> &'static str {
-    match format {
-        gpui::ImageFormat::Jpeg => "jpg",
-        gpui::ImageFormat::Gif => "gif",
-        gpui::ImageFormat::Webp => "webp",
-        _ => "png",
+fn has_text(item: &ClipboardItem) -> bool {
+    item.entries().iter().any(|e| matches!(e, ClipboardEntry::String(s) if !s.text().is_empty()))
+}
+
+/// A clipboard picture as it can be sent, with its extension: PNG, JPEG, GIF and WebP as they
+/// are, anything else as PNG. A screenshot (Win+Shift+S) reaches the clipboard as a bitmap, whose
+/// fourth byte is often all zeros: read as alpha, that would send it fully transparent.
+fn sendable_picture(pic: gpui::Image) -> anyhow::Result<(Vec<u8>, &'static str)> {
+    use gpui::ImageFormat as F;
+    match pic.format {
+        F::Png => return Ok((pic.bytes, "png")),
+        F::Jpeg => return Ok((pic.bytes, "jpg")),
+        F::Gif => return Ok((pic.bytes, "gif")),
+        F::Webp => return Ok((pic.bytes, "webp")),
+        _ => {}
     }
+    let mut rgba = image::load_from_memory(&pic.bytes)?.into_rgba8();
+    if rgba.pixels().all(|p| p[3] == 0) {
+        rgba.pixels_mut().for_each(|p| p[3] = 255);
+    }
+    let mut png = Vec::new();
+    rgba.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)?;
+    Ok((png, "png"))
 }
 
 /// Toasts what went wrong when a background send fails.
@@ -2377,5 +2440,43 @@ impl Render for Lightbox {
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(Dismiss))),
                     ),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A 2 × 1 bitmap as the clipboard gives it: a DIB with a file header in front, 32 bits a
+    /// pixel, the fourth byte unused (zero).
+    fn clipboard_bitmap() -> Vec<u8> {
+        let mut bmp = b"BM".to_vec();
+        bmp.extend_from_slice(&(14 + 40 + 8u32).to_le_bytes());
+        bmp.extend_from_slice(&[0; 4]);
+        bmp.extend_from_slice(&(14 + 40u32).to_le_bytes());
+        for v in [40u32, 2, 1] {
+            bmp.extend_from_slice(&v.to_le_bytes());
+        }
+        bmp.extend_from_slice(&1u16.to_le_bytes());
+        bmp.extend_from_slice(&32u16.to_le_bytes());
+        bmp.extend_from_slice(&[0; 24]);
+        bmp.extend_from_slice(&[0, 0, 255, 0, 255, 0, 0, 0]);
+        bmp
+    }
+
+    #[test]
+    fn a_pasted_screenshot_is_sent_as_an_opaque_png() {
+        let pic = gpui::Image::from_bytes(gpui::ImageFormat::Bmp, clipboard_bitmap());
+        let (png, ext) = sendable_picture(pic).unwrap();
+        assert_eq!(ext, "png");
+        let img = image::load_from_memory_with_format(&png, image::ImageFormat::Png).unwrap().into_rgba8();
+        assert_eq!(img.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(img.get_pixel(1, 0).0, [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn a_pasted_png_is_sent_as_it_is() {
+        let pic = gpui::Image::from_bytes(gpui::ImageFormat::Png, vec![0x89, b'P', b'N', b'G']);
+        assert_eq!(sendable_picture(pic).unwrap(), (vec![0x89, b'P', b'N', b'G'], "png"));
     }
 }

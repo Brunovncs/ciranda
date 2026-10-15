@@ -6,6 +6,7 @@ pub mod call;
 pub mod camera;
 pub mod diagnose;
 pub mod loopback;
+pub mod replay;
 pub mod rtc;
 pub mod screen;
 pub mod share;

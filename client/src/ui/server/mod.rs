@@ -86,6 +86,8 @@ pub struct ServerView {
     link_hover: bool,
     /// When the last message tone played, so a burst of messages makes one sound.
     message_cue_at: Option<std::time::Instant>,
+    /// The drawings over each screen share tile, by tile.
+    ink_layers: HashMap<EntityId, Entity<crate::ui::ink::InkLayer>>,
     /// The channel list draws again whenever this view is notified (the session, the call and
     /// who speaks all notify it); the member list only when the session changes.
     sidebar: Entity<Panel>,
@@ -150,12 +152,14 @@ fn refusal(e: &crate::core::realtime::RequestError) -> gpui::SharedString {
 
 impl ServerView {
     pub fn new(session: Entity<Session>, root: WeakEntity<Root>, window: &mut Window, cx: &mut Context<Self>) -> ServerView {
+        let ink = crate::ui::ink::board(cx);
         let subs = vec![
             cx.observe(&session, |this, _, cx| this.on_session(cx)),
             cx.subscribe_in(&session, window, |this, _, ev: &SessionEvent, window, cx| this.on_event(ev, window, cx)),
             // The shortcuts are heard here, so focus comes back when a dialog closes or a click
             // lands on nothing focusable.
             cx.on_focus_lost(window, |this, window, cx| this.focus.focus(window, cx)),
+            cx.observe(&ink, |this, _, cx| this.sync_screen_ink(cx)),
         ];
         crate::media::voice::apply_mic_prefs(cx);
         crate::media::audio::audio().set_output(&prefs(cx).voice_output_id);
@@ -189,6 +193,7 @@ impl ServerView {
             link_hover: false,
             message_cue_at: None,
             ringing: None,
+            ink_layers: HashMap::new(),
             sidebar,
             members,
             focus: cx.focus_handle(),
@@ -444,7 +449,12 @@ impl ServerView {
             }
         });
         self._subs.push(sub);
-        cx.observe(&call, |_, _, cx| cx.notify()).detach();
+        cx.observe(&call, |this, _, cx| {
+            this.sync_screen_ink(cx);
+            cx.notify();
+        })
+        .detach();
+        crate::ui::game_overlay::set_call(Some((call.clone(), self.session.clone())), cx);
         self.call = Some(call);
         crate::ui::updates::call_changed(true, cx);
         self.show_stage(cx);
@@ -714,6 +724,9 @@ impl ServerView {
             let connected = call.read(cx).tokens.is_some();
             call.update(cx, |c, cx| c.leave(cx));
             crate::ui::updates::call_changed(false, cx);
+            crate::ui::game_overlay::set_call(None, cx);
+            crate::ui::ink::board(cx).update(cx, |b, cx| b.set_pen(false, cx));
+            cx.defer(|cx| crate::ui::ink::show_on_screen(None, cx));
             if cue && connected {
                 voice_cue(Cue::Disconnect, cx);
             }
@@ -783,6 +796,18 @@ impl ServerView {
         match action {
             HotkeyAction::Mute => self.toggle_mute(cx),
             HotkeyAction::Deafen => self.toggle_deafen(cx),
+            HotkeyAction::Overlay => {
+                if !prefs(cx).overlay_enabled {
+                    overlay::toast(
+                        tr!("Turn the overlay on in Settings › In game first.", "Ative a sobreposição em Configurações › Durante o jogo primeiro."),
+                        cx,
+                    );
+                } else if !crate::ui::game_overlay::toggle(cx) {
+                    overlay::toast(tr!("Overlay hidden. The same hotkey brings it back.", "Sobreposição escondida. O mesmo atalho a traz de volta."), cx);
+                }
+            }
+            HotkeyAction::Replay => self.save_replay(cx),
+            HotkeyAction::Ink => self.clear_my_ink(cx),
             HotkeyAction::Clip(id) => {
                 if let Some(channel) = self.call_channel(cx)
                     && self.session.read(cx).clips.iter().any(|c| c.id == id)
@@ -791,6 +816,64 @@ impl ServerView {
                 }
             }
         }
+    }
+
+    /// Saves the last seconds of your share as a video, and says where; in the overlay too,
+    /// since a game is likely in front of the window.
+    pub fn save_replay(&mut self, cx: &mut Context<Self>) {
+        let save = crate::media::replay::save();
+        cx.spawn(async move |_, cx| {
+            let saved = save.await;
+            cx.update(|cx| match saved {
+                Ok(path) => {
+                    crate::media::audio::cue(Cue::StreamStart, cue_volume(cx));
+                    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                    crate::ui::game_overlay::notice(tr!("Replay saved", "Clipe salvo"), cx);
+                    overlay::toast(trf!("Replay saved in Videos\\Ciranda: {}", "Clipe salvo em Vídeos\\Ciranda: {}", name), cx);
+                }
+                Err(e) => {
+                    log::info!("replay not saved: {e}");
+                    overlay::toast(e, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Your share, as drawings name it: your call and your slot in it.
+    pub fn my_share(&self, cx: &App) -> Option<crate::ui::ink::Share> {
+        let call = self.call.as_ref()?.read(cx);
+        Some(crate::ui::ink::Share { place: call.place, mid: call.mid? })
+    }
+
+    /// Wipes every drawing on your share, for everyone.
+    pub fn clear_my_ink(&mut self, cx: &mut Context<Self>) {
+        let Some(share) = self.my_share(cx) else { return };
+        let session = self.session.clone();
+        crate::ui::ink::board(cx).update(cx, |b, cx| b.clear(session, share, true, cx));
+    }
+
+    /// Opens the drawings over your screen while there are some on your share (and the setting
+    /// lets them), closes them when there are none: a window over a game, even an empty one,
+    /// costs it the fast path to the screen.
+    pub fn sync_screen_ink(&mut self, cx: &mut Context<Self>) {
+        use crate::media::screen::SourceKind;
+        use crate::ui::ink::{Shared, board, show_on_screen};
+        // Only the view with the call has a say; leaving the call closes them.
+        if self.call.is_none() {
+            return;
+        }
+        let board = board(cx);
+        let target = self.my_share(cx).filter(|s| prefs(cx).ink_enabled && board.read(cx).any_on(*s)).and_then(|share| {
+            let voice = self.call.as_ref()?.read(cx).voice.clone()?;
+            let choice = voice.read(cx).screen_choice()?;
+            let shared = match choice.source.kind {
+                SourceKind::Screen => Shared::Screen(choice.source.id),
+                SourceKind::Window => Shared::Window(choice.source.id),
+            };
+            Some((share, shared))
+        });
+        cx.defer(move |cx| show_on_screen(target, cx));
     }
 
     /// Right-click on someone in voice: their volume for you, and the admin's tools.

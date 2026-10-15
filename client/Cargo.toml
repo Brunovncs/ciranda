@@ -1,7 +1,7 @@
 [package]
 name = "ciranda"
 description = "Ciranda desktop client: voice, screen sharing and text chat for a group of friends"
-version = "4.3.2"
+version = "4.3.3"
 edition = "2024"
 rust-version = "1.97"
 license = "MIT"
@@ -72,6 +72,7 @@ windows-sys = { version = "0.61", features = [
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Media_Audio",
+    "Win32_Media_MediaFoundation",
     "Win32_Security",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",

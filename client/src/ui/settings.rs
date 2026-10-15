@@ -38,6 +38,7 @@ enum Section {
     Appearance,
     Sounds,
     Hotkeys,
+    InGame,
     Privacy,
     Advanced,
 }
@@ -756,6 +757,9 @@ impl Settings {
         let rows = [
             (HotkeyAction::Mute, "hotkey-mute", tr!("Mute or unmute", "Silenciar ou reativar o microfone")),
             (HotkeyAction::Deafen, "hotkey-deafen", tr!("Deafen or undeafen", "Desativar ou reativar o som")),
+            (HotkeyAction::Overlay, "hotkey-overlay", tr!("Show or hide the overlay", "Mostrar ou esconder a sobreposição")),
+            (HotkeyAction::Replay, "hotkey-replay", tr!("Save a replay of your share", "Salvar um clipe do seu compartilhamento")),
+            (HotkeyAction::Ink, "hotkey-ink", tr!("Clear the drawings on your share", "Limpar os rabiscos na sua tela")),
         ];
         for (action, id, what) in rows {
             let combo = Combo::parse(prefs(cx).hotkey(&server, action));
@@ -816,6 +820,114 @@ impl Settings {
                     "Para dar um atalho a um som do painel, clique nele com o botão direito no painel de sons."
                 ),
                 t.text3,
+            ))
+            .into_any_element()
+    }
+
+    fn in_game_section(&mut self, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let p = prefs(cx).clone();
+        let corners = [
+            ("top-left", tr!("Top left", "Em cima, à esquerda")),
+            ("top-right", tr!("Top right", "Em cima, à direita")),
+            ("bottom-left", tr!("Bottom left", "Embaixo, à esquerda")),
+            ("bottom-right", tr!("Bottom right", "Embaixo, à direita")),
+        ];
+        let corner = corners.iter().find(|c| c.0 == p.overlay_corner).unwrap_or(&corners[0]).1.to_string();
+        let lengths: Vec<(u32, SharedString)> = [15u32, 30, 60].into_iter().map(|s| (s, format!("{s} s").into())).collect();
+        let replay_keys = Combo::parse(p.hotkey("", HotkeyAction::Replay)).map(|c| c.keycaps().join(" + "));
+        let group = |name: &'static str| div().pt(px(6.)).child(label(name, t));
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(14.))
+            .child(group(tr!("Overlay", "Sobreposição")))
+            .child(toggle_row(
+                "overlay",
+                tr!("Show who is in the call over games", "Mostrar quem está na call por cima dos jogos"),
+                tr!(
+                    "A list in a corner of the screen you play on, lit while each person talks. Clicks go through it, and your screen share doesn't show it. Works over games in a window or borderless full screen, not exclusive full screen.",
+                    "Uma lista num canto da tela em que você joga, acesa enquanto cada pessoa fala. Os cliques passam por ela, e seu compartilhamento de tela não a mostra. Funciona com jogos em janela ou em tela cheia sem bordas, não em tela cheia exclusiva."
+                ),
+                p.overlay_enabled,
+                t,
+                cx,
+                |cx| {
+                    set_prefs(cx, |p| p.overlay_enabled = !p.overlay_enabled);
+                    crate::ui::game_overlay::sync(cx);
+                },
+            ))
+            .when(p.overlay_enabled, |d| {
+                d.child(row_field(
+                    tr!("Corner", "Canto"),
+                    div().w(px(260.)).child(select(
+                        "overlay-corner",
+                        corner,
+                        corners.iter().map(|(k, l)| (k.to_string(), l.to_string())).collect(),
+                        t,
+                        cx,
+                        |_, corner, cx| {
+                            set_prefs(cx, |p| p.overlay_corner = corner);
+                            crate::ui::game_overlay::sync(cx);
+                        },
+                    )),
+                ))
+                .child(toggle_row(
+                    "overlay-speaking",
+                    tr!("Only who is talking", "Só quem está falando"),
+                    tr!("The list shows people only while they speak.", "A lista mostra as pessoas só enquanto elas falam."),
+                    p.overlay_only_speaking,
+                    t,
+                    cx,
+                    |cx| {
+                        set_prefs(cx, |p| p.overlay_only_speaking = !p.overlay_only_speaking);
+                        crate::ui::game_overlay::sync(cx);
+                    },
+                ))
+            })
+            .child(group(tr!("Replays", "Clipes")))
+            .child(toggle_row(
+                "replay",
+                tr!("Keep the last seconds of your screen share", "Guardar os últimos segundos do seu compartilhamento"),
+                tr!(
+                    "While you share, what you send is also recorded by the graphics card, a few seconds at a time, the oldest thrown away. A hotkey saves it to Videos\\Ciranda, small enough to send in the chat.",
+                    "Enquanto você compartilha, o que você envia também é gravado pela placa de vídeo, poucos segundos por vez, e o mais antigo é descartado. Um atalho salva em Vídeos\\Ciranda, pequeno o bastante para mandar no chat."
+                ),
+                p.replay_enabled,
+                t,
+                cx,
+                |cx| set_prefs(cx, |p| p.replay_enabled = !p.replay_enabled),
+            ))
+            .when(p.replay_enabled, |d| {
+                d.child(row_field(
+                    tr!("Replay length", "Duração do clipe"),
+                    div().w(px(260.)).child(segmented("replay-length", lengths, p.replay_seconds, t, cx, |_, s, _, cx| {
+                        set_prefs(cx, |p| p.replay_seconds = s)
+                    })),
+                ))
+                .child(caption(
+                    match &replay_keys {
+                        Some(k) => trf!("Save one with {} while you share.", "Salve um com {} enquanto compartilha.", k),
+                        None => tr!(
+                            "Give \"Save a replay\" a hotkey under Hotkeys, or use the button on your share.",
+                            "Dê um atalho a \"Salvar um clipe\" em Atalhos globais, ou use o botão no seu compartilhamento."
+                        )
+                        .to_string(),
+                    },
+                    t.text3,
+                ))
+            })
+            .child(group(tr!("Drawing", "Rabiscos")))
+            .child(toggle_row(
+                "ink",
+                tr!("Show others' drawings over your screen", "Mostrar os rabiscos dos outros na sua tela"),
+                tr!(
+                    "People watching your share can draw on it; you see their strokes over what you share, and they fade after a few seconds. To draw on someone's share, turn on the pen on it.",
+                    "Quem assiste seu compartilhamento pode rabiscar nele; você vê os traços por cima do que compartilha, e eles somem depois de alguns segundos. Para rabiscar na tela de alguém, ligue o lápis nela."
+                ),
+                p.ink_enabled,
+                t,
+                cx,
+                |cx| set_prefs(cx, |p| p.ink_enabled = !p.ink_enabled),
             ))
             .into_any_element()
     }
@@ -1109,6 +1221,7 @@ impl Render for Settings {
             Section::Appearance => self.appearance_section(&t, cx),
             Section::Sounds => self.sounds_section(&t, cx),
             Section::Hotkeys => self.hotkeys_section(&t, cx),
+            Section::InGame => self.in_game_section(&t, cx),
             Section::Privacy => self.privacy_section(&t, cx),
             Section::Advanced => self.advanced_section(&t, cx),
         };
@@ -1119,6 +1232,7 @@ impl Render for Settings {
             Section::Appearance => tr!("Appearance and language", "Aparência e idioma"),
             Section::Sounds => tr!("Sounds", "Sons"),
             Section::Hotkeys => tr!("Hotkeys", "Atalhos globais"),
+            Section::InGame => tr!("Overlay, replays and drawing", "Sobreposição, clipes e rabiscos"),
             Section::Privacy => tr!("Private messages", "Mensagens privadas"),
             Section::Advanced => tr!("Advanced", "Avançado"),
         };
@@ -1147,6 +1261,7 @@ impl Render for Settings {
                     .child(nav("nav-appearance", Some("palette"), tr!("Appearance", "Aparência"), Section::Appearance, self, cx))
                     .child(nav("nav-sounds", Some("music"), tr!("Sounds", "Sons"), Section::Sounds, self, cx))
                     .child(nav("nav-hotkeys", Some("keyboard"), tr!("Hotkeys", "Atalhos globais"), Section::Hotkeys, self, cx))
+                    .child(nav("nav-in-game", Some("layers"), tr!("In game", "Durante o jogo"), Section::InGame, self, cx))
                     .child(nav("nav-privacy", Some("lock"), tr!("Privacy", "Privacidade"), Section::Privacy, self, cx))
                     .child(nav("nav-advanced", Some("settings"), tr!("Advanced", "Avançado"), Section::Advanced, self, cx))
                     .child(div().flex_1())

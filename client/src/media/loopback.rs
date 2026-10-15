@@ -62,6 +62,7 @@ struct Framer {
 
 impl Framer {
     fn push(&mut self, source: &NativeAudioSource, samples: &[i16]) {
+        super::replay::audio(samples);
         self.pending.extend_from_slice(samples);
         let frame = (RATE / 100 * CHANNELS) as usize;
         while self.pending.len() >= frame {

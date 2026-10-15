@@ -66,6 +66,7 @@ pub fn set_prefs(cx: &mut App, f: impl FnOnce(&mut Settings)) {
             return;
         }
         p.redraw = !p.store.values.same_but_levels(&before);
+        follow(&p.store.values);
         if p.redraw {
             p.save(cx);
         } else {
@@ -77,8 +78,14 @@ pub fn set_prefs(cx: &mut App, f: impl FnOnce(&mut Settings)) {
     });
 }
 
+/// What runs outside the window and reads the settings only when told.
+fn follow(s: &Settings) {
+    crate::media::replay::configure(s.replay_enabled, s.replay_seconds);
+}
+
 /// Writes a level still settling before Ciranda quits.
 pub fn init(cx: &mut App) {
+    follow(prefs(cx));
     cx.on_app_quit(|cx| {
         let p = cx.global_mut::<Prefs>();
         if p.pending.take().is_some() {

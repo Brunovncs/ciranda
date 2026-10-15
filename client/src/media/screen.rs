@@ -352,6 +352,7 @@ impl ScreenCapture {
         let (tx, rx) = mpsc::channel();
         let (src, prev, st, c) = (source.clone(), preview.clone(), stop.clone(), choice.clone());
         std::thread::Builder::new().name("ciranda-screen".into()).spawn(move || run(c, rx, src, prev, st)).ok();
+        super::replay::sharing(true);
         let sound = loopback_for(&choice).map(Loopback::start);
         let sound_source = sound.as_ref().map(|l| l.source.clone());
         ScreenCapture {
@@ -376,7 +377,9 @@ impl ScreenCapture {
     }
 
     pub fn stop(&self) {
-        self.stop.store(true, Ordering::Relaxed);
+        if !self.stop.swap(true, Ordering::Relaxed) {
+            super::replay::sharing(false);
+        }
         *self.sound.lock() = None;
     }
 }
@@ -458,6 +461,9 @@ fn run(
             c.capture_frame();
             let mut st = staging.lock();
             if let Some(buffer) = st.frame.take() {
+                if super::replay::recording() {
+                    keep_for_replay(&buffer, choice.fps);
+                }
                 let mut vf = VideoFrame::new(VideoRotation::VideoRotation0, buffer);
                 vf.timestamp_us = started.elapsed().as_micros() as i64;
                 source.capture_frame(&vf);
@@ -470,6 +476,58 @@ fn run(
             if let Some(rest) = frame.checked_sub(tick.elapsed()) {
                 std::thread::sleep(rest);
             }
+        }
+    }
+}
+
+/// A copy of the frame sent, as packed NV12 no taller than the replay keeps, for the replay.
+fn keep_for_replay(frame: &EncoderFrame, fps: u32) {
+    let max = super::replay::MAX_HEIGHT;
+    let (fw, fh) = { let b = frame.as_ref(); (b.width(), b.height()) };
+    let scaled;
+    let frame = if fh > max {
+        let w = ((fw as u64 * max as u64 / fh as u64) as u32) & !1;
+        let mut out = I420Buffer::new(w, max);
+        match frame {
+            EncoderFrame::I420(b) => yuv::scale(b, &mut out),
+            EncoderFrame::Nv12(b) => {
+                let mut full = I420Buffer::new(fw, fh);
+                let (sy, suv) = b.strides();
+                let (y, uv) = b.data();
+                let (dy, du, dv) = full.strides();
+                let (oy, ou, ov) = full.data_mut();
+                yuv_helper::nv12_to_i420(y, sy, uv, suv, oy, dy, ou, du, ov, dv, fw as i32, fh as i32);
+                yuv::scale(&full, &mut out);
+            }
+        }
+        scaled = EncoderFrame::I420(out);
+        &scaled
+    } else {
+        frame
+    };
+    match frame {
+        EncoderFrame::I420(b) => {
+            let (w, h) = (b.width(), b.height());
+            let (sy, su, sv) = b.strides();
+            let (y, u, v) = b.data();
+            super::replay::video(w, h, fps, |out| {
+                let (oy, ouv) = out.split_at_mut((w * h) as usize);
+                yuv_helper::i420_to_nv12(y, sy, u, su, v, sv, oy, w, ouv, w, w as i32, h as i32);
+            });
+        }
+        EncoderFrame::Nv12(b) => {
+            let (w, h) = (b.width(), b.height());
+            let (sy, suv) = b.strides();
+            let (y, uv) = b.data();
+            super::replay::video(w, h, fps, |out| {
+                let (oy, ouv) = out.split_at_mut((w * h) as usize);
+                for r in 0..h as usize {
+                    oy[r * w as usize..][..w as usize].copy_from_slice(&y[r * sy as usize..][..w as usize]);
+                }
+                for r in 0..(h / 2) as usize {
+                    ouv[r * w as usize..][..w as usize].copy_from_slice(&uv[r * suv as usize..][..w as usize]);
+                }
+            });
         }
     }
 }

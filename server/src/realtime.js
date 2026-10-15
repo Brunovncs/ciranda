@@ -37,12 +37,20 @@ export const POLL_REACH_MS = 40_000;
  */
 const PRIVATE_TYPES = new Set([
   'call:start', 'call:answer', 'call:hang-up', 'call:join',
-  'voice:leave', 'voice:mute', 'voice:publishing', 'voice:refresh',
+  'voice:leave', 'voice:mute', 'voice:publishing', 'voice:refresh', 'ink',
 ]);
+
+/** The most ink messages one person may send in a second: a stroke goes out in ~25 a second. */
+export const INK_PER_SECOND = 60;
+/** Coordinates are in ten-thousandths of the shared picture, so a stroke fits in small integers. */
+const INK_SCALE = 10_000;
+const INK_MAX_POINTS = 512;
 
 export class Realtime {
   #wss;
   #deps;
+  /** Ink sent per person in the current second: { at, count }. */
+  #inkRate = new Map();
   /**
    * `scope` is `full` for the server on screen, or `private` for one a client
    * keeps in the background: that one hears only what is sent to its user
@@ -325,6 +333,7 @@ export class Realtime {
       'call:hang-up': this.#callHangUp,
       'call:join': this.#callJoin,
       'soundpad:play': this.#soundpadPlay,
+      ink: this.#ink,
       'admin:force-mute': this.#adminForceMute,
       'admin:move': this.#adminMove,
     };
@@ -549,6 +558,61 @@ export class Realtime {
         name: clip.name,
         by: user.nickname,
       });
+    }
+    return { type: 'voice:ok' };
+  }
+
+  // ------------------------------------------------------------- ink
+
+  /**
+   * Drawing on someone's screen share: a piece of a stroke, passed on to the
+   * rest of the room and kept nowhere. `mid` is the sharer's slot; `points`
+   * are x, y pairs in ten-thousandths of the picture; `clear` wipes strokes
+   * (the sharer's clear wipes everyone's, anyone else's only their own --
+   * the clients apply that, since nothing is stored here).
+   */
+  #ink(user, msg) {
+    const place = this.#place(msg);
+    const found = place.rooms.find(place.id, user.id);
+    if (!found) return { type: 'voice:error', error: 'not_in_channel' };
+    const mid = Number(msg.mid);
+    const target = place.rooms.slot(place.id, mid);
+    if (!target || !target.publishing.has('s')) return { type: 'voice:error', error: 'not_sharing' };
+
+    const points = Array.isArray(msg.points) ? msg.points : [];
+    const id = Number(msg.id);
+    const color = String(msg.color ?? '');
+    if (
+      points.length % 2 !== 0
+      || points.length > INK_MAX_POINTS * 2
+      || !points.every((p) => Number.isInteger(p) && p >= 0 && p <= INK_SCALE)
+      || !Number.isInteger(id) || id < 0 || id > 0x7fffffff
+      || !/^#[0-9a-f]{6}$/i.test(color)
+    ) {
+      return { type: 'voice:error', error: 'bad_ink' };
+    }
+
+    const now = Date.now();
+    const bucket = this.#inkRate.get(user.id);
+    if (bucket && now - bucket.at < 1000) {
+      if (++bucket.count > INK_PER_SECOND) return { type: 'voice:error', error: 'too_fast' };
+    } else {
+      this.#inkRate.set(user.id, { at: now, count: 1 });
+    }
+
+    const payload = {
+      type: 'ink',
+      ...place.echo,
+      mid,
+      by: user.id,
+      id,
+      color,
+      points,
+      end: Boolean(msg.end),
+      clear: Boolean(msg.clear),
+    };
+    for (const member of place.rooms.roster(place.id)) {
+      if (member.userId !== user.id) this.toUser(member.userId, payload);
     }
     return { type: 'voice:ok' };
   }

@@ -260,7 +260,7 @@ app.get('/api/health', (req, res) => {
     authenticated: authed,
     // `inbox`: GET /api/inbox and `scope: 'private'` sockets, so a client can
     // keep this server's private messages in the background cheaply.
-    features: ['inbox', 'replies', 'edit-history'],
+    features: ['inbox', 'replies', 'edit-history', 'ink'],
     ...(authed
       ? {
           name: serverSettings.name,

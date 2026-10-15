@@ -47,8 +47,8 @@ pub struct Settings {
     pub mention_sound: bool,
     /// Every cue's volume, as a percentage: 100 is as designed, up to 200 for a noisy room.
     pub sound_volume: u32,
-    /// Global hotkeys by action (`mute`, `deafen`), as Electron accelerators (`Ctrl+Shift+M`);
-    /// empty is unbound.
+    /// Global hotkeys by action (`mute`, `deafen`, `overlay`, `replay`, `ink`), as Electron
+    /// accelerators (`Ctrl+Shift+M`); empty is unbound.
     pub hotkeys: BTreeMap<String, String>,
     /// Soundboard hotkeys by server address, then by clip id: a clip id only means something on
     /// the server that gave it.
@@ -94,6 +94,20 @@ pub struct Settings {
     /// "app" or "off".
     pub share_kind: String,
     pub share_sound: String,
+    /// The in-game overlay: who is in your call, over whatever has the screen. Off until turned on.
+    pub overlay_enabled: bool,
+    /// Its corner of the screen: "top-left", "top-right", "bottom-left" or "bottom-right".
+    pub overlay_corner: String,
+    /// Only who is talking is listed, not the whole call.
+    pub overlay_only_speaking: bool,
+    /// While you share your screen, its last seconds are kept, to be saved as a video with a
+    /// hotkey. On: the graphics card does the encoding, and it costs the share about a tenth of
+    /// a core.
+    pub replay_enabled: bool,
+    /// How many seconds a saved replay holds.
+    pub replay_seconds: u32,
+    /// Others watching your screen can draw on it, and you see their drawings over your screen.
+    pub ink_enabled: bool,
 }
 
 /// The window's place on the screens, in logical pixels: its size and position when not
@@ -365,6 +379,9 @@ impl Settings {
         match action {
             HotkeyAction::Mute => self.hotkeys.get("mute"),
             HotkeyAction::Deafen => self.hotkeys.get("deafen"),
+            HotkeyAction::Overlay => self.hotkeys.get("overlay"),
+            HotkeyAction::Replay => self.hotkeys.get("replay"),
+            HotkeyAction::Ink => self.hotkeys.get("ink"),
             HotkeyAction::Clip(id) => self.server_clip_hotkeys(server).and_then(|m| m.get(&id.to_string())),
         }
         .map_or("", String::as_str)
@@ -455,6 +472,9 @@ impl Settings {
         let (name, clip) = match action {
             HotkeyAction::Mute => ("mute", String::new()),
             HotkeyAction::Deafen => ("deafen", String::new()),
+            HotkeyAction::Overlay => ("overlay", String::new()),
+            HotkeyAction::Replay => ("replay", String::new()),
+            HotkeyAction::Ink => ("ink", String::new()),
             HotkeyAction::Clip(id) => ("", id.to_string()),
         };
         for (k, v) in self.hotkeys.iter_mut() {
@@ -483,6 +503,12 @@ impl Settings {
 pub enum HotkeyAction {
     Mute,
     Deafen,
+    /// Shows or hides the in-game overlay.
+    Overlay,
+    /// Saves the last seconds of your screen share as a video.
+    Replay,
+    /// Clears the drawings on your screen share.
+    Ink,
     /// Plays a soundboard clip, by id, on the server it belongs to.
     Clip(i64),
 }
@@ -569,6 +595,12 @@ impl Default for Settings {
             folded_groups: BTreeMap::new(),
             share_kind: "screen".into(),
             share_sound: "system".into(),
+            overlay_enabled: false,
+            overlay_corner: "top-left".into(),
+            overlay_only_speaking: false,
+            replay_enabled: true,
+            replay_seconds: 30,
+            ink_enabled: true,
         }
     }
 }

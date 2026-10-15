@@ -86,7 +86,8 @@ pub fn sync(cx: &mut App) {
     let server = cx.global::<Hotkeys>().server.clone();
     let base = server.as_ref().map(|s| s.0.as_str()).unwrap_or("");
     let mut wanted: Vec<(HotkeyAction, Combo)> =
-        [HotkeyAction::Mute, HotkeyAction::Deafen].into_iter().filter_map(|a| Some((a, Combo::parse(p.hotkey(base, a))?))).collect();
+        [HotkeyAction::Mute, HotkeyAction::Deafen, HotkeyAction::Overlay, HotkeyAction::Replay, HotkeyAction::Ink]
+            .into_iter().filter_map(|a| Some((a, Combo::parse(p.hotkey(base, a))?))).collect();
     // Clips that still exist only: a deleted one's binding stays in the file but holds no key.
     if let Some((base, clips)) = &server
         && let Some(bound) = p.server_clip_hotkeys(base)
