@@ -3,6 +3,7 @@
 
 pub mod camera;
 pub mod connect;
+mod elsewhere;
 pub mod hotkeys;
 pub mod overlay;
 mod rail;
@@ -12,7 +13,7 @@ pub mod tray;
 pub mod updates;
 
 use crate::prefs::prefs;
-use crate::session::{Session, SessionEvent};
+use crate::session::{Link, Session, SessionEvent};
 use crate::theme::{self, CustomColors, FONT, Theme, px, radius};
 use crate::widgets::*;
 use connect::{ConnectEvent, ConnectView, Connected};
@@ -22,10 +23,16 @@ use gpui::{
     Render, RenderImage, SharedString, Styled, Subscription, Window, div,
 };
 use overlay::{Overlay, Toast};
-use server::ServerView;
+use server::{ServerView, Then};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// How often the background servers are matched against the rail again, so one that could not be
+/// reached at first is tried again.
+const SYNC_EVERY_TICKS: u32 = 23;
+/// The ring's beat, as the server view rings it.
+const RING_TICK: Duration = Duration::from_millis(2600);
 
 enum Screen {
     Connect { view: Entity<ConnectView> },
@@ -43,6 +50,16 @@ pub struct Root {
     screen_subs: Vec<Subscription>,
     /// The rail's server pictures by hash; `None` while one loads or when it would not.
     rail_icons: HashMap<String, Option<Arc<RenderImage>>>,
+    /// What each background session is listened to with, by its entity.
+    away_subs: HashMap<gpui::EntityId, Vec<Subscription>>,
+    /// A call ringing from a server in the background, and its dialog.
+    away_ringing: Option<(gpui::EntityId, Entity<server::private::Incoming>)>,
+    /// When a background message last made a sound.
+    away_cue_at: Option<std::time::Instant>,
+    /// Where `go_to` is going (server, username) and what to do once there.
+    pending: Option<(String, String, Then)>,
+    /// What to do on the server on screen once its socket is up.
+    then: Option<Then>,
 }
 
 impl Focusable for Root {
@@ -97,6 +114,30 @@ impl Root {
             crate::prefs::set_prefs(cx, |s| s.window = Some(place));
         }));
         let view =cx.new(|cx| ConnectView::new(None, window, cx));
+        // The ring of a call from a server in the background, and every minute or so, the
+        // background servers matched against the rail again.
+        let handle = window.window_handle();
+        cx.spawn(async move |this, cx| {
+            let mut tick = 0u32;
+            loop {
+                cx.background_executor().timer(RING_TICK).await;
+                tick += 1;
+                let sync = tick % SYNC_EVERY_TICKS == 0;
+                let Ok(()) = handle.update(cx, |_, window, cx| {
+                    let _ = this.update(cx, |root: &mut Root, cx| {
+                        if root.away_ringing.is_some() {
+                            crate::media::audio::cue(crate::media::audio::Cue::Ring, crate::media::voice::cue_volume(cx).max(0.6));
+                        }
+                        if sync && matches!(root.screen, Screen::Server(_)) {
+                            root.sync_elsewhere(window, cx);
+                        }
+                    });
+                }) else {
+                    break;
+                };
+            }
+        })
+        .detach();
         let mut root = Root {
             focus: cx.focus_handle(),
             screen: Screen::Connect { view: view.clone() },
@@ -106,6 +147,11 @@ impl Root {
             _subs: subs,
             screen_subs: Vec::new(),
             rail_icons: HashMap::new(),
+            away_subs: HashMap::new(),
+            away_ringing: None,
+            away_cue_at: None,
+            pending: None,
+            then: None,
         };
         root.subscribe_connect(&view, window, cx);
         root
@@ -270,6 +316,11 @@ impl Root {
         if let Screen::Server(v) = &self.screen {
             v.update(cx, |v, cx| v.shutdown(cx));
         }
+        crate::elsewhere::elsewhere_mut(cx).home = None;
+        self.then = None;
+        // The overlay goes with the screen, the ringing dialog with it; `resume_rings` brings it
+        // back once the next server is up.
+        self.away_ringing = None;
         self.screen_subs.clear();
         let view = cx.new(|cx| ConnectView::new(error, window, cx));
         self.subscribe_connect(&view, window, cx);
@@ -285,25 +336,54 @@ impl Root {
         self.screen_subs.push(sub);
     }
 
-    /// Starts the session a sign-in handed over, in place of whatever was open.
+    /// Starts the session a sign-in handed over, in place of whatever was open. A server that was
+    /// kept in the background goes on with the session it had, so a call ringing there still rings.
     fn enter(&mut self, done: &Connected, window: &mut Window, cx: &mut Context<Self>) {
         if let Screen::Server(v) = &self.screen {
             v.update(cx, |v, cx| v.shutdown(cx));
         }
-        let session = Session::start(
-            done.api.clone(),
-            done.cache.clone(),
-            done.me.clone(),
-            done.server_name.clone(),
-            done.server_icon.clone(),
-            done.ice_servers.clone(),
-            cx,
-        );
+        let (base, nickname) = (done.api.base(), done.me.nickname.clone());
+        let session = match self.take_away(&base, &nickname, cx) {
+            Some(session) => {
+                session.update(cx, |s, cx| {
+                    s.api.set_token(&done.api.token());
+                    s.promote(done.me.clone(), done.ice_servers.clone(), cx);
+                });
+                session
+            }
+            None => Session::start(
+                done.api.clone(),
+                done.cache.clone(),
+                done.me.clone(),
+                done.server_name.clone(),
+                done.server_icon.clone(),
+                done.ice_servers.clone(),
+                cx,
+            ),
+        };
+        self.then = match self.pending.take() {
+            Some((url, user, then)) if user == nickname && crate::core::settings::same_server(&url, &base) => Some(then),
+            _ => None,
+        };
         self.open_server(session, window, cx);
+        self.sync_elsewhere(window, cx);
+        self.resume_rings(window, cx);
     }
 
     fn open_server(&mut self, session: Entity<Session>, window: &mut Window, cx: &mut Context<Self>) {
         self.screen_subs.clear();
+        crate::elsewhere::elsewhere_mut(cx).home = Some(session.clone());
+        // What `go_to` came here to do, once the socket is up.
+        self.screen_subs.push(cx.observe_in(&session, window, |this, session, window, cx| {
+            if session.read(cx).link != Link::Up {
+                return;
+            }
+            // After this update: what it does may toast or open a dialog, which go through the root.
+            if let (Some(then), Screen::Server(v)) = (this.then.take(), &this.screen) {
+                let v = v.clone();
+                window.defer(cx, move |window, cx| v.update(cx, |v, cx| v.carry_out(then, window, cx)));
+            }
+        }));
         let sub = cx.subscribe_in(&session, window, |this, _, ev: &SessionEvent, window, cx| match ev {
             SessionEvent::SignedOut(why) => {
                 crate::prefs::set_prefs(cx, |s| s.session_token.clear());

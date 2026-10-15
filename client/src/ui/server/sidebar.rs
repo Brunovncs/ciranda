@@ -17,14 +17,13 @@ use gpui::{
 
 impl ServerView {
     pub fn render_sidebar(&mut self, t: &Theme, window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
+        if self.dms_open {
+            return self.render_dm_home(t, window, cx);
+        }
         let admin = self.session.read(cx).me.role.is_admin();
         let layout: Vec<(Option<Group>, Vec<Channel>)> =
             self.session.read(cx).layout().into_iter().map(|(g, cs)| (g.cloned(), cs.into_iter().cloned().collect())).collect();
         let mut list = div().id("channels").flex().flex_col().gap(px(1.)).px(px(8.)).pb(px(8.)).flex_1().min_h(px(0.)).overflow_y_scroll();
-        // Your conversations first, then the server's channels, scrolling as one list.
-        if let Some(dms) = self.render_dms(t, window, cx) {
-            list = list.child(dms);
-        }
         let empty = self.session.read(cx).channels.is_empty();
         list = list
             .child(
@@ -133,126 +132,181 @@ impl ServerView {
         div().flex().flex_col().size_full().pt(px(6.)).child(list)
     }
 
-    /// Private conversations, above the channels: the people you talk to, newest first, with
-    /// what is unread and who is calling. Folds like a group. Says plainly when this computer
-    /// can't open them yet, and nags gently until the recovery key is kept somewhere.
-    fn render_dms(&mut self, t: &Theme, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// The rail's "Direct messages": every server's conversations in one list, newest first, each
+    /// saying which server it is on, with what is unread and who is calling. Says plainly when this
+    /// computer can't open a server's yet, and nags gently until its recovery key is kept somewhere.
+    fn render_dm_home(&mut self, t: &Theme, window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
+        let row = |d: &crate::session::Dm, s: &Session, from: Option<Entity<Session>>| DmRow {
+            from,
+            id: d.info.id,
+            peer: d.peer,
+            preview: d.preview.clone(),
+            unread: d.info.unread,
+            in_call: s.calls.contains_key(&d.info.id),
+            last_at: d.info.last_at,
+        };
         let s = self.session.read(cx);
-        let state = s.vault.state.clone();
-        if matches!(state, KeyState::Unsupported) {
-            return None;
+        let mut dms: Vec<DmRow> = s.dm_list().into_iter().map(|d| row(d, s, None)).collect();
+        let away: Vec<Entity<Session>> =
+            crate::elsewhere::elsewhere(cx).map(|e| e.away.iter().map(|a| a.session.clone()).collect()).unwrap_or_default();
+        for other in &away {
+            let o = other.read(cx);
+            if o.vault.ready() {
+                dms.extend(o.dm_list().into_iter().map(|d| row(d, o, Some(other.clone()))));
+            }
         }
-        let folded = self.folded.contains(&DMS_FOLD);
-        let unread = s.dm_unread();
-        let needs_backup = s.vault.needs_backup();
-        let dms: Vec<(ConversationId, UserId, String, u32, bool)> = s
-            .dm_list()
-            .into_iter()
-            .map(|d| (d.info.id, d.peer, d.preview.clone(), d.info.unread, s.calls.contains_key(&d.info.id)))
-            .collect();
-        let mut col = div().flex().flex_col().gap(px(1.)).pb(px(6.)).child(
+        dms.sort_by_key(|r| std::cmp::Reverse(r.last_at));
+        let can_start = s.vault.ready();
+        let new_tip = trf!("New private conversation on {}", "Nova conversa privada em {}", s.server_name);
+        let mut col = div().id("dms").flex().flex_col().gap(px(1.)).px(px(8.)).pb(px(8.)).flex_1().min_h(px(0.)).overflow_y_scroll().child(
             div()
-                .id("dms-head")
                 .flex()
                 .items_center()
                 .gap(px(4.))
                 .pt(px(6.))
                 .pb(px(4.))
                 .px(px(4.))
-                .cursor_pointer()
-                .child(icon(if folded { "chevron-right" } else { "chevron-down" }, 12., t.text3))
-                .child(label(tr!("Direct messages", "Mensagens diretas"), t))
+                .child(label(tr!("Conversations", "Conversas"), t))
                 .child(div().flex_1())
-                .when(folded && unread > 0, |d| d.child(badge_text(unread_count(unread), t.on_accent, t.accent)))
-                .child(
-                    icon_button("new-dm", "plus", t)
-                        .size(px(22.))
-                        .tooltip(tip(tr!("New private conversation", "Nova conversa privada"), t))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            cx.stop_propagation();
+                .when(can_start, |d| {
+                    d.child(icon_button("new-dm", "plus", t).size(px(22.)).tooltip(tip(new_tip, t)).on_click(cx.listener(
+                        |this, _, window, cx| {
                             let view = cx.entity().downgrade();
                             super::private::pick_person(&this.session, window, cx, move |user, window, cx| {
                                 if let Some(view) = view.upgrade() {
                                     view.update(cx, |v, cx| v.message_user(user, window, cx));
                                 }
                             });
-                        })),
-                )
-                .on_click(cx.listener(|this, _, _, cx| this.toggle_fold(DMS_FOLD, cx))),
+                        },
+                    )))
+                }),
         );
-        if folded {
-            return Some(col.into_any_element());
+        // Each server keeps its own keys. One card per thing to do, with a button per server that
+        // needs it, rather than a card per server.
+        let several = !away.is_empty();
+        let (mut locked, mut backup, mut failed) = (Vec::new(), Vec::new(), Vec::new());
+        for session in std::iter::once(self.session.clone()).chain(away.iter().cloned()) {
+            let s = session.read(cx);
+            let name = s.server_name.clone();
+            match s.vault.state {
+                KeyState::Locked => locked.push((name, session.clone())),
+                KeyState::Failed(_) => failed.push(name),
+                _ if s.vault.needs_backup() => backup.push((name, session.clone())),
+                _ => {}
+            }
         }
-        let session = self.session.clone();
-        match state {
-            KeyState::Locked => {
-                col = col.child(key_card(
-                    "lock",
-                    tr!(
-                        "Your private messages are locked on this computer. Unlock them with your recovery key.",
-                        "Suas mensagens privadas estão trancadas neste computador. Desbloqueie com a sua chave de recuperação."
-                    ),
-                    tr!("Unlock", "Desbloquear"),
-                    t,
-                    move |window, cx| super::private::unlock(&session, window, cx),
-                ));
-            }
-            KeyState::Failed(_) => {
-                col = col.child(div().px(px(8.)).py(px(4.)).child(caption(
-                    tr!("Private messages aren't available right now.", "As mensagens privadas não estão disponíveis agora."),
-                    t.text3,
-                )));
-            }
-            _ if needs_backup => {
-                col = col.child(key_card(
-                    "key",
-                    tr!(
-                        "Keep your recovery key: it's how you read your private messages on another computer.",
-                        "Guarde sua chave de recuperação: é com ela que você lê suas mensagens privadas em outro computador."
-                    ),
-                    tr!("Show key", "Ver chave"),
-                    t,
-                    move |window, cx| super::private::backup(&session, window, cx),
-                ));
-            }
-            _ => {}
+        if !locked.is_empty() {
+            let text = tr!(
+                "Your private messages are locked on this computer. Unlock them with your recovery key.",
+                "Suas mensagens privadas estão trancadas neste computador. Desbloqueie com a sua chave de recuperação."
+            );
+            let actions: Vec<KeyAction> = locked
+                .into_iter()
+                .map(|(name, session)| {
+                    let label = if several { name } else { tr!("Unlock", "Desbloquear").into() };
+                    KeyAction::new(label, move |window, cx| super::private::unlock(&session, window, cx))
+                })
+                .collect();
+            col = col.child(key_card("lock", text, actions, t));
         }
-        if dms.is_empty() && self.session.read(cx).vault.ready() {
-            col = col.child(div().px(px(8.)).py(px(4.)).child(caption(
+        if !backup.is_empty() {
+            let text = if several {
                 tr!(
-                    "Talk to someone in private: press + or right-click a member.",
-                    "Converse com alguém no privado: clique no + ou com o botão direito em um membro."
+                    "Keep your recovery keys: they're how you read your private messages on another computer. Each server has its own.",
+                    "Guarde suas chaves de recuperação: é com elas que você lê suas mensagens privadas em outro computador. Cada servidor tem a sua."
+                )
+            } else {
+                tr!(
+                    "Keep your recovery key: it's how you read your private messages on another computer.",
+                    "Guarde sua chave de recuperação: é com ela que você lê suas mensagens privadas em outro computador."
+                )
+            };
+            let actions: Vec<KeyAction> = backup
+                .into_iter()
+                .map(|(name, session)| {
+                    let label = if several { name } else { tr!("Show key", "Ver chave").into() };
+                    KeyAction::new(label, move |window, cx| super::private::backup(&session, window, cx))
+                })
+                .collect();
+            col = col.child(key_card("key", text, actions, t));
+        }
+        if !failed.is_empty() {
+            col = col.child(div().px(px(8.)).py(px(4.)).child(caption(
+                trf!(
+                    "Private messages on {} aren't available right now.",
+                    "As mensagens privadas em {} não estão disponíveis agora.",
+                    failed.join(", ")
                 ),
                 t.text3,
             )));
         }
-        for (id, peer, preview, unread, in_call) in dms {
-            col = col.child(self.dm_row(id, peer, preview, unread, in_call, t, window, cx));
+        if dms.is_empty() {
+            col = col.child(div().px(px(8.)).py(px(4.)).child(caption(
+                tr!(
+                    "Talk to someone in private: press + or right-click a member of a server.",
+                    "Converse com alguém no privado: clique no + ou com o botão direito em um membro de um servidor."
+                ),
+                t.text3,
+            )));
         }
-        Some(col.into_any_element())
+        for r in dms {
+            col = col.child(self.dm_row(r, several, t, window, cx));
+        }
+        div().flex().flex_col().size_full().pt(px(6.)).child(col)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn dm_row(
-        &mut self,
-        id: ConversationId,
-        peer: UserId,
-        preview: String,
-        unread: u32,
-        in_call: bool,
-        t: &Theme,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let img = self.session.update(cx, |s, cx| s.avatar(peer, cx));
-        let s = self.session.read(cx);
+    /// One conversation; `several`: other servers are kept too, so every row says where it is.
+    fn dm_row(&mut self, r: DmRow, several: bool, t: &Theme, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let DmRow { from, id, peer, preview, unread, in_call, .. } = r;
+        let session = from.clone().unwrap_or_else(|| self.session.clone());
+        let img = session.update(cx, |s, cx| s.avatar(peer, cx));
+        let server_picture = from.as_ref().and_then(|f| f.update(cx, |s, cx| s.server_picture(cx)));
+        let s = session.read(cx);
         let name = s.display_name(Some(peer), None);
-        let online = s.online.contains(&peer);
-        let open = self.center == Center::Chat(Room::Dm(id));
+        // Who is online is known only on the server on screen; one in the background shows its own
+        // picture there instead.
+        let online = from.is_none().then(|| s.online.contains(&peer));
+        let server = several.then(|| s.server_name.clone());
+        let (center, row_id) = match &from {
+            None => (Center::Chat(Room::Dm(id)), gpui::ElementId::from(("dm", id as u64))),
+            Some(f) => (Center::Away(f.entity_id(), id), gpui::ElementId::from(SharedString::from(format!("dm-{}-{id}", f.entity_id())))),
+        };
+        let open = self.center == center;
+        let preview = match &server {
+            Some(server) if preview.is_empty() => server.clone(),
+            Some(server) => format!("{server} · {preview}"),
+            None => preview,
+        };
         let fg = if open || unread > 0 { t.text } else { t.text2 };
         let hover = t.layer_hover;
+        let corner = match (online, server_picture) {
+            (Some(online), _) => Some(
+                div()
+                    .absolute()
+                    .right(px(-2.))
+                    .bottom(px(-2.))
+                    .size(px(10.))
+                    .rounded_full()
+                    .border_2()
+                    .border_color(t.pane)
+                    .bg(if online { t.success } else { t.text3 }),
+            ),
+            (None, Some(picture)) => Some(
+                div()
+                    .absolute()
+                    .right(px(-4.))
+                    .bottom(px(-4.))
+                    .size(px(14.))
+                    .rounded(px(4.))
+                    .border_1()
+                    .border_color(t.pane)
+                    .overflow_hidden()
+                    .child(gpui::img(picture).size_full()),
+            ),
+            (None, None) => None,
+        };
         div()
-            .id(("dm", id as u64))
+            .id(row_id)
             .relative()
             .flex()
             .items_center()
@@ -264,17 +318,7 @@ impl ServerView {
             .when(open, |d| d.bg(t.layer_hover))
             .when(!open, |d| d.hover(move |s| s.bg(hover)))
             .when(open, |d| d.child(div().absolute().left(px(-8.)).top(px(12.)).w(px(3.)).h(px(16.)).rounded(px(2.)).bg(t.accent)))
-            .child(div().relative().flex_none().child(avatar(&name, img, 26., None)).child(
-                div()
-                    .absolute()
-                    .right(px(-2.))
-                    .bottom(px(-2.))
-                    .size(px(10.))
-                    .rounded_full()
-                    .border_2()
-                    .border_color(t.pane)
-                    .bg(if online { t.success } else { t.text3 }),
-            ))
+            .child(div().relative().flex_none().child(avatar(&name, img, 26., None)).children(corner))
             .child(
                 div()
                     .flex()
@@ -295,7 +339,10 @@ impl ServerView {
             )
             .when(in_call, |d| d.child(icon("phone", 13., t.success)))
             .when(unread > 0 && !open, |d| d.child(badge_text(unread_count(unread), t.on_accent, t.accent)))
-            .on_click(cx.listener(move |this, _, window, cx| this.open_room(Room::Dm(id), window, cx)))
+            .on_click(cx.listener(move |this, _, window, cx| match &from {
+                None => this.open_room(Room::Dm(id), window, cx),
+                Some(f) => this.open_away(f.clone(), id, window, cx),
+            }))
             .into_any_element()
     }
 
@@ -310,6 +357,7 @@ impl ServerView {
         let in_call = self.call_channel(cx) == Some(c.id);
         let open = match self.center {
             Center::Chat(room) => room == Room::Channel(c.id),
+            Center::Away(..) | Center::Inbox => false,
             Center::Stage => in_call,
         };
         let mentions = s.mentioned.get(&c.id).copied().unwrap_or(0);
@@ -788,22 +836,34 @@ impl ServerView {
     }
 }
 
-/// The fold key of the private conversations' section; channel groups use their (positive) ids.
-const DMS_FOLD: i64 = -1;
-
 /// "3", or "99+".
 fn unread_count(n: u32) -> String {
     if n > 99 { "99+".into() } else { n.to_string() }
 }
 
-/// A small card in the sidebar about your private-message key, with the one thing to do about it.
-fn key_card(
-    glyph: &'static str,
-    text: &'static str,
-    action: &'static str,
-    t: &Theme,
-    on: impl Fn(&mut Window, &mut App) + 'static,
-) -> gpui::Div {
+/// One button of a key card: what it says, and what it does.
+struct KeyAction {
+    label: String,
+    on: std::rc::Rc<dyn Fn(&mut Window, &mut App)>,
+}
+
+impl KeyAction {
+    fn new(label: String, on: impl Fn(&mut Window, &mut App) + 'static) -> KeyAction {
+        KeyAction { label, on: std::rc::Rc::new(on) }
+    }
+}
+
+/// A small card in the sidebar about your private-message keys, with the thing to do about them:
+/// one wide button, or one per server, named after it.
+fn key_card(glyph: &'static str, text: &'static str, actions: Vec<KeyAction>, t: &Theme) -> gpui::Div {
+    let one = actions.len() == 1;
+    let buttons = actions.into_iter().enumerate().map(|(i, a)| {
+        let on = a.on.clone();
+        let kind = if one { Kind::Primary } else { Kind::Standard };
+        button(SharedString::from(format!("key-card-{glyph}-{i}")), a.label, kind, t)
+            .when(!one, |b| b.h(px(28.)).px(px(10.)).text_size(px(12.5)))
+            .on_click(move |_, window, cx| on(window, cx))
+    });
     div()
         .flex()
         .flex_col()
@@ -816,7 +876,7 @@ fn key_card(
         .border_1()
         .border_color(t.accent.opacity(0.35))
         .child(div().flex().gap(px(8.)).child(icon(glyph, 15., t.accent)).child(div().flex_1().min_w(px(0.)).child(caption(text, t.text))))
-        .child(button(SharedString::from(format!("key-card-{glyph}")), action, Kind::Primary, t).on_click(move |_, window, cx| on(window, cx)))
+        .map(|d| if one { d.children(buttons) } else { d.child(div().flex().flex_wrap().gap(px(6.)).children(buttons)) })
 }
 
 /// New messages you have not seen: the accent pill of the channel you are in, small.
@@ -850,6 +910,17 @@ pub fn badge_text(s: impl Into<gpui::SharedString>, fg: gpui::Hsla, bg: gpui::Hs
 /// whatever the palette, so it takes a red light enough to read there.
 pub fn live_chip(t: &Theme, over_video: bool) -> gpui::Div {
     chip(tr!("Live", "Ao vivo"), if over_video { gpui::rgb(0xff6b78).into() } else { t.critical })
+}
+
+/// A conversation in the list: on the server on screen (`from: None`), or on one in the background.
+struct DmRow {
+    from: Option<Entity<Session>>,
+    id: ConversationId,
+    peer: UserId,
+    preview: String,
+    unread: u32,
+    in_call: bool,
+    last_at: i64,
 }
 
 // A simple menu of actions.

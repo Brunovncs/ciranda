@@ -258,6 +258,9 @@ app.get('/api/health', (req, res) => {
     mediamtx: monitor.reachable ? 'up' : 'down',
     passwordRequired: serverSettings.passwordRequired,
     authenticated: authed,
+    // `inbox`: GET /api/inbox and `scope: 'private'` sockets, so a client can
+    // keep this server's private messages in the background cheaply.
+    features: ['inbox'],
     ...(authed
       ? {
           name: serverSettings.name,
@@ -1360,6 +1363,23 @@ mountDirectMessages(app, {
   accounts,
   push: (userIds, payload) => { for (const id of userIds) realtime?.toUser(id, payload); },
   broadcast: (payload) => realtime?.broadcast(payload),
+});
+
+/**
+ * Whether anything arrived, for a client that keeps this server in the
+ * background with no socket open: the newest private message and whether a
+ * call is ringing for you. Cheap on purpose, since it is asked every 15
+ * seconds; the client opens a socket only once the answer changes. Asking
+ * also keeps you reachable, so a call to you rings instead of being missed.
+ */
+app.get('/api/inbox', requireLogin, (req, res) => {
+  realtime?.notePoll(req.user.id);
+  const mine = calls.forUser(req.user.id);
+  res.json({
+    latest: dms.latest(req.user.id),
+    ringing: mine.some((c) => c.state === 'ringing' && c.calleeId === req.user.id),
+    inCall: mine.some((c) => c.state === 'active'),
+  });
 });
 
 // ---------------------------------------------------------------------------

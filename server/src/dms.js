@@ -92,6 +92,11 @@ export class DirectMessages {
           AND EXISTS (SELECT 1 FROM dm_messages m WHERE m.conversation_id = c.id)
         ORDER BY c.last_at DESC
       `),
+      latest: db.prepare(`
+        SELECT MAX(m.id) AS id FROM dm_messages m
+        JOIN dm_conversations c ON c.id = m.conversation_id
+        WHERE c.user_a = :me OR c.user_b = :me
+      `),
 
       // --- messages ----------------------------------------------------------
       insertMessage: db.prepare(`
@@ -255,6 +260,11 @@ export class DirectMessages {
     const now = Date.now();
     const info = this.#q.insertConversation.run(a, b, now, now);
     return { conversation: this.#q.conversation.get(Number(info.lastInsertRowid)), created: true };
+  }
+
+  /** The newest message id in any of your conversations, 0 with none: what an inbox poll compares. */
+  latest(userId) {
+    return this.#q.latest.get({ me: userId })?.id ?? 0;
   }
 
   /** Your conversations, newest activity first, with unread counts and the last message. */

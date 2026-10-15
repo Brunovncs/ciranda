@@ -21,11 +21,39 @@ import { DirectMessages } from './dms.js';
 /** A socket that has not answered a ping in this long is assumed dead. */
 const HEARTBEAT_MS = 15_000;
 
+/**
+ * How long a `GET /api/inbox` keeps somebody reachable with no socket open.
+ *
+ * A client signed in to several servers keeps a socket only to the one on
+ * screen; the others it asks every 15 seconds whether anything arrived. Two
+ * polls missed in a row and it is treated as gone, as a closed socket is.
+ */
+export const POLL_REACH_MS = 40_000;
+
+/**
+ * What a `private` socket may ask for: its calls, and nothing that puts it in
+ * a channel. It hears nothing broadcast, so a voice channel joined from it
+ * would never see its own roster.
+ */
+const PRIVATE_TYPES = new Set([
+  'call:start', 'call:answer', 'call:hang-up', 'call:join',
+  'voice:leave', 'voice:mute', 'voice:publishing', 'voice:refresh',
+]);
+
 export class Realtime {
   #wss;
   #deps;
-  /** @type {Map<import('ws').WebSocket, {user: object, alive: boolean, host: string}>} */
+  /**
+   * `scope` is `full` for the server on screen, or `private` for one a client
+   * keeps in the background: that one hears only what is sent to its user
+   * (messages, calls), never the server's broadcasts, and does not count as
+   * being online.
+   *
+   * @type {Map<import('ws').WebSocket, {user: object, alive: boolean, host: string, scope: string}>}
+   */
   #clients = new Map();
+  /** @type {Map<number, number>} by user id: until when an inbox poll keeps them reachable */
+  #polled = new Map();
   #timer = null;
 
   /**
@@ -70,7 +98,7 @@ export class Realtime {
     // cannot set request headers, so the token cannot travel in an
     // Authorization header. It arrives in a `hello` frame instead, and nothing
     // else is accepted until it does.
-    this.#clients.set(ws, { user: null, alive: true, host });
+    this.#clients.set(ws, { user: null, alive: true, host, scope: 'full' });
 
     ws.on('pong', () => {
       const client = this.#clients.get(ws);
@@ -120,17 +148,22 @@ export class Realtime {
     // Presence is derived from this socket existing, so closing it IS leaving.
     // Nothing has to be reconciled, and a server restart rebuilds the whole
     // picture from whoever reconnects.
-    const stillOnline = this.#isOnline(client.user.id);
-    if (stillOnline) return;
-
-    for (const { channelId } of this.#deps.voice.leaveAll(client.user.id)) {
-      this.broadcastRoster(channelId);
+    const id = client.user.id;
+    if (client.scope === 'full' && !this.#isOnline(id)) {
+      for (const { channelId } of this.#deps.voice.leaveAll(id)) {
+        this.broadcastRoster(channelId);
+      }
+      // After leaveAll, so a client redrawing on this gets a roster that has
+      // already lost them rather than one that still has them in a channel.
+      this.broadcastPresence();
     }
-    // Ringing ends; a call under way waits a little for them to come back.
-    this.#deps.calls?.disconnected(client.user.id);
-    // After leaveAll, so a client redrawing on this gets a roster that has
-    // already lost them rather than one that still has them in a channel.
-    this.broadcastPresence();
+    // A background socket closes when its conversation goes quiet, and the
+    // client goes back to polling: until its next poll it is still there.
+    if (client.scope === 'private') this.notePoll(id);
+    // A call needs only some socket: one kept in the background carries it
+    // as well as the one on screen. Ringing ends; a call under way waits a
+    // little for them to come back.
+    if (!this.#hasSocket(id)) this.#deps.calls?.disconnected(id);
   }
 
   /**
@@ -146,7 +179,7 @@ export class Realtime {
   onlineUserIds() {
     const out = new Set();
     for (const client of this.#clients.values()) {
-      if (client.user) out.add(client.user.id);
+      if (client.user && client.scope === 'full') out.add(client.user.id);
     }
     return [...out];
   }
@@ -156,12 +189,39 @@ export class Realtime {
     this.broadcast({ type: 'presence', online: this.onlineUserIds() });
   }
 
-  /** True if this user has another socket open (a second window, say). */
+  /** True if this user has the server open somewhere (a second window, say). */
   #isOnline(userId) {
+    for (const client of this.#clients.values()) {
+      if (client.user?.id === userId && client.scope === 'full') return true;
+    }
+    return false;
+  }
+
+  /** True if this user has any socket open here, in the background included. */
+  #hasSocket(userId) {
     for (const client of this.#clients.values()) {
       if (client.user?.id === userId) return true;
     }
     return false;
+  }
+
+  /**
+   * Whether something sent to this user now would reach them soon: a socket,
+   * or an inbox poll recent enough that the next one will see it. A call to
+   * somebody reachable rings; to anybody else it is missed on the spot.
+   */
+  isReachable(userId) {
+    if (this.#hasSocket(userId)) return true;
+    const until = this.#polled.get(userId);
+    if (until === undefined) return false;
+    if (until > Date.now()) return true;
+    this.#polled.delete(userId);
+    return false;
+  }
+
+  /** A client asked `GET /api/inbox` for this user, so it is still there. */
+  notePoll(userId) {
+    this.#polled.set(userId, Date.now() + POLL_REACH_MS);
   }
 
   #sweep() {
@@ -206,6 +266,16 @@ export class Realtime {
       }
       client.user = user;
       this.#deps.calls?.reconnected(user.id);
+      // A call ringing for them, or one they were in before the socket
+      // dropped: without it a reconnect mid-call would forget the call.
+      const calls = (this.#deps.calls?.forUser(user.id) ?? []).map((c) => ({
+        ...publicCall(c),
+        roster: this.#deps.calls.voice.roster(c.conversationId),
+      }));
+      if (msg.scope === 'private') {
+        client.scope = 'private';
+        return this.#send(ws, { type: 'hello-ok', rid: msg.rid, scope: 'private', user: publicUser(user), calls });
+      }
       // Before the reply, so the arriving client's own hello already
       // contains them -- otherwise the one person guaranteed to be online
       // is missing from the list until somebody else connects.
@@ -223,16 +293,17 @@ export class Realtime {
         rosters: this.#deps.voice.allRosters(),
         online: this.onlineUserIds(),
         voiceCap: VOICE_HARD_CAP,
-        // A call ringing for them, or one they were in before the socket
-        // dropped: without it a reconnect mid-call would forget the call.
-        calls: (this.#deps.calls?.forUser(user.id) ?? []).map((c) => ({
-          ...publicCall(c),
-          roster: this.#deps.calls.voice.roster(c.conversationId),
-        })),
+        calls,
       });
     }
 
     if (!client.user) return this.#send(ws, { type: 'error', rid: msg.rid, error: 'no_hello' });
+    if (client.scope === 'private' && !PRIVATE_TYPES.has(msg.type)) {
+      return this.#send(ws, { type: 'error', rid: msg.rid, error: 'not_here' });
+    }
+    if (client.scope === 'private' && String(msg.type).startsWith('voice:') && msg.conversationId == null) {
+      return this.#send(ws, { type: 'voice:error', rid: msg.rid, error: 'not_here' });
+    }
 
     const handler = this.#handlers[msg.type];
     if (!handler) return this.#send(ws, { type: 'error', rid: msg.rid, error: 'unknown_type' });
@@ -405,7 +476,7 @@ export class Realtime {
       sealedKey: msg.sealedKey,
       senderKey: msg.senderKey,
       recipientKey: msg.recipientKey,
-      calleeOnline: this.#isOnline(peerId),
+      calleeOnline: this.isReachable(peerId),
     });
     if (!result.ok) return { type: 'call:error', error: result.error };
     return { type: 'call:ok', call: publicCall(result.call) };
@@ -574,9 +645,9 @@ export class Realtime {
     }
   }
 
-  /** Send to everyone authenticated. */
+  /** Send to everyone authenticated with the server open (not to background sockets). */
   broadcast(payload) {
-    this.#fanOut(payload, (client) => Boolean(client.user));
+    this.#fanOut(payload, (client) => Boolean(client.user) && client.scope === 'full');
   }
 
   /**
@@ -587,7 +658,7 @@ export class Realtime {
    * channel, and that question belongs with the routes that already ask it.
    */
   broadcastWhere(payload, allow) {
-    this.#fanOut(payload, (client) => Boolean(client.user) && allow(client.user));
+    this.#fanOut(payload, (client) => Boolean(client.user) && client.scope === 'full' && allow(client.user));
   }
 
   broadcastRoster(channelId) {
@@ -615,7 +686,7 @@ export class Realtime {
   broadcastStreams(streamsFor) {
     const byHost = new Map();
     for (const [ws, client] of this.#clients) {
-      if (!client.user) continue;
+      if (!client.user || client.scope !== 'full') continue;
       if (!byHost.has(client.host)) byHost.set(client.host, { streams: streamsFor(client.host) });
       const forHost = byHost.get(client.host);
       if (ws.readyState !== ws.OPEN) continue;

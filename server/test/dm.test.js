@@ -132,11 +132,11 @@ function connect(token) {
       ws.send(JSON.stringify({ ...payload, rid }));
       return this.next((m) => m.rid === rid);
     },
-    async hello() {
+    async hello(extra = {}) {
       if (ws.readyState !== WebSocket.OPEN) {
         await new Promise((done) => ws.addEventListener('open', done, { once: true }));
       }
-      return this.request({ type: 'hello', token });
+      return this.request({ type: 'hello', token, ...extra });
     },
     close() {
       ws.close();
@@ -724,6 +724,84 @@ describe('a dropped connection', () => {
 
     await alice.request({ type: 'call:hang-up', conversationId: convo });
     await Promise.all([alice.close(), bob.close()]);
+  });
+});
+
+describe('in the background', () => {
+  it('says so in the health check', async () => {
+    const health = await api('/api/health');
+    assert.ok(health.body.features.includes('inbox'));
+  });
+
+  it('keeps a private socket out of presence and broadcasts, but delivers what is yours', async () => {
+    const convo = await open('alice', 'bob');
+    const alice = connect(tokens.alice);
+    await alice.hello();
+    const bob = connect(tokens.bob);
+    const hello = await bob.hello({ scope: 'private' });
+    assert.equal(hello.type, 'hello-ok');
+    assert.equal(hello.scope, 'private');
+    assert.equal(hello.channels, undefined, 'no channel snapshot for a background socket');
+
+    const presence = await api('/api/channels', { token: tokens.alice });
+    assert.ok(!presence.body.online.includes(ids.bob), 'a background socket is not being online');
+
+    assert.equal((await send('alice', 'bob', convo)).status, 201);
+    await bob.next((m) => m.type === 'dm:message' && m.conversation.id === convo);
+
+    await publishKey('eve');
+    await alice.next((m) => m.type === 'keys:changed' && m.key.userId === ids.eve);
+    await silent(bob, (m) => m.type === 'keys:changed' || m.type === 'presence');
+
+    const join = await bob.request({ type: 'voice:join', channelId: 1 });
+    assert.equal(join.error, 'not_here');
+    await Promise.all([alice.close(), bob.close()]);
+  });
+
+  it('answers an inbox poll with the newest message, and keeps the poller reachable for a call', async () => {
+    const convo = await open('alice', 'bob');
+    const before = await api('/api/inbox', { token: tokens.bob });
+    assert.equal(before.status, 200);
+    assert.equal(before.body.ringing, false);
+    assert.equal((await send('alice', 'bob', convo)).status, 201);
+    const after = await api('/api/inbox', { token: tokens.bob });
+    assert.ok(after.body.latest > before.body.latest);
+
+    // Bob has no socket open at all, only the poll: the call rings rather than being missed.
+    const alice = connect(tokens.alice);
+    await alice.hello();
+    const r = await alice.request({
+      type: 'call:start', conversationId: convo, sealedKey: b64(60), senderKey: keyOf.alice, recipientKey: keyOf.bob,
+    });
+    assert.equal(r.type, 'call:ok', JSON.stringify(r));
+    assert.equal((await api('/api/inbox', { token: tokens.bob })).body.ringing, true);
+
+    // He opens a background socket, hears it ring, and answers there.
+    const bob = connect(tokens.bob);
+    const hello = await bob.hello({ scope: 'private' });
+    assert.equal(hello.calls[0].state, 'ringing');
+    const answered = await bob.request({ type: 'call:answer', conversationId: convo });
+    assert.equal(answered.call.state, 'active');
+    assert.equal((await bob.request({ type: 'call:join', conversationId: convo })).type, 'call:joined');
+    await alice.request({ type: 'call:hang-up', conversationId: convo });
+    await Promise.all([alice.close(), bob.close()]);
+  });
+
+  it('keeps somebody reachable for a while after their background socket closes', async () => {
+    const convo = await open('alice', 'eve');
+    const eve = connect(tokens.eve);
+    await eve.hello({ scope: 'private' });
+    // Gone quiet: the client closes the socket and goes back to polling.
+    await eve.close();
+    await new Promise((done) => setTimeout(done, 100));
+    const alice = connect(tokens.alice);
+    await alice.hello();
+    const r = await alice.request({
+      type: 'call:start', conversationId: convo, sealedKey: b64(60), senderKey: keyOf.alice, recipientKey: keyOf.eve,
+    });
+    assert.equal(r.type, 'call:ok', 'it rings rather than being missed until the next poll');
+    await alice.request({ type: 'call:hang-up', conversationId: convo });
+    await alice.close();
   });
 });
 

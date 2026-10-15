@@ -442,6 +442,18 @@ impl Settings {
                 |cx| set_prefs(cx, |p| p.confirm_voice_join = !p.confirm_voice_join),
             ))
             .child(toggle_row(
+                "confirm-server-switch",
+                tr!("Ask before leaving a call for another server", "Perguntar antes de sair de uma chamada para outro servidor"),
+                tr!(
+                    "Going to another server ends the voice channel or call you are in, so a click on it asks first.",
+                    "Ir para outro servidor encerra o canal de voz ou a chamada em que você está, então o clique pergunta antes."
+                ),
+                p.confirm_server_switch,
+                t,
+                cx,
+                |cx| set_prefs(cx, |p| p.confirm_server_switch = !p.confirm_server_switch),
+            ))
+            .child(toggle_row(
                 "join-muted",
                 tr!("Join voice channels muted", "Entrar mutado nos canais de voz"),
                 tr!(

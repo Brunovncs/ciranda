@@ -671,6 +671,10 @@ pub struct Health {
     pub has_accounts: Option<bool>,
     #[serde(default)]
     pub needs_owner: bool,
+    /// What this server can do beyond the basics; `inbox` is keeping its private messages in the
+    /// background (`GET /api/inbox` and private sockets).
+    #[serde(default, deserialize_with = "lenient")]
+    pub features: Vec<String>,
 }
 
 impl Health {
@@ -678,6 +682,20 @@ impl Health {
     pub fn icon_hash(&self) -> Option<&String> {
         self.icon_hash.as_ref().or(self.logo.as_ref())
     }
+
+    pub fn has(&self, feature: &str) -> bool {
+        self.features.iter().any(|f| f == feature)
+    }
+}
+
+/// `GET /api/inbox`: whether anything arrived, for a server kept in the background.
+#[derive(Clone, Copy, Debug, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Inbox {
+    /// The newest private message in any of your conversations there.
+    pub latest: MessageId,
+    pub ringing: bool,
+    pub in_call: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]

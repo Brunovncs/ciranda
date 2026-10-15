@@ -27,9 +27,9 @@ use crate::widgets::*;
 use chat::{ChatEvent, ChatView};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnimationExt, AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent,
-    MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render, SpringAnimation, SpringConfig, StatefulInteractiveElement,
-    StyleRefinement, Styled, Subscription, WeakEntity, Window, div,
+    AnimationExt, AnyElement, App, AppContext, Context, Entity, EntityId, FocusHandle, Focusable, InteractiveElement, IntoElement,
+    KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render, SpringAnimation, SpringConfig,
+    StatefulInteractiveElement, StyleRefinement, Styled, Subscription, WeakEntity, Window, div,
 };
 use sidebar::{Menu, MenuEntry};
 use std::collections::{HashMap, HashSet};
@@ -38,16 +38,38 @@ use std::collections::{HashMap, HashSet};
 pub enum Center {
     /// A text channel or a private conversation.
     Chat(Room),
+    /// A private conversation on a server kept in the background (its session's entity), while
+    /// this one stays on screen around it.
+    Away(EntityId, ConversationId),
+    /// The conversations are open, with none chosen yet.
+    Inbox,
     /// The voice channel you are in: people, cameras, screens.
     Stage,
+}
+
+/// What to do on a server once it is on screen, for something started from another one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Then {
+    /// Pick up the call ringing in this conversation.
+    Answer(ConversationId),
+    /// Ring the other person of this conversation.
+    Dial(ConversationId),
 }
 
 pub struct ServerView {
     pub session: Entity<Session>,
     root: WeakEntity<Root>,
     pub center: Center,
+    /// The rail's "Direct messages" is open: every server's conversations in place of this one's
+    /// channels. This server stays connected underneath, its voice and calls included.
+    pub dms_open: bool,
+    /// The conversation open last, to open again with the rail's button.
+    last_dm: Option<Center>,
     pub folded: HashSet<i64>,
     chats: HashMap<Room, Entity<ChatView>>,
+    /// Conversations open from servers in the background, by their session and conversation, with
+    /// what they are listened to with.
+    away_chats: HashMap<(EntityId, ConversationId), (Entity<ChatView>, Subscription)>,
     pub call: Option<Entity<Call>>,
     /// The "is calling you" dialog, while it rings.
     ringing: Option<Entity<private::Incoming>>,
@@ -109,7 +131,7 @@ impl Render for Panel {
 
 /// Sends a request on the socket now and toasts it if the server turns it down, as
 /// `Session::call` does for HTTP.
-pub(super) fn request(session: &Entity<Session>, kind: &'static str, payload: serde_json::Value, cx: &mut App) {
+pub(crate) fn request(session: &Entity<Session>, kind: &'static str, payload: serde_json::Value, cx: &mut App) {
     let reply = Session::request(session.read(cx).realtime.clone(), kind, payload);
     cx.spawn(async move |cx| {
         if let Err(e) = reply.await {
@@ -153,8 +175,11 @@ impl ServerView {
             session,
             root,
             center: Center::Stage,
+            dms_open: false,
+            last_dm: None,
             folded,
             chats: HashMap::new(),
+            away_chats: HashMap::new(),
             call: None,
             focused_tile: None,
             theater: None,
@@ -190,9 +215,10 @@ impl ServerView {
         // made from, say), or the first text channel once the list arrives.
         if self.center == Center::Stage && self.call.is_none() {
             let s = self.session.read(cx);
+            // A channel: the conversations are the rail's, not the server's.
             let last = s.open_room.filter(|r| match r {
                 Room::Channel(id) => s.channel(*id).is_some(),
-                Room::Dm(id) => s.dms.contains_key(id),
+                Room::Dm(_) => false,
             });
             // Else the channel open when Ciranda last ran, while it is still a text channel.
             let saved = || {
@@ -208,9 +234,13 @@ impl ServerView {
         let gone = match self.center {
             Center::Chat(Room::Channel(id)) => self.session.read(cx).channel(id).is_none(),
             Center::Chat(Room::Dm(id)) => self.session.read(cx).dms_loaded && !self.session.read(cx).dms.contains_key(&id),
-            Center::Stage => false,
+            Center::Away(..) => self.away_center(cx).is_none(),
+            Center::Inbox | Center::Stage => false,
         };
-        if gone {
+        if gone && self.dms_open {
+            self.leave_away(cx);
+            self.center = Center::Inbox;
+        } else if gone {
             self.show_stage(cx);
         }
         cx.notify();
@@ -337,7 +367,7 @@ impl ServerView {
         }
     }
 
-    fn show_ringing(&mut self, conversation: ConversationId, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn show_ringing(&mut self, conversation: ConversationId, window: &mut Window, cx: &mut Context<Self>) {
         let Some(caller) = self.session.read(cx).calls.get(&conversation).map(|c| c.caller_id) else { return };
         if let Some(old) = self.ringing.take() {
             old.update(cx, |r, cx| r.close(cx));
@@ -423,6 +453,8 @@ impl ServerView {
 
     /// The voice stage in the middle, in place of any chat.
     pub fn show_stage(&mut self, cx: &mut Context<Self>) {
+        self.leave_away(cx);
+        self.set_dms_open(false, cx);
         self.center = Center::Stage;
         self.session.update(cx, |s, cx| s.leave_chat(cx));
         cx.notify();
@@ -430,9 +462,20 @@ impl ServerView {
 
     pub fn shutdown(&mut self, cx: &mut Context<Self>) {
         self.leave_voice(cx);
+        self.leave_away(cx);
         crate::ui::hotkeys::set_server(None, cx);
         self.session.update(cx, |s, _| s.stop());
-        let _ = &self.root;
+    }
+
+    /// Does what another server's conversation or call asked for, now that this one is on screen.
+    pub fn carry_out(&mut self, then: Then, window: &mut Window, cx: &mut Context<Self>) {
+        match then {
+            Then::Answer(id) => self.answer_call(id, window, cx),
+            Then::Dial(id) => {
+                self.open_room(Room::Dm(id), window, cx);
+                self.start_call(id, window, cx);
+            }
+        }
     }
 
     // Where you are.
@@ -443,11 +486,112 @@ impl ServerView {
 
     /// A text channel or a private conversation, in the middle.
     pub fn open_room(&mut self, room: Room, window: &mut Window, cx: &mut Context<Self>) {
+        self.leave_away(cx);
         self.center = Center::Chat(room);
+        self.set_dms_open(matches!(room, Room::Dm(_)), cx);
+        if self.dms_open {
+            self.last_dm = Some(self.center);
+        }
         let chat = self.chat_view(room, window, cx);
         self.session.update(cx, |s, cx| s.open(room, cx));
         chat.update(cx, |c, cx| c.focus_composer(window, cx));
         cx.notify();
+    }
+
+    /// A private conversation of a server kept in the background, in the middle, with this server
+    /// still around it (its channels, and the voice you are in here).
+    pub fn open_away(&mut self, session: Entity<Session>, conversation: ConversationId, window: &mut Window, cx: &mut Context<Self>) {
+        let at = (session.entity_id(), conversation);
+        if self.center != Center::Away(at.0, at.1) {
+            self.leave_away(cx);
+        }
+        self.session.update(cx, |s, cx| s.leave_chat(cx));
+        self.center = Center::Away(at.0, at.1);
+        self.set_dms_open(true, cx);
+        self.last_dm = Some(self.center);
+        let chat = self.away_chat(&session, conversation, window, cx);
+        session.update(cx, |s, cx| s.open(Room::Dm(conversation), cx));
+        chat.update(cx, |c, cx| c.focus_composer(window, cx));
+        cx.notify();
+    }
+
+    /// In or out of the conversations; the rail marks which, so it draws again after this.
+    fn set_dms_open(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.dms_open == on {
+            return;
+        }
+        self.dms_open = on;
+        let root = self.root.clone();
+        cx.defer(move |cx| {
+            let _ = root.update(cx, |_, cx| cx.notify());
+        });
+    }
+
+    /// The rail's "Direct messages": every server's conversations, and the one open last.
+    pub fn open_dms(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dms_open {
+            return;
+        }
+        let away = match self.last_dm {
+            Some(Center::Away(id, conversation)) => crate::elsewhere::away_session(id, cx).map(|s| (s, conversation)),
+            _ => None,
+        };
+        match (self.last_dm, away) {
+            (Some(Center::Chat(room)), _) if self.session.read(cx).dms.contains_key(&room.conversation().unwrap_or(-1)) => {
+                self.open_room(room, window, cx)
+            }
+            (_, Some((session, conversation))) => self.open_away(session, conversation, window, cx),
+            _ => {
+                self.session.update(cx, |s, cx| s.leave_chat(cx));
+                self.center = Center::Inbox;
+                self.set_dms_open(true, cx);
+                cx.notify();
+            }
+        }
+    }
+
+    /// Back from the conversations to this server's channels, where they were.
+    pub fn close_dms(&mut self, cx: &mut Context<Self>) {
+        if !self.dms_open {
+            return;
+        }
+        self.leave_away(cx);
+        self.set_dms_open(false, cx);
+        self.center = Center::Stage;
+        self.on_session(cx);
+    }
+
+    /// Opens the conversation with `user` on a server in the background, making it if needed.
+    pub fn message_away(&mut self, session: Entity<Session>, user: UserId, window: &mut Window, cx: &mut Context<Self>) {
+        let task = session.update(cx, |s, cx| s.open_dm_with(user, cx));
+        let handle = window.window_handle();
+        cx.spawn(async move |this, cx| {
+            let got = task.await;
+            let _ = handle.update(cx, |_, window, cx| {
+                let _ = this.update(cx, |this, cx| match got {
+                    Ok(id) => this.open_away(session, id, window, cx),
+                    Err(e) => overlay::toast(e.message, cx),
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// The background conversation in the middle and its session, while that session is kept.
+    pub fn away_center(&self, cx: &App) -> Option<(Entity<Session>, ConversationId)> {
+        let Center::Away(id, conversation) = self.center else { return None };
+        let session = crate::elsewhere::away_session(id, cx)?;
+        let s = session.read(cx);
+        (!s.dms_loaded || s.dms.contains_key(&conversation)).then_some((session, conversation))
+    }
+
+    /// Off a background conversation: its server no longer counts it as being looked at.
+    fn leave_away(&mut self, cx: &mut Context<Self>) {
+        if let Center::Away(id, _) = self.center
+            && let Some(session) = crate::elsewhere::away_session(id, cx)
+        {
+            session.update(cx, |s, cx| s.leave_chat(cx));
+        }
     }
 
     fn chat_view(&mut self, room: Room, window: &mut Window, cx: &mut Context<Self>) -> Entity<ChatView> {
@@ -456,12 +600,42 @@ impl ServerView {
         }
         let session = self.session.clone();
         let chat = cx.new(|cx| ChatView::new(session, room, window, cx));
-        let sub = cx.subscribe_in(&chat, window, |this, _, ev: &ChatEvent, window, cx| match ev {
-            ChatEvent::Call(id) => this.start_call(*id, window, cx),
-        });
+        let sub = cx.subscribe_in(&chat, window, |this, _, ev: &ChatEvent, window, cx| this.on_chat_event(ev, window, cx));
         self._subs.push(sub);
         self.chats.insert(room, chat.clone());
         chat
+    }
+
+    fn away_chat(&mut self, session: &Entity<Session>, conversation: ConversationId, window: &mut Window, cx: &mut Context<Self>) -> Entity<ChatView> {
+        let at = (session.entity_id(), conversation);
+        // Chats of sessions no longer kept go with them.
+        self.away_chats.retain(|(id, _), _| crate::elsewhere::away_session(*id, cx).is_some());
+        if let Some((chat, _)) = self.away_chats.get(&at) {
+            return chat.clone();
+        }
+        let chat = cx.new(|cx| ChatView::new(session.clone(), Room::Dm(conversation), window, cx));
+        let sub = cx.subscribe_in(&chat, window, |this, _, ev: &ChatEvent, window, cx| this.on_chat_event(ev, window, cx));
+        self.away_chats.insert(at, (chat.clone(), sub));
+        chat
+    }
+
+    fn on_chat_event(&mut self, ev: &ChatEvent, window: &mut Window, cx: &mut Context<Self>) {
+        match ev {
+            ChatEvent::Call(session, id) if *session == self.session => self.start_call(*id, window, cx),
+            // A call is always made from the server it is on: go there, then ring.
+            ChatEvent::Call(session, id) => {
+                let (url, user) = {
+                    let s = session.read(cx);
+                    (s.api.base(), s.me.nickname.clone())
+                };
+                let then = Some(Then::Dial(*id));
+                if let Some(root) = self.root.upgrade() {
+                    window.defer(cx, move |window, cx| root.update(cx, |r, cx| r.ask_go_to(&url, &user, then, window, cx)));
+                }
+            }
+            ChatEvent::Elsewhere(session, user) if *session == self.session => self.message_user(*user, window, cx),
+            ChatEvent::Elsewhere(session, user) => self.message_away(session.clone(), *user, window, cx),
+        }
     }
 
     pub fn call_place(&self, cx: &App) -> Option<Place> {
@@ -758,16 +932,27 @@ impl ServerView {
         // Connected, it is only the dot; it opens on hover, and stays open while something is wrong.
         let open = !up || self.link_hover;
         let text2 = t.text2;
+        let server_name = s.server_name.clone();
+        let lead = div().flex().items_center().gap(px(10.));
+        // The conversations are every server's: their title, not this server's.
+        let lead = if self.dms_open {
+            lead.child(
+                div().size(px(28.)).flex().items_center().justify_center().rounded(px(8.)).bg(t.accent_soft).child(icon("message", 15., t.accent)),
+            )
+            .child(title(tr!("Direct messages", "Mensagens diretas"), t.text))
+        } else {
+            lead.child(admin::mark(picture, t))
+                .child(admin::entry(server_name, role, t, cx))
+                // Down a touch, to sit on the name's letters as the gear does.
+                .when(role.is_admin(), |d| d.child(admin::role_chip(role, t).relative().top(px(1.))))
+        };
         div()
             .flex()
             .items_center()
             .gap(px(10.))
             .h(px(48.))
             .px(px(GUTTER + 4.))
-            .child(admin::mark(picture, t))
-            .child(admin::entry(s.server_name.clone(), role, t, cx))
-            // Down a touch, to sit on the name's letters as the gear does.
-            .when(role.is_admin(), |d| d.child(admin::role_chip(role, t).relative().top(px(1.))))
+            .child(lead)
             .child(div().flex_1())
             .children(crate::ui::updates::button(cx))
             .child(
@@ -802,14 +987,14 @@ impl ServerView {
                         )
                     }),
             )
-            .child(
+            .when(!self.dms_open, |d| d.child(
                 tool_button("toggle-members", "users", show_members, if show_members { t.accent } else { t.text2 }, t)
                     .tooltip(tip(
                         if show_members { tr!("Hide members", "Ocultar membros") } else { tr!("Show members", "Mostrar membros") },
                         t,
                     ))
                     .on_click(cx.listener(|_, _, _, cx| set_prefs(cx, |p| p.show_members = !p.show_members))),
-            )
+            ))
             .child(
                 icon_button("settings", "settings", t)
                     .tooltip(tip(tr!("Settings (Ctrl+,)", "Configurações (Ctrl+,)"), t))
@@ -1110,7 +1295,8 @@ impl Render for ServerView {
                 let _ = root.update(cx, |_, cx| cx.notify());
             });
         }
-        let show_members = prefs(cx).show_members && f32::from(window.viewport_size().width) > 900. * crate::theme::scale();
+        let show_members =
+            !self.dms_open && prefs(cx).show_members && f32::from(window.viewport_size().width) > 900. * crate::theme::scale();
         let narrow = f32::from(window.viewport_size().width) < 720. * crate::theme::scale();
         let topbar = self.render_topbar(&t, cx);
         let sidebar = self.sidebar.clone().cached(StyleRefinement::default().flex_1().min_h(px(0.)).w_full());
@@ -1121,9 +1307,38 @@ impl Render for ServerView {
         if let Some(voice) = self.call.as_ref().and_then(|c| c.read(cx).voice.as_ref()) {
             voice.read(cx).hide_streams(self.center != Center::Stage);
         }
-        let center: AnyElement = match self.center {
-            Center::Chat(room) => self.chat_view(room, window, cx).cached(StyleRefinement::default().size_full()).into_any_element(),
-            Center::Stage => self.render_stage(&t, window, cx).into_any_element(),
+        let away = match self.center {
+            Center::Away(..) => self.away_center(cx),
+            _ => None,
+        };
+        if matches!(self.center, Center::Away(..)) && away.is_none() {
+            // Its server left the rail, or the conversation is gone.
+            self.leave_away(cx);
+            self.center = if self.dms_open { Center::Inbox } else { Center::Stage };
+        }
+        let center: AnyElement = match (self.center, away) {
+            (Center::Chat(room), _) => self.chat_view(room, window, cx).cached(StyleRefinement::default().size_full()).into_any_element(),
+            (Center::Away(..), Some((session, id))) => {
+                self.away_chat(&session, id, window, cx).cached(StyleRefinement::default().size_full()).into_any_element()
+            }
+            (Center::Inbox, _) => div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(10.))
+                .child(div().size(px(64.)).rounded_full().bg(t.layer).flex().items_center().justify_center().child(icon("message", 26., t.text3)))
+                .child(title(tr!("Your conversations", "Suas conversas"), t.text))
+                .child(caption(
+                    tr!(
+                        "Every server's, together. Pick one on the left, or start one with +.",
+                        "As de todos os servidores, juntas. Escolha uma à esquerda, ou comece outra com o +."
+                    ),
+                    t.text3,
+                ))
+                .into_any_element(),
+            _ => self.render_stage(&t, window, cx).into_any_element(),
         };
         let members = show_members.then(|| self.members.clone().cached(StyleRefinement::default().size_full()));
         div()

@@ -10,6 +10,7 @@
 mod i18n;
 mod core;
 mod dm;
+mod elsewhere;
 mod emoji;
 mod hotkeys;
 mod icons;

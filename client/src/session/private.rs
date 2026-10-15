@@ -49,6 +49,9 @@ impl Session {
             let got = core::run(async move { api.keys().await }).await;
             let _ = this.update(cx, |s, cx| {
                 match got {
+                    // A key being made already: only learn the others' from this answer, or a second
+                    // one would be made and the first recovery key lost.
+                    Ok(reply) if s.creating_key => s.vault.learn(reply.keys),
                     Ok(reply) => {
                         if s.vault.on_keys(reply) == Next::Create {
                             s.create_key(cx);
@@ -71,9 +74,11 @@ impl Session {
         let (identity, recovery, wrapped) = Vault::create();
         let (api, public) = (self.api.clone(), identity.public_b64());
         self.vault.state = KeyState::Loading;
+        self.creating_key = true;
         cx.spawn(async move |this, cx| {
             let got = core::run(async move { api.publish_key(&public, &wrapped).await }).await;
             let _ = this.update(cx, |s, cx| {
+                s.creating_key = false;
                 match got {
                     Ok(key) => {
                         s.vault.adopt(key, identity, &recovery, false);
@@ -130,7 +135,9 @@ impl Session {
 
     // Conversations.
 
-    fn load_dms(&mut self, cx: &mut Context<Self>) {
+    /// The conversation list, again. In the background, what arrived since the last one is told as
+    /// news (`SessionEvent::Message`): with no socket open, nothing else said so.
+    pub(super) fn load_dms(&mut self, cx: &mut Context<Self>) {
         let api = self.api.clone();
         cx.spawn(async move |this, cx| {
             let got = core::run(async move { api.dms().await }).await;
@@ -139,12 +146,19 @@ impl Session {
                 s.vault.learn(list.keys);
                 s.blocked = list.blocked.into_iter().collect();
                 let me = s.me.id;
+                let news = s.background && s.dms_loaded;
                 let mut dms = HashMap::new();
                 for info in list.conversations {
                     let peer = info.peer(me);
                     let mut dm = Dm { peer, preview: String::new(), preview_mine: false, info };
                     if let Some(last) = dm.info.last.clone() {
                         s.preview(&mut dm, &last);
+                        let seen = s.dms.get(&dm.info.id).and_then(|d| d.info.last.as_ref()).map_or(0, |m| m.id);
+                        if news && last.id > seen && last.user_id != me {
+                            s.vault.pin(peer);
+                            let opened = s.vault.open_message(&last, peer);
+                            cx.emit(SessionEvent::Message(Room::Dm(dm.info.id), Box::new(opened)));
+                        }
                     }
                     dms.insert(dm.info.id, dm);
                 }
@@ -179,6 +193,11 @@ impl Session {
 
     pub fn dm_unread(&self) -> u32 {
         self.dms.values().map(|d| d.info.unread).sum()
+    }
+
+    /// The newest message in any conversation, as far as this session knows.
+    pub(super) fn newest_dm(&self) -> MessageId {
+        self.dms.values().filter_map(|d| d.info.last.as_ref().map(|m| m.id)).max().unwrap_or(0)
     }
 
     pub fn peer_of(&self, conversation: ConversationId) -> Option<UserId> {
@@ -285,6 +304,8 @@ impl Session {
     /// back, exactly as in a channel.
     pub fn send_dm(&mut self, conversation: ConversationId, body: String, file: Option<Outgoing>, cx: &mut Context<Self>) -> Task<Result<(), ApiError>> {
         let Some(peer) = self.peer_of(conversation) else { return Task::ready(Err(gone())) };
+        // In the background the socket opens now, so the echo and the reply come back on it.
+        self.wake(cx);
         let (api, cache) = (self.api.clone(), self.cache.clone());
         cx.spawn(async move |this, cx| {
             let mut attachment = None;
@@ -520,6 +541,7 @@ impl Session {
         let room = Room::Dm(id);
         let mine = m.user_id == me;
         let away = self.viewing != Some(room);
+        self.active_at = std::time::Instant::now();
         let mut dm = self.dms.remove(&id).unwrap_or(Dm { peer, preview: String::new(), preview_mine: false, info: info.clone() });
         dm.info.last_at = info.last_at;
         dm.info.last = Some(m.clone());

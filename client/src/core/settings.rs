@@ -77,6 +77,8 @@ pub struct Settings {
     pub tray_notice_seen: bool,
     /// Clicking a voice channel asks before joining it.
     pub confirm_voice_join: bool,
+    /// Going to another server while in a voice channel or a call asks first: it ends them.
+    pub confirm_server_switch: bool,
     /// Every voice channel is entered with the microphone off, switching between them included.
     pub join_muted: bool,
     /// Where the window was and whether it was maximised, to open it there again.
@@ -559,6 +561,7 @@ impl Default for Settings {
             close_to_tray: true,
             tray_notice_seen: false,
             confirm_voice_join: true,
+            confirm_server_switch: true,
             join_muted: true,
             window: None,
             voice_volumes: BTreeMap::new(),

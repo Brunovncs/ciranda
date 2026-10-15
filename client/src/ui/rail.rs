@@ -40,9 +40,15 @@ impl Root {
         for a in &accounts {
             self.account_picture(a, cx);
         }
+        // The conversations are open in place of a server's channels: no server is the one shown.
+        let server_view = match &self.screen {
+            super::Screen::Server(v) => Some(v.clone()),
+            super::Screen::Connect { .. } => None,
+        };
+        let dms_open = server_view.as_ref().is_some_and(|v| v.read(cx).dms_open);
         let mut list = div().id("rail-servers").flex().flex_col().gap(px(8.)).py(px(2.)).min_h(px(0.)).overflow_y_scroll();
         for (i, s) in servers {
-            list = list.child(self.rail_tile(i, s, active == Some(i), t, cx));
+            list = list.child(self.rail_tile(i, s, active == Some(i) && !dms_open, t, cx));
         }
         let plus_hover = t.control_hover;
         pane(t)
@@ -52,6 +58,9 @@ impl Root {
             .ml(px(GUTTER))
             .py(px(GUTTER))
             .gap(px(8.))
+            .when(server_view.is_some(), |d| {
+                d.child(self.dms_tile(dms_open, t, cx)).child(div().mx(px(14.)).h(px(1.)).flex_none().bg(t.stroke))
+            })
             .child(list)
             .child(div().mx(px(14.)).h(px(1.)).flex_none().bg(t.stroke))
             .child(
@@ -75,6 +84,33 @@ impl Root {
             )
             .child(div().flex_1())
             .when_some(account, |d, a| d.child(self.account_button(&a, t, cx)))
+    }
+
+    /// "Direct messages", above the servers: every server's conversations, with what is unread
+    /// across all of them.
+    fn dms_tile(&mut self, on: bool, t: &Theme, cx: &mut Context<Root>) -> gpui::Stateful<gpui::Div> {
+        let unread: u32 = crate::elsewhere::sessions(cx).iter().map(|s| s.read(cx).dm_unread()).sum();
+        let hover = t.accent.opacity(if t.dark { 0.28 } else { 0.22 });
+        rail_slot("rail-dms", on, t)
+            .child(
+                div()
+                    .size(px(TILE))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(radius::CARD))
+                    .when(on, |d| d.bg(t.accent))
+                    .when(!on, |d| d.bg(t.accent_soft).hover(move |s| s.bg(hover)))
+                    .child(icon("message", 18., if on { t.on_accent } else { t.accent })),
+            )
+            .when(unread > 0, |d| d.child(unread_badge(unread, t)))
+            .tooltip(tip(tr!("Direct messages", "Mensagens diretas"), t))
+            .on_click(cx.listener(|this, _, window, cx| {
+                if let super::Screen::Server(v) = &this.screen {
+                    v.clone().update(cx, |v, cx| v.open_dms(window, cx));
+                }
+                cx.notify();
+            }))
     }
 
     fn account_button(&mut self, a: &Account, t: &Theme, cx: &mut Context<Root>) -> gpui::Stateful<gpui::Div> {
@@ -110,7 +146,7 @@ impl Root {
             .when(!self.overlay.has_menu(), |d| {
                 d.tooltip(move |_, cx| cx.new(|_| ServerTip { name: tip_text.0.clone(), host: tip_text.1.clone(), theme }).into())
             })
-            .on_click(cx.listener(move |this, _, window, cx| this.switch_server(&url, &user, window, cx)))
+            .on_click(cx.listener(move |this, _, window, cx| this.ask_go_to(&url, &user, None, window, cx)))
             .on_mouse_down(MouseButton::Right, cx.listener(move |this, e: &MouseDownEvent, _, cx| this.server_menu(&url2, e.position, cx)))
             .on_drag(dragged, |d, _, _, cx| cx.new(|_| d.clone()))
             // The dragged server takes this one's place.
@@ -174,10 +210,15 @@ impl Root {
         None
     }
 
-    /// Goes to a saved server: ends the session in use, then signs in with what was kept.
+    /// Goes to a saved server: ends the session in use, then signs in with what was kept. The one
+    /// in use, from the conversations, goes back to its channels.
     pub(super) fn switch_server(&mut self, url: &str, username: &str, window: &mut Window, cx: &mut Context<Root>) {
         let p = prefs(cx);
         if p.username == username && same_server(&p.server_url, url) {
+            if let super::Screen::Server(v) = &self.screen {
+                v.clone().update(cx, |v, cx| v.close_dms(cx));
+            }
+            cx.notify();
             return;
         }
         let mut found = false;
@@ -304,6 +345,8 @@ impl Root {
         let in_use = p.active_server() == Some(index);
         let mut gone = None;
         set_prefs(cx, |p| gone = p.forget_server(url, &user));
+        // Off the background first, so it does not see its own sign-in end.
+        self.sync_elsewhere(window, cx);
         sign_out(gone, cx);
         if in_use {
             self.move_on(Some((&user, index)), window, cx);
@@ -315,7 +358,8 @@ impl Root {
     fn sign_out_account(&mut self, username: &str, window: &mut Window, cx: &mut Context<Root>) {
         let mut gone = Vec::new();
         set_prefs(cx, |p| gone = p.forget_account(username));
-        // Off the session first, so it does not see its own sign-in end.
+        // Off the sessions first, so they do not see their own sign-ins end.
+        self.sync_elsewhere(window, cx);
         self.move_on(None, window, cx);
         for s in gone {
             sign_out(Some(s), cx);
@@ -365,6 +409,28 @@ pub(super) fn keep_session_news(session: &Entity<Session>, cx: &mut App) {
             p.note_identity(&user, &url, &display, &avatar);
         });
     }
+}
+
+/// What is unread, on a corner of a rail tile.
+fn unread_badge(n: u32, t: &Theme) -> gpui::Div {
+    div()
+        .absolute()
+        .top(px(-3.))
+        .right(px(4.))
+        .h(px(18.))
+        // A circle for one digit; wider only when the number is.
+        .map(|d| if n < 10 { d.w(px(18.)) } else { d.px(px(5.)) })
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .border_2()
+        .border_color(t.pane)
+        .bg(t.critical)
+        .text_size(px(10.5))
+        .font_weight(FontWeight::BOLD)
+        .text_color(t.on_accent)
+        .child(if n > 99 { "99+".to_string() } else { n.to_string() })
 }
 
 /// A row as wide as the rail, with the active marker on its edge as the settings rail has it.
@@ -525,7 +591,7 @@ impl AccountMenu {
             .child(div().flex_1().min_w(px(0.)).truncate().child(body(s.name.clone(), if s.on { t.text } else { t.text2 })))
             .when(s.on, |d| d.child(icon("check", 14., t.accent)))
             .on_click(
-                cx.listener(move |this, _, window, cx| this.then(cx, window, |r, window, cx| r.switch_server(&url, &user, window, cx))),
+                cx.listener(move |this, _, window, cx| this.then(cx, window, |r, window, cx| r.ask_go_to(&url, &user, None, window, cx))),
             )
     }
 }

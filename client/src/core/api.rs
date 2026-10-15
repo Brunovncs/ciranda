@@ -174,6 +174,10 @@ impl Api {
         self.get("/api/health").await
     }
 
+    pub async fn inbox(&self) -> Result<Inbox> {
+        self.get("/api/inbox").await
+    }
+
     pub async fn register(&self, nickname: &str, password: &str, owner_key: Option<&str>) -> Result<AuthReply> {
         self.post("/api/accounts/register", json!({ "nickname": nickname, "password": password, "ownerKey": owner_key })).await
     }

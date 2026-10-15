@@ -1,6 +1,11 @@
 //! What the window knows about the server it is connected to: who is there, the channels and
 //! who is in each, chat history, emoji, soundpad clips, and your private conversations (see
 //! `private`). One entity, fed by the realtime socket and by HTTP replies; views observe it.
+//!
+//! The other servers you are signed in to have a session too, kept in the background for their
+//! private messages (see `elsewhere`). Such a session holds no socket while nothing happens: it
+//! asks `GET /api/inbox` every so often, opens a socket that hears only what is sent to you when
+//! the answer changes or you write, and closes it again once the conversation goes quiet.
 
 mod private;
 
@@ -9,7 +14,7 @@ pub use private::{Dm, Outgoing};
 use crate::core::api::{Api, ApiError};
 use crate::core::cache::Cache;
 use crate::core::lru::Lru;
-use crate::core::realtime::{self, Realtime};
+use crate::core::realtime::{self, Realtime, Scope};
 use crate::core::types::*;
 use crate::core::{self};
 use crate::dm::Vault;
@@ -30,12 +35,26 @@ const THUMBNAIL: (u32, u32) = (840, 600);
 /// The lightbox gets the picture at its own size, up to this on either side.
 const FULL: (u32, u32) = (4096, 4096);
 
+/// How often a session in the background looks after itself: closing a socket gone quiet, and
+/// asking whether anything arrived.
+const KEEP_TICK: Duration = Duration::from_secs(5);
+/// How often a background server is asked whether anything arrived, with no socket open. Short
+/// enough that a call rings well inside the server's 45 s; the server takes a poll as being there.
+const POLL_EVERY: Duration = Duration::from_secs(15);
+/// As often while one of its conversations is on screen, so a reply shows soon.
+const POLL_WATCHING: Duration = Duration::from_secs(8);
+/// How long a background socket stays open after the last message either way, or after you opened
+/// the conversation. A call keeps it open for as long as it lasts.
+const AWAKE_FOR: Duration = Duration::from_secs(180);
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Link {
     /// Signed in and the socket is up.
     Up,
     /// The socket dropped; it is coming back on its own.
     Reconnecting,
+    /// A server kept in the background, with no socket open: it is asked now and then instead.
+    Asleep,
 }
 
 #[derive(Default)]
@@ -307,6 +326,19 @@ pub struct Session {
     pictures: Lru<String, Slot>,
     /// When the soonest animated frame handed out since `take_frame_due` gives way to the next.
     frame_due: Option<Instant>,
+    /// Kept in the background for its private messages, not the server on screen.
+    background: bool,
+    /// The last message either way, or the last time you opened or wrote in a conversation here.
+    active_at: Instant,
+    /// When the inbox was last asked, in the background with no socket open.
+    polled_at: Option<Instant>,
+    /// The socket being replaced, kept until the new one is up: closing it first would leave the
+    /// server a moment with no socket of yours, and a call ringing for you would end.
+    retiring: Option<Realtime>,
+    /// Stopped for good: nothing is asked or opened any more, whoever still holds it.
+    stopped: bool,
+    /// A new identity key is on its way to the server.
+    creating_key: bool,
     _pump: Task<()>,
 }
 
@@ -324,71 +356,203 @@ impl Session {
         cx: &mut App,
     ) -> Entity<Session> {
         cx.new(|cx| {
-            let (tx, rx) = async_channel::unbounded();
-            let rt = Realtime::start(core::runtime().handle(), api.clone(), tx);
-            let pump = cx.spawn(async move |this, cx| {
-                while let Ok(ev) = rx.recv().await {
-                    if this.update(cx, |s: &mut Session, cx| s.on_realtime(ev, cx)).is_err() {
-                        break;
-                    }
-                }
-            });
-            // The cache's index goes to disk every few seconds, so a crash loses little.
-            cx.spawn(async move |this, cx| {
-                loop {
-                    cx.background_executor().timer(Duration::from_secs(2)).await;
-                    let Ok(cache) = this.read_with(cx, |s: &Session, _| s.cache.clone()) else { break };
-                    cx.background_executor().spawn(async move { cache.flush() }).await;
-                }
-            })
-            .detach();
-            let vault = Vault::new(crate::core::keystore::KeyFile::open(&api.base(), &me.nickname), me.id);
-            let mut s = Session {
-                api,
-                cache,
-                realtime: Some(rt),
-                link: Link::Reconnecting,
-                users: HashMap::from([(me.id, me.clone())]),
-                vault,
-                dms: HashMap::new(),
-                dms_loaded: false,
-                blocked: HashSet::new(),
-                calls: HashMap::new(),
-                call_rosters: HashMap::new(),
-                call_outcomes: HashMap::new(),
-                me,
-                server_name,
-                server_icon,
-                server_info: None,
-                online: HashSet::new(),
-                channels: Vec::new(),
-                groups: Vec::new(),
-                rosters: HashMap::new(),
-                unlocked: HashSet::new(),
-                voice_cap: 16,
-                ice_servers,
-                emojis: Vec::new(),
-                clips: Vec::new(),
-                chats: HashMap::new(),
-                mentioned: HashMap::new(),
-                open_room: None,
-                unread: HashSet::new(),
-                viewing: None,
-                pictures: Lru::new(PICTURE_BUDGET),
-                frame_due: None,
-                _pump: pump,
-            };
+            let mut s = Session::new(api, cache, me, server_name, server_icon, ice_servers, false, cx);
+            s.connect(Scope::Full, cx);
             s.refresh_lists(cx);
             s.start_private(cx);
             s
         })
     }
 
+    /// A server you are signed in to but not looking at, for its private messages: its people,
+    /// keys and conversations now, and from then on a look at its inbox every so often.
+    pub fn start_background(api: Api, cache: Cache, me: User, server_name: String, server_icon: Option<String>, cx: &mut App) -> Entity<Session> {
+        cx.new(|cx| {
+            let mut s = Session::new(api, cache, me, server_name, server_icon, Vec::new(), true, cx);
+            s.refresh_lists(cx);
+            s.start_private(cx);
+            s
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        api: Api,
+        cache: Cache,
+        me: User,
+        server_name: String,
+        server_icon: Option<String>,
+        ice_servers: Vec<IceServer>,
+        background: bool,
+        cx: &mut Context<Self>,
+    ) -> Session {
+        // The cache's index goes to disk every few seconds, so a crash loses little.
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(2)).await;
+                let Ok(cache) = this.read_with(cx, |s: &Session, _| s.cache.clone()) else { break };
+                cx.background_executor().spawn(async move { cache.flush() }).await;
+            }
+        })
+        .detach();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(KEEP_TICK).await;
+                let Ok(poll) = this.update(cx, |s: &mut Session, cx| s.keep(cx)) else { break };
+                let Some(api) = poll else { continue };
+                let got = core::run(async move { api.inbox().await }).await;
+                if this.update(cx, |s: &mut Session, cx| s.inbox_said(got, cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+        let vault = Vault::new(crate::core::keystore::KeyFile::open(&api.base(), &me.nickname), me.id);
+        Session {
+            api,
+            cache,
+            realtime: None,
+            link: if background { Link::Asleep } else { Link::Reconnecting },
+            users: HashMap::from([(me.id, me.clone())]),
+            vault,
+            dms: HashMap::new(),
+            dms_loaded: false,
+            blocked: HashSet::new(),
+            calls: HashMap::new(),
+            call_rosters: HashMap::new(),
+            call_outcomes: HashMap::new(),
+            me,
+            server_name,
+            server_icon,
+            server_info: None,
+            online: HashSet::new(),
+            channels: Vec::new(),
+            groups: Vec::new(),
+            rosters: HashMap::new(),
+            unlocked: HashSet::new(),
+            voice_cap: 16,
+            ice_servers,
+            emojis: Vec::new(),
+            clips: Vec::new(),
+            chats: HashMap::new(),
+            mentioned: HashMap::new(),
+            open_room: None,
+            unread: HashSet::new(),
+            viewing: None,
+            pictures: Lru::new(PICTURE_BUDGET),
+            frame_due: None,
+            background,
+            active_at: Instant::now(),
+            polled_at: None,
+            retiring: None,
+            stopped: false,
+            creating_key: false,
+            _pump: Task::ready(()),
+        }
+    }
+
+    /// Opens a socket of this scope in place of any there is; the old one closes once the new one
+    /// is up.
+    fn connect(&mut self, scope: Scope, cx: &mut Context<Self>) {
+        let (tx, rx) = async_channel::unbounded();
+        let rt = Realtime::start(core::runtime().handle(), self.api.clone(), scope, tx);
+        self._pump = cx.spawn(async move |this, cx| {
+            while let Ok(ev) = rx.recv().await {
+                if this.update(cx, |s: &mut Session, cx| s.on_realtime(ev, cx)).is_err() {
+                    break;
+                }
+            }
+        });
+        if let Some(old) = self.realtime.replace(rt) {
+            if let Some(older) = self.retiring.replace(old) {
+                older.stop();
+            }
+        }
+        self.link = Link::Reconnecting;
+    }
+
     pub fn stop(&mut self) {
-        if let Some(rt) = self.realtime.take() {
+        self.stopped = true;
+        for rt in self.realtime.take().into_iter().chain(self.retiring.take()) {
             rt.stop();
         }
         self.cache.flush_all();
+    }
+
+    /// Kept in the background for its private messages, rather than the server on screen.
+    pub fn is_background(&self) -> bool {
+        self.background
+    }
+
+    /// This background server becomes the one on screen: a full socket, opened before the one it
+    /// replaces closes, and the lists the screen needs.
+    pub fn promote(&mut self, me: User, ice_servers: Vec<IceServer>, cx: &mut Context<Self>) {
+        self.background = false;
+        self.users.insert(me.id, me.clone());
+        self.me = me;
+        self.ice_servers = ice_servers;
+        self.connect(Scope::Full, cx);
+        self.refresh_lists(cx);
+        cx.notify();
+    }
+
+    /// Something is happening in a private conversation here: in the background, open the socket
+    /// if it is closed, and keep it open a while longer.
+    pub fn wake(&mut self, cx: &mut Context<Self>) {
+        self.active_at = Instant::now();
+        if self.background && !self.stopped && self.realtime.is_none() {
+            self.connect(Scope::Private, cx);
+            cx.notify();
+        }
+    }
+
+    /// Closes the background socket; the inbox is asked again from now on.
+    fn doze(&mut self, cx: &mut Context<Self>) {
+        for rt in self.realtime.take().into_iter().chain(self.retiring.take()) {
+            rt.stop();
+        }
+        self.link = Link::Asleep;
+        // Asked again at the next tick: the server counts a poll as being there, and with the
+        // socket closed nothing else says so.
+        self.polled_at = None;
+        cx.notify();
+    }
+
+    /// Every few seconds, in the background: closes a socket gone quiet, and says when the inbox is
+    /// due to be asked (with what to ask it with).
+    fn keep(&mut self, cx: &mut Context<Self>) -> Option<Api> {
+        if !self.background || self.stopped {
+            return None;
+        }
+        let now = Instant::now();
+        if self.realtime.is_some() {
+            if !self.calls.is_empty() {
+                self.active_at = now;
+            } else if now.duration_since(self.active_at) > AWAKE_FOR {
+                self.doze(cx);
+            }
+            return None;
+        }
+        let every = if self.viewing.is_some() { POLL_WATCHING } else { POLL_EVERY };
+        if self.polled_at.is_some_and(|at| now.duration_since(at) < every) {
+            return None;
+        }
+        self.polled_at = Some(now);
+        Some(self.api.clone())
+    }
+
+    /// The inbox's answer: something new, or a call, opens the socket to fetch it.
+    fn inbox_said(&mut self, got: Result<Inbox, ApiError>, cx: &mut Context<Self>) {
+        match got {
+            Ok(inbox) => {
+                let news = self.dms_loaded && inbox.latest > self.newest_dm();
+                if self.background && self.realtime.is_none() && (news || inbox.ringing || inbox.in_call) {
+                    self.wake(cx);
+                }
+            }
+            Err(e) if e.status == 401 => cx.emit(SessionEvent::SignedOut(SignOutReason::Expired)),
+            Err(e) => log::debug!("inbox of {} did not answer: {e}", self.api.base()),
+        }
     }
 
     /// Users, emoji and soundpad clips, and the REST channel list for the `unlocked` flags.
@@ -440,7 +604,27 @@ impl Session {
     }
 
     fn on_realtime(&mut self, ev: realtime::Event, cx: &mut Context<Self>) {
+        if matches!(ev, realtime::Event::Up(_))
+            && let Some(old) = self.retiring.take()
+        {
+            old.stop();
+        }
         match ev {
+            realtime::Event::Up(snap) if self.background => {
+                // Only your calls come with a background socket's hello; the keys and the
+                // conversations are asked for, with what arrived while it was closed. Keys too: a
+                // key that changed is told to everyone at once, which a background socket never
+                // hears, and a call sealed to it would not open.
+                let calls_before = self.calls.clone();
+                if let Some(snap) = snap {
+                    self.call_rosters = snap.calls.iter().map(|c| (c.conversation_id, c.roster.clone())).collect();
+                    self.calls = snap.calls.into_iter().map(|c| (c.conversation_id, c)).collect();
+                }
+                self.link = Link::Up;
+                self.calls_reconciled(calls_before, cx);
+                self.start_private(cx);
+                self.catch_up(cx);
+            }
             realtime::Event::Up(snap) => {
                 let was_down = self.link == Link::Reconnecting && !self.channels.is_empty();
                 let calls_before = self.calls.clone();
@@ -791,7 +975,10 @@ impl Session {
                 let server = self.api.base();
                 crate::prefs::set_prefs(cx, |s| s.set_last_channel(&server, id));
             }
-            Room::Dm(id) => self.mark_read(id, cx),
+            Room::Dm(id) => {
+                self.wake(cx);
+                self.mark_read(id, cx);
+            }
         }
         let log = self.chats.entry(room).or_default();
         if !log.loaded && !log.fetching {

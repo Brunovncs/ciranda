@@ -66,6 +66,16 @@ pub struct Realtime {
     commands: mpsc::UnboundedSender<Command>,
 }
 
+/// What a socket hears.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    /// Everything: the server on screen.
+    Full,
+    /// Only what is sent to you (private messages, calls), for a server kept in the background.
+    /// It does not count as being online there.
+    Private,
+}
+
 /// `http(s)://host:port/anything` → `ws(s)://host:port/ws`.
 pub fn ws_url(base: &str) -> Option<String> {
     let mut url = url::Url::parse(base).ok()?;
@@ -79,10 +89,10 @@ pub fn ws_url(base: &str) -> Option<String> {
 impl Realtime {
     /// The token is read from `api` on every connect, so a new one (a changed password) is used
     /// from the next reconnect on.
-    pub fn start(rt: &tokio::runtime::Handle, api: Api, events: async_channel::Sender<Event>) -> Realtime {
+    pub fn start(rt: &tokio::runtime::Handle, api: Api, scope: Scope, events: async_channel::Sender<Event>) -> Realtime {
         let (tx, rx) = mpsc::unbounded_channel();
         let url = ws_url(&api.base()).unwrap_or_default();
-        rt.spawn(run(url, api, rx, events));
+        rt.spawn(run(url, api, scope, rx, events));
         Realtime { commands: tx }
     }
 
@@ -110,7 +120,7 @@ impl Realtime {
 
 type Pending = HashMap<String, oneshot::Sender<Result<Value, RequestError>>>;
 
-async fn run(url: String, api: Api, mut commands: mpsc::UnboundedReceiver<Command>, events: async_channel::Sender<Event>) {
+async fn run(url: String, api: Api, scope: Scope, mut commands: mpsc::UnboundedReceiver<Command>, events: async_channel::Sender<Event>) {
     let mut attempt = 0usize;
     let mut next_rid = 0u64;
     loop {
@@ -120,7 +130,11 @@ async fn run(url: String, api: Api, mut commands: mpsc::UnboundedReceiver<Comman
                 let (mut sink, mut stream) = ws.split();
                 next_rid += 1;
                 let hello_rid = next_rid.to_string();
-                let hello = json!({ "type": "hello", "token": api.token(), "rid": hello_rid }).to_string();
+                let mut hello = json!({ "type": "hello", "token": api.token(), "rid": hello_rid });
+                if scope == Scope::Private {
+                    hello["scope"] = json!("private");
+                }
+                let hello = hello.to_string();
                 if sink.send(WsMessage::Text(hello.into())).await.is_err() {
                     continue;
                 }

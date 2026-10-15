@@ -411,7 +411,8 @@ one step at a time, with the candidate pair that won.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/api/health` | Status, and whether a password is required. Outside the password gate |
+| `GET` | `/api/health` | Status, whether a password is required, and `features` (`inbox`). Outside the password gate |
+| `GET` | `/api/inbox` | The newest private message and whether a call rings for you, for a client keeping this server in the background. Asking keeps you reachable for calls for 40 s |
 | `GET` | `/api/media/:hash?k=` | An upload by media key (`GET /api/media-key`), for browser and Android clients that cannot send headers. Outside the password gate: the key, issued behind it, stands in for it. Never a private conversation's file |
 | `GET` | `/api/server/logo` | The server's picture, behind the password gate but not a login; the same one as `/api/server/icon/:hash` |
 | `GET` | `/api/streams` | Who is live, viewer counts, watch URLs, ICE servers |
