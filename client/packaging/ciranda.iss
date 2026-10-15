@@ -45,7 +45,8 @@ RestartApplications=no
 Compression=lzma2/max
 SolidCompression=yes
 OutputDir={#Root}\..\dist
-OutputBaseFilename=ciranda-{#Version}-setup
+; It must not end in -windows-x64.exe: the in-app updater takes the first asset that does.
+OutputBaseFilename=ciranda-{#Version}-windows-x64-setup
 
 [Languages]
 Name: "en"; MessagesFile: "compiler:Default.isl"

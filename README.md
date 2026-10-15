@@ -77,7 +77,7 @@ workload) installed:
 cargo build --release --manifest-path client/Cargo.toml   # -> client/target/release/ciranda.exe
 ```
 
-Or download `ciranda-<version>-setup.exe` from the
+Or download `ciranda-<version>-windows-x64-setup.exe` from the
 [latest release](https://github.com/Brunovncs/ciranda/releases/latest). It
 installs for your user only, with no administrator prompt, and asks whether to
 add Ciranda to the Start menu and the desktop. Uninstalling (from Windows'

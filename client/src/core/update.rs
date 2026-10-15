@@ -226,6 +226,16 @@ mod tests {
         if cfg!(windows) {
             assert_eq!(r.exe, Some(("https://example/exe".into(), "https://example/sha".into())));
         }
+        // The installer sits beside the program in a release, listed first or not; the updater
+        // still takes the program.
+        let with_installer = br#"{"tag_name":"v4.2.1","assets":[
+            {"name":"ciranda-4.2.1-windows-x64-setup.exe","browser_download_url":"https://example/setup"},
+            {"name":"ciranda-4.2.1-windows-x64-setup.exe.sha256","browser_download_url":"https://example/setup-sha"},
+            {"name":"ciranda-4.2.1-windows-x64.exe","browser_download_url":"https://example/exe"},
+            {"name":"ciranda-4.2.1-windows-x64.exe.sha256","browser_download_url":"https://example/sha"}]}"#;
+        if cfg!(windows) {
+            assert_eq!(parse(with_installer).unwrap().exe, Some(("https://example/exe".into(), "https://example/sha".into())));
+        }
         let without = parse(br#"{"tag_name":"v4.0.1","assets":[]}"#).unwrap();
         assert_eq!(without.exe, None);
         assert_eq!(without.page, RELEASES_PAGE);
