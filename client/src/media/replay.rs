@@ -618,7 +618,10 @@ mod imp {
                 })
                 .unwrap();
                 let secs = (last - first.unwrap()) as f64 / HNS as f64;
-                assert_eq!(first, Some(0), "starts at a key frame, at zero");
+                // At zero, give or take what an encoder with reordered frames shifts the
+                // pictures by (Microsoft's software one: about 15 ms).
+                let start = first.unwrap() as f64 / HNS as f64;
+                assert!(start.abs() < 0.1, "starts at {start} s");
                 assert!((4.5..=9.5).contains(&secs), "{secs} s kept");
                 assert!(frames as f64 >= secs * fps as f64 * 0.9, "{frames} frames");
                 drop(r);
