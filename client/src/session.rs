@@ -788,6 +788,8 @@ impl Session {
             Room::Channel(id) => {
                 self.mentioned.remove(&id);
                 self.unread.remove(&id);
+                let server = self.api.base();
+                crate::prefs::set_prefs(cx, |s| s.set_last_channel(&server, id));
             }
             Room::Dm(id) => self.mark_read(id, cx),
         }

@@ -26,8 +26,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-/// Per-person volumes (0..3.5), by user so they survive changing slots and rejoining. Kept for as
-/// long as the app runs, as in the old client.
+/// Per-person volumes (0..3.5) on the server of the call, by user so they survive changing slots
+/// and rejoining. Read from the settings as a call starts, and saved there as they change.
 fn volumes() -> &'static Mutex<HashMap<UserId, f32>> {
     static V: OnceLock<Mutex<HashMap<UserId, f32>>> = OnceLock::new();
     V.get_or_init(Default::default)
@@ -273,6 +273,7 @@ impl Voice {
     ) -> Voice {
         let a = audio::audio();
         apply_mic_prefs(cx);
+        *volumes().lock() = crate::prefs::prefs(cx).voice_volumes_on(&session.read(cx).api.base());
         a.mixer.deafened.store(deafened, std::sync::atomic::Ordering::Relaxed);
         a.mic.muted.store(muted, std::sync::atomic::Ordering::Relaxed);
         // Speaking rings, ten times a second.
@@ -787,6 +788,8 @@ impl Voice {
         for p in self.peers.values().filter(|p| p.user == user) {
             p.source.gain.set(gain);
         }
+        let server = self.session.read(cx).api.base();
+        crate::prefs::set_prefs(cx, |s| s.set_voice_volume(&server, user, gain));
         cx.notify();
     }
 

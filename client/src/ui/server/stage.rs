@@ -18,12 +18,16 @@ use crate::ui::overlay::{self, Dismiss, menu_card, menu_item, menu_rule};
 use crate::widgets::*;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, App, AppContext, Context, Entity, EventEmitter, Focusable, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    Animation, AnimationExt, AnyElement, App, AppContext, Context, Entity, EventEmitter, Focusable, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
     ParentElement, Pixels, Point, Render, SharedString, StatefulInteractiveElement, StyleRefinement, Styled, Window, anchored, div,
     surface,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+/// How long the controls stay over a stream watched over the whole window once the pointer rests.
+const THEATER_CONTROLS: Duration = Duration::from_millis(2500);
 
 /// Whether you are sending your camera and your screen.
 pub fn sharing(_: &Entity<Session>, voice: Option<&Entity<Voice>>, cx: &App) -> (bool, bool) {
@@ -390,19 +394,8 @@ impl ServerView {
                     )
                     .child(
                         tool_button(("fullscreen", id), "fullscreen", false, gpui::white(), t)
-                            .tooltip(tip(
-                                if window.is_fullscreen() {
-                                    tr!("Leave full screen (double-click)", "Sair da tela cheia (clique duplo)")
-                                } else {
-                                    tr!("Full screen (double-click)", "Tela cheia (clique duplo)")
-                                },
-                                t,
-                            ))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.focused_tile = Some(t2.clone());
-                                window.toggle_fullscreen();
-                                cx.notify();
-                            })),
+                            .tooltip(tip(tr!("Full screen (double-click)", "Tela cheia (clique duplo)"), t))
+                            .on_click(cx.listener(move |this, _, _, cx| this.enter_theater(t2.clone(), cx))),
                     )
                     .when(!local, |d| {
                         let (tile, voice) = (tile.clone(), voice.clone());
@@ -419,15 +412,296 @@ impl ServerView {
             )
             .on_click(cx.listener({
                 let tile = tile.clone();
-                move |this, e: &gpui::ClickEvent, window, cx| {
+                move |this, e: &gpui::ClickEvent, _, cx| {
                     if e.click_count() == 2 {
-                        this.focused_tile = Some(tile.clone());
-                        window.toggle_fullscreen();
-                        cx.notify();
+                        this.enter_theater(tile.clone(), cx);
                     }
                 }
             }));
         speaking(el, lit, radius::CARD + 2., t).into_any_element()
+    }
+
+    /// Watches a stream over the whole window: nothing around it but a bar along the bottom with
+    /// the people in the call and its controls, which hides while the pointer rests.
+    pub fn enter_theater(&mut self, tile: Entity<Tile>, cx: &mut Context<Self>) {
+        self.theater = Some(tile);
+        self.theater_bar_hover = false;
+        self.theater_moved = Instant::now() - THEATER_CONTROLS;
+        self.theater_poke(cx);
+        let _ = self.root.update(cx, |_, cx| cx.notify());
+        cx.notify();
+    }
+
+    /// Back to the window as it was, out of the monitor's full screen too.
+    pub fn leave_theater(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.theater = None;
+        if window.is_fullscreen() {
+            window.toggle_fullscreen();
+        }
+        let _ = self.root.update(cx, |_, cx| cx.notify());
+        cx.notify();
+    }
+
+    fn theater_controls_shown(&self) -> bool {
+        self.theater_bar_hover || self.theater_moved.elapsed() < THEATER_CONTROLS
+    }
+
+    /// The pointer moved over the stream: the controls show, and hide again once it rests.
+    fn theater_poke(&mut self, cx: &mut Context<Self>) {
+        let shown = self.theater_controls_shown();
+        // Moves come by the dozen; a new wake-up every quarter second is plenty.
+        if shown && self.theater_moved.elapsed() < Duration::from_millis(250) {
+            return;
+        }
+        self.theater_moved = Instant::now();
+        self.theater_wake = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(THEATER_CONTROLS).await;
+            let _ = this.update(cx, |_, cx| cx.notify());
+        });
+        if !shown {
+            cx.notify();
+        }
+    }
+
+    pub fn render_theater(
+        &mut self,
+        tile: &Entity<Tile>,
+        voice: &Entity<Voice>,
+        t: &Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(call) = self.call.clone() else { return div().into_any_element() };
+        let c = call.read(cx);
+        let (place, muted, deafened) = (c.place, c.muted, c.deafened);
+        let private = place.conversation().is_some();
+        let (camera_on, screen_on) = sharing(&self.session, Some(voice), cx);
+        let roster = self.session.read(cx).roster(place).cloned().unwrap_or_default();
+        let tiles = voice.read(cx).tiles.clone();
+        let tl = tile.read(cx);
+        let (user, kind, local) = (tl.user, tl.kind, tl.local);
+        // The frames come at the size of the window, in its pixels.
+        let size = window.viewport_size();
+        let s = window.scale_factor();
+        tl.slot.want_w.store((f32::from(size.width) * s) as u32, std::sync::atomic::Ordering::Relaxed);
+        tl.slot.want_h.store((f32::from(size.height) * s) as u32, std::sync::atomic::Ordering::Relaxed);
+        let name = self.session.read(cx).display_name(Some(user), None);
+        let shown = self.theater_controls_shown();
+        let white = gpui::white();
+
+        let label = div()
+            .absolute()
+            .left(px(20.))
+            .top(px(18.))
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .px(px(10.))
+            .py(px(6.))
+            .rounded(px(8.))
+            .bg(gpui::black().opacity(0.55))
+            .when(kind == TileKind::Screen, |d| d.child(live_chip(t, true)))
+            .child(div().text_size(px(13.)).text_color(white).child(if local { trf!("{} (you)", "{} (você)", name) } else { name.to_string() }))
+            .child(div().text_size(px(12.)).text_color(white.opacity(0.7)).child(if kind == TileKind::Screen {
+                tr!("screen", "tela")
+            } else {
+                tr!("camera", "câmera")
+            }));
+
+        // The people in the call; a click shows the stream of whoever has one, their screen first.
+        let mut people = div().flex().items_center().gap(px(6.));
+        const MOST: usize = 8;
+        for m in roster.iter().take(MOST) {
+            let person = self.session.read(cx).display_name(Some(m.user_id), Some(&m.nickname));
+            let image = self.session.update(cx, |s, cx| s.avatar(m.user_id, cx));
+            let ring = self.is_speaking(place, m.user_id, cx).then_some(t.success);
+            let theirs = tiles
+                .iter()
+                .filter(|x| x.read(cx).user == m.user_id)
+                .min_by_key(|x| if x.read(cx).kind == TileKind::Screen { 0 } else { 1 })
+                .cloned();
+            let watched = m.user_id == user;
+            let quiet = m.muted || m.silenced() || m.deafened;
+            people = people.child(
+                div()
+                    .id(("theater-person", m.mid as u64))
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(3.))
+                    .child(avatar(&person, image, 32., ring))
+                    .child(div().size(px(4.)).rounded_full().when(watched, |d| d.bg(t.accent)))
+                    .when(quiet, |d| {
+                        d.child(
+                            div()
+                                .absolute()
+                                .right(px(-3.))
+                                .top(px(18.))
+                                .size(px(16.))
+                                .rounded_full()
+                                .bg(gpui::black().opacity(0.8))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(icon(if m.deafened { "headphones-off" } else { "mic-off" }, 10., white.opacity(0.9))),
+                        )
+                    })
+                    .tooltip(tip(if theirs.is_some() && !watched { trf!("{} · watch", "{} · assistir", person) } else { person }, t))
+                    .when_some(theirs.filter(|_| !watched), |d, theirs| {
+                        d.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| this.enter_theater(theirs.clone(), cx)))
+                    }),
+            );
+        }
+        if roster.len() > MOST {
+            people = people.child(mono(format!("+{}", roster.len() - MOST), white.opacity(0.7)));
+        }
+
+        let button = |id: &'static str, glyph: &'static str, on: bool, color: gpui::Hsla| tool_button(id, glyph, on, color, t).size(px(38.));
+        let rule = || div().w(px(1.)).h(px(24.)).mx(px(4.)).bg(white.opacity(0.18));
+        let fullscreen = window.is_fullscreen();
+        let controls = div()
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .child(
+                button("theater-mute", if muted { "mic-off" } else { "mic" }, muted, if muted { t.critical } else { white })
+                    .tooltip(tip(
+                        if muted {
+                            tr!("Unmute (Ctrl+Shift+M)", "Reativar o microfone (Ctrl+Shift+M)")
+                        } else {
+                            tr!("Mute (Ctrl+Shift+M)", "Silenciar (Ctrl+Shift+M)")
+                        },
+                        t,
+                    ))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_mute(cx))),
+            )
+            .child(
+                button("theater-deafen", if deafened { "headphones-off" } else { "headphones" }, deafened, if deafened { t.critical } else { white })
+                    .tooltip(tip(
+                        if deafened {
+                            tr!("Undeafen (Ctrl+Shift+D)", "Reativar o som (Ctrl+Shift+D)")
+                        } else {
+                            tr!("Deafen (Ctrl+Shift+D)", "Desativar o som (Ctrl+Shift+D)")
+                        },
+                        t,
+                    ))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_deafen(cx))),
+            )
+            .child(
+                button("theater-camera", if camera_on { "camera-off" } else { "camera" }, false, white)
+                    .tooltip(tip(
+                        if camera_on { tr!("Turn the camera off", "Desligar a câmera") } else { tr!("Turn the camera on", "Ligar a câmera") },
+                        t,
+                    ))
+                    .on_click(cx.listener(|this, _, window, cx| this.toggle_camera(window, cx))),
+            )
+            .child(
+                button("theater-screen", if screen_on { "screen-share-off" } else { "screen-share" }, false, white)
+                    .tooltip(tip(
+                        if screen_on {
+                            tr!("Change or stop what you share", "Trocar ou parar o que você compartilha")
+                        } else {
+                            tr!("Share your screen", "Compartilhar a tela")
+                        },
+                        t,
+                    ))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, e: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.toggle_screen(e.position, window, cx)
+                        }),
+                    ),
+            )
+            .child(
+                div()
+                    .id("theater-hang-up")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .h(px(38.))
+                    .px(px(14.))
+                    .ml(px(4.))
+                    .rounded(px(10.))
+                    .cursor_pointer()
+                    .bg(t.critical)
+                    .hover(|s| s.opacity(0.85))
+                    .child(icon("phone-off", 18., white))
+                    .tooltip(tip(if private { tr!("Hang up", "Desligar") } else { tr!("Leave the channel", "Sair do canal") }, t))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.leave_theater(window, cx);
+                        this.leave_voice(cx);
+                    })),
+            )
+            .child(rule())
+            .child(
+                button("theater-monitor", if fullscreen { "minimize" } else { "maximize" }, false, white)
+                    .tooltip(tip(
+                        if fullscreen {
+                            tr!("Leave the monitor's full screen (F)", "Sair da tela cheia do monitor (F)")
+                        } else {
+                            tr!("Full screen on the monitor (F)", "Tela cheia no monitor (F)")
+                        },
+                        t,
+                    ))
+                    .on_click(cx.listener(|_, _, window, cx| {
+                        window.toggle_fullscreen();
+                        cx.notify();
+                    })),
+            )
+            .child(
+                button("theater-back", "shrink", false, white)
+                    .tooltip(tip(tr!("Back to the app (Esc)", "Voltar ao app (Esc)"), t))
+                    .on_click(cx.listener(|this, _, window, cx| this.leave_theater(window, cx))),
+            );
+
+        let bar = div()
+            .id("theater-bar")
+            .occlude()
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .px(px(12.))
+            .py(px(8.))
+            .rounded(px(16.))
+            .bg(gpui::black().opacity(0.72))
+            .border_1()
+            .border_color(white.opacity(0.1))
+            .shadow_lg()
+            .child(people)
+            .child(rule())
+            .child(controls)
+            .on_hover(cx.listener(|this, on: &bool, _, cx| {
+                this.theater_bar_hover = *on;
+                if !on {
+                    // Off the bar, it stays a moment as after a move.
+                    this.theater_moved = Instant::now();
+                    this.theater_wake = cx.spawn(async move |this, cx| {
+                        cx.background_executor().timer(THEATER_CONTROLS).await;
+                        let _ = this.update(cx, |_, cx| cx.notify());
+                    });
+                }
+                cx.notify();
+            }))
+            .with_animation("theater-bar-in", Animation::new(Duration::from_millis(160)), |d, p| d.opacity(p).mb(px(8. * (1. - p))));
+
+        div()
+            .id("theater")
+            .relative()
+            .size_full()
+            .bg(gpui::black())
+            .child(tile.clone().cached(StyleRefinement::default().size_full()))
+            .when(shown, |d| d.child(label).child(div().absolute().left_0().right_0().bottom(px(22.)).flex().justify_center().child(bar)))
+            .on_mouse_move(cx.listener(|this, _: &gpui::MouseMoveEvent, _, cx| this.theater_poke(cx)))
+            .on_click(cx.listener(|this, e: &gpui::ClickEvent, window, cx| {
+                if e.click_count() == 2 {
+                    window.toggle_fullscreen();
+                    this.theater_poke(cx);
+                    cx.notify();
+                }
+            }))
+            .into_any_element()
     }
 
     pub fn open_soundpad(&mut self, at: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {

@@ -89,7 +89,7 @@ impl Backup {
         let target = cx.prompt_for_new_path(&dir, Some("ciranda-chave-de-recuperacao.txt"));
         let text = format!(
             "{}\r\n\r\n{}\r\n\r\n{}\r\n",
-            tr!("Ciranda recovery key", "Chave de recuperação da Ciranda"),
+            tr!("Ciranda recovery key", "Chave de recuperação de Ciranda"),
             self.key,
             tr!(
                 "It opens your private messages on another computer. Keep it to yourself.",

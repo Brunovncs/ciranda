@@ -4,6 +4,7 @@
 pub mod api;
 pub mod cache;
 pub mod crypto;
+pub mod install;
 pub mod keystore;
 pub mod lru;
 pub mod realtime;

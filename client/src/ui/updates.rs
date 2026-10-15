@@ -76,7 +76,7 @@ impl Updater {
                         overlay::toast(
                             trf!(
                                 "Ciranda was updated to version {}.",
-                                "A Ciranda foi atualizada para a versão {}.",
+                                "Ciranda agora está na versão {}.",
                                 env!("CARGO_PKG_VERSION")
                             ),
                             cx,
@@ -135,10 +135,10 @@ impl Updater {
             State::Ready(r) => {
                 let this = cx.entity();
                 Ask::confirm_action(
-                    tr!("Restart Ciranda now?", "Reiniciar a Ciranda agora?"),
+                    tr!("Restart Ciranda now?", "Reiniciar Ciranda agora?"),
                     trf!(
                         "Ciranda {} is ready. Restarting now takes you out of the voice call; otherwise it restarts by itself when you leave.",
-                        "A Ciranda {} está pronta. Reiniciar agora tira você da chamada de voz; senão ela reinicia sozinha quando você sair.",
+                        "A versão {} de Ciranda está pronta. Reiniciar agora tira você da chamada de voz; se não, Ciranda reinicia automaticamente quando você sair.",
                         r.version
                     ),
                     tr!("Leave the call and restart", "Sair da chamada e reiniciar"),
@@ -272,7 +272,7 @@ fn excerpt(notes: &str) -> String {
 }
 
 fn about(r: &Release) -> String {
-    let head = trf!("Ciranda {} is out.", "A Ciranda {} já está disponível.", r.version);
+    let head = trf!("Ciranda {} is out.", "Ciranda {} já está disponível.", r.version);
     match excerpt(&r.notes) {
         notes if notes.is_empty() => head,
         notes => format!("{head}\n\n{notes}"),
@@ -326,7 +326,7 @@ pub fn button(cx: &App) -> Option<AnyElement> {
             let hint = if installs {
                 tr!(
                     "Click to update. Ciranda restarts by itself, after your call if you're in one.",
-                    "Clique para atualizar. A Ciranda reinicia sozinha, depois da sua chamada se você estiver em uma."
+                    "Clique para atualizar. Ciranda reinicia automaticamente, depois da sua chamada se você estiver em uma."
                 )
             } else {
                 tr!(
@@ -359,13 +359,13 @@ pub fn button(cx: &App) -> Option<AnyElement> {
                 "Atualizando {}%",
                 (done * 100.).round() as u32
             )))
-            .tooltip(tip(trf!("Downloading Ciranda {}…", "Baixando a Ciranda {}…", r.version), &t))
+            .tooltip(tip(trf!("Downloading Ciranda {}…", "Baixando Ciranda {}…", r.version), &t))
             .into_any_element(),
         State::Ready(r) => clickable(pill("update-ready", "restart", tr!("Restart", "Reiniciar"), t.on_accent, t.accent, t.accent))
             .tooltip(tip(
                 trf!(
                     "Ciranda {} is ready. It restarts by itself when you leave the call, or click to restart now.",
-                    "A Ciranda {} está pronta. Ela reinicia sozinha quando você sair da chamada, ou clique para reiniciar agora.",
+                    "A versão {} de Ciranda está pronta. Ciranda reinicia automaticamente quando você sair da chamada, ou clique para reiniciar agora.",
                     r.version
                 ),
                 &t,
@@ -383,7 +383,7 @@ pub fn button(cx: &App) -> Option<AnyElement> {
             t.tint(t.critical),
             t.critical.opacity(0.4),
         ))
-        .tooltip(tip(trf!("Ciranda {} could not be installed: {}", "Não foi possível instalar a Ciranda {}: {}", r.version, e), &t))
+        .tooltip(tip(trf!("Ciranda {} could not be installed: {}", "Não foi possível instalar Ciranda {}: {}", r.version, e), &t))
         .into_any_element(),
         State::Idle | State::Current => return None,
     };
@@ -404,12 +404,12 @@ pub fn settings_row(t: &Theme, cx: &mut App) -> AnyElement {
         _ if checking => (tr!("Checking…", "Verificando…").to_string(), t.text2),
         (State::Idle | State::Current, Some(e)) => (trf!("Couldn't check: {}", "Não foi possível verificar: {}", e), t.caution),
         (State::Current, None) => (trf!("{} is the latest version.", "A {} é a versão mais recente.", update::current()), t.success),
-        (State::Idle, None) => (trf!("This is Ciranda {}.", "Esta é a Ciranda {}.", update::current()), t.text2),
+        (State::Idle, None) => (trf!("This is Ciranda {}.", "Você está usando Ciranda {}.", update::current()), t.text2),
         (State::Failed(r, e), _) => {
-            (trf!("Ciranda {} could not be installed: {}", "Não foi possível instalar a Ciranda {}: {}", r.version, e), t.critical)
+            (trf!("Ciranda {} could not be installed: {}", "Não foi possível instalar Ciranda {}: {}", r.version, e), t.critical)
         }
         (_, _) => (
-            release.as_ref().map(|r| trf!("Ciranda {} is out.", "A Ciranda {} já está disponível.", r.version)).unwrap_or_default(),
+            release.as_ref().map(|r| trf!("Ciranda {} is out.", "Ciranda {} já está disponível.", r.version)).unwrap_or_default(),
             t.accent,
         ),
     };
@@ -446,7 +446,7 @@ pub fn settings_row(t: &Theme, cx: &mut App) -> AnyElement {
                         .child(caption(
                             tr!(
                                 "Asks GitHub for a newer version when Ciranda opens and every 6 hours. Nothing about you is sent.",
-                                "Pergunta ao GitHub por uma versão nova quando a Ciranda abre e a cada 6 horas. Nada sobre você é enviado."
+                                "Pergunta ao GitHub por uma versão nova quando Ciranda abre e a cada 6 horas. Nada sobre você é enviado."
                             ),
                             t.text2,
                         )),

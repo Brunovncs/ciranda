@@ -109,7 +109,7 @@ impl Refusal {
             Refusal::Unusable => tr!("That key can't be used as a hotkey.", "Essa tecla não pode ser usada como atalho."),
             Refusal::NeedsModifier => tr!(
                 "Add Ctrl or Alt. On its own this key would stop working in every other program while Ciranda is open.",
-                "Adicione Ctrl ou Alt. Sozinha, essa tecla pararia de funcionar em todos os outros programas enquanto a Ciranda estiver aberta."
+                "Adicione Ctrl ou Alt. Sozinha, essa tecla pararia de funcionar em todos os outros programas enquanto Ciranda estiver rodando."
             ),
         }
     }

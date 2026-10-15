@@ -52,6 +52,14 @@ pub struct ServerView {
     /// The "is calling you" dialog, while it rings.
     ringing: Option<Entity<private::Incoming>>,
     pub focused_tile: Option<Entity<crate::media::video::Tile>>,
+    /// The stream watched over the whole window, with the call's controls along the bottom.
+    pub theater: Option<Entity<crate::media::video::Tile>>,
+    /// When the pointer last moved over it: its controls hide once it rests.
+    theater_moved: std::time::Instant,
+    /// The pointer is on those controls, which keeps them up.
+    theater_bar_hover: bool,
+    /// Draws again when the controls are due to hide.
+    theater_wake: gpui::Task<()>,
     /// The pointer is on the connection dot, which opens to say what it means.
     link_hover: bool,
     /// When the last message tone played, so a burst of messages makes one sound.
@@ -140,14 +148,19 @@ impl ServerView {
         .detach();
         let sidebar = Panel::new(&this, &this, |s, t, w, cx| s.render_sidebar(t, w, cx).into_any_element(), cx);
         let members = Panel::new(&this, &session, |s, t, w, cx| s.render_members(t, w, cx).into_any_element(), cx);
+        let folded = prefs(cx).folded_groups_on(&session.read(cx).api.base()).iter().copied().collect();
         ServerView {
             session,
             root,
             center: Center::Stage,
-            folded: HashSet::new(),
+            folded,
             chats: HashMap::new(),
             call: None,
             focused_tile: None,
+            theater: None,
+            theater_moved: std::time::Instant::now(),
+            theater_bar_hover: false,
+            theater_wake: gpui::Task::ready(()),
             link_hover: false,
             message_cue_at: None,
             ringing: None,
@@ -156,6 +169,17 @@ impl ServerView {
             focus: cx.focus_handle(),
             _subs: subs,
         }
+    }
+
+    /// Folds or unfolds a group of the channel list, and remembers it for this server.
+    pub(super) fn toggle_fold(&mut self, group: i64, cx: &mut Context<Self>) {
+        if !self.folded.remove(&group) {
+            self.folded.insert(group);
+        }
+        let server = self.session.read(cx).api.base();
+        let groups = self.folded.iter().copied().collect();
+        crate::prefs::set_prefs(cx, |s| s.set_folded_groups(&server, groups));
+        cx.notify();
     }
 
     fn on_session(&mut self, cx: &mut Context<Self>) {
@@ -170,8 +194,13 @@ impl ServerView {
                 Room::Channel(id) => s.channel(*id).is_some(),
                 Room::Dm(id) => s.dms.contains_key(id),
             });
+            // Else the channel open when Ciranda last ran, while it is still a text channel.
+            let saved = || {
+                let id = prefs(cx).last_channel(&s.api.base())?;
+                s.channel(id).is_some_and(|c| c.kind == ChannelKind::Text).then_some(Room::Channel(id))
+            };
             let first = || s.layout().into_iter().flat_map(|(_, cs)| cs).find(|c| c.kind == ChannelKind::Text).map(|c| Room::Channel(c.id));
-            if let Some(room) = last.or_else(first) {
+            if let Some(room) = last.or_else(saved).or_else(first) {
                 self.center = Center::Chat(room);
                 self.session.update(cx, |s, cx| s.open(room, cx));
             }
@@ -675,6 +704,19 @@ impl ServerView {
 
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let k = &ev.keystroke;
+        // Over the whole window: Esc leaves the monitor's full screen first, then this; F toggles
+        // the monitor's full screen.
+        if self.theater.is_some() && !k.modifiers.control && !k.modifiers.alt {
+            match k.key.as_str() {
+                "escape" if window.is_fullscreen() => window.toggle_fullscreen(),
+                "escape" => self.leave_theater(window, cx),
+                "f" => window.toggle_fullscreen(),
+                _ => return,
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         if k.modifiers.control && !k.modifiers.shift {
             match k.key.as_str() {
                 "," => self.open_settings(window, cx),
@@ -1047,6 +1089,27 @@ impl<F: Fn(f32, &mut App) + 'static> VolumeSlider<F> {
 impl Render for ServerView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = current();
+        if let Some(tile) = self.theater.clone() {
+            let voice = self.call.as_ref().and_then(|c| c.read(cx).voice.clone());
+            if let Some(voice) = voice.filter(|v| v.read(cx).tiles.contains(&tile)) {
+                voice.read(cx).hide_streams(false);
+                return div()
+                    .key_context("Server")
+                    .track_focus(&self.focus)
+                    .on_key_down(cx.listener(Self::on_key))
+                    .size_full()
+                    .child(self.render_theater(&tile, &voice, &t, window, cx));
+            }
+            // The stream ended, or the call did.
+            self.theater = None;
+            if window.is_fullscreen() {
+                window.toggle_fullscreen();
+            }
+            let root = self.root.clone();
+            cx.defer(move |cx| {
+                let _ = root.update(cx, |_, cx| cx.notify());
+            });
+        }
         let show_members = prefs(cx).show_members && f32::from(window.viewport_size().width) > 900. * crate::theme::scale();
         let narrow = f32::from(window.viewport_size().width) < 720. * crate::theme::scale();
         let topbar = self.render_topbar(&t, cx);

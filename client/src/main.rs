@@ -40,9 +40,28 @@ fn first_size(cx: &gpui::App) -> gpui::Size<gpui::Pixels> {
     size(want.width.min(room.width * 0.85), want.height.min(room.height * 0.8))
 }
 
+/// Where the window was when Ciranda last ran, while its title bar is still on a screen (one
+/// unplugged since would leave it out of reach); else centred.
+fn first_bounds(cx: &gpui::App) -> WindowBounds {
+    if let Some(p) = prefs::prefs(cx).window.filter(|p| p.width >= 640. && p.height >= 480.) {
+        let b = Bounds::new(gpui::point(gpui::px(p.x), gpui::px(p.y)), size(gpui::px(p.width), gpui::px(p.height)));
+        let title_bar = Bounds::new(b.origin, size(b.size.width.min(gpui::px(240.)), gpui::px(32.)));
+        if cx.displays().iter().any(|d| d.bounds().intersects(&title_bar)) {
+            return if p.maximized { WindowBounds::Maximized(b) } else { WindowBounds::Windowed(b) };
+        }
+    }
+    WindowBounds::Windowed(Bounds::centered(None, first_size(cx), cx))
+}
+
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("ciranda=info,warn")).init();
     let smoke = std::env::args().any(|a| a == "--smoke");
+    // The installer's way to close a running Ciranda before it replaces or removes the program.
+    if std::env::args().any(|a| a == "--quit") {
+        let gone = tray::quit_running(&core::settings::data_dir(), std::time::Duration::from_secs(15));
+        std::process::exit(if gone { 0 } else { 1 });
+    }
+    core::install::note_version();
     let relaunched = core::update::relaunched();
     if let Some(legacy) = core::settings::legacy_dir() {
         let Some(_harmony) = tray::Instance::claim_legacy(&legacy, relaunched) else {
@@ -72,7 +91,7 @@ fn main() {
         ui::hotkeys::init(cx);
 
         let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, first_size(cx), cx))),
+            window_bounds: Some(first_bounds(cx)),
             titlebar: Some(TitlebarOptions { title: Some("Ciranda".into()), ..Default::default() }),
             app_id: Some("ciranda".into()),
             window_min_size: Some(size(gpui::px(640.), gpui::px(480.))),

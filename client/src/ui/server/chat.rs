@@ -163,7 +163,7 @@ impl ChatView {
         } else if !s.vault.peer_has_key(peer) {
             Some(trf!(
                 "{} can't receive private messages yet: they need to update Ciranda and open it once.",
-                "{} ainda não pode receber mensagens privadas: precisa atualizar a Ciranda e abri-la uma vez.",
+                "{} ainda não pode receber mensagens privadas: precisa atualizar Ciranda e abrir o app uma vez.",
                 name
             ))
         } else {
@@ -1094,7 +1094,7 @@ impl ChatView {
                     "shield-alert",
                     trf!(
                         "{}'s security key changed. It happens when someone sets Ciranda up again without their recovery key; if you weren't expecting it, compare your safety number with them.",
-                        "A chave de segurança de {} mudou. Isso acontece quando alguém configura a Ciranda de novo sem a chave de recuperação; se você não esperava por isso, comparem o código de segurança.",
+                        "A chave de segurança de {} mudou. Isso acontece quando alguém configura Ciranda de novo sem a chave de recuperação; se você não esperava por isso, comparem o código de segurança.",
                         name
                     ),
                     t.caution,

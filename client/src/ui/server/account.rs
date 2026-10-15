@@ -115,7 +115,7 @@ impl ServerView {
 /// The server's picture is made the same way and held to the same limit.
 pub(super) fn avatar_jpeg(path: &std::path::Path) -> Result<Vec<u8>, String> {
     let img = image::open(path).map_err(|_| {
-        tr!("That file is not a picture Ciranda can read.", "Esse arquivo não é uma imagem que a Ciranda consiga ler.").to_string()
+        tr!("That file is not a picture Ciranda can read.", "Ciranda não consegue ler esse arquivo como imagem.").to_string()
     })?;
     let side = img.width().min(img.height());
     let (x, y) = ((img.width() - side) / 2, (img.height() - side) / 2);

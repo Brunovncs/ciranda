@@ -50,14 +50,18 @@ impl Picker {
         let p = prefs(cx);
         let mut picker = Picker {
             focus: cx.focus_handle(),
-            kind: current.as_ref().map(|c| c.source.kind).unwrap_or(SourceKind::Screen),
+            kind: current.as_ref().map(|c| c.source.kind).unwrap_or(if p.share_kind == "window" { SourceKind::Window } else { SourceKind::Screen }),
             sources: None,
             stills: HashMap::new(),
             picked: current.as_ref().map(|c| c.source.id),
             resolution: current.as_ref().map(|c| c.resolution).unwrap_or_else(|| Resolution::from_setting(&p.resolution)),
             fps: current.as_ref().map(|c| c.fps).unwrap_or(if p.framerate == 0 { 30 } else { p.framerate }),
             sharp: current.as_ref().map(|c| c.sharp).unwrap_or(p.priority != "smooth"),
-            sound: current.as_ref().map(|c| c.sound).unwrap_or(Sound::System),
+            sound: current.as_ref().map(|c| c.sound).unwrap_or(match p.share_sound.as_str() {
+                "app" => Sound::App,
+                "off" => Sound::Off,
+                _ => Sound::System,
+            }),
             changing: current.is_some(),
             on_pick: Rc::new(on_pick),
             _load: Task::ready(()),
@@ -117,11 +121,18 @@ impl Picker {
         let Some(source) = self.sources.as_ref().and_then(|l| l.iter().find(|s| Some(s.id) == self.picked)).cloned() else { return };
         let sound = if self.sound == Sound::App && source.kind == SourceKind::Screen { Sound::System } else { self.sound };
         let choice = ScreenChoice { source, resolution: self.resolution, fps: self.fps, sharp: self.sharp, sound };
-        let (res, fps, sharp) = (self.resolution, self.fps, self.sharp);
+        let (res, fps, sharp, kind, sound) = (self.resolution, self.fps, self.sharp, self.kind, self.sound);
         set_prefs(cx, |p| {
             p.resolution = res.setting().into();
             p.framerate = fps;
             p.priority = if sharp { "sharp" } else { "smooth" }.into();
+            p.share_kind = if kind == SourceKind::Window { "window" } else { "screen" }.into();
+            p.share_sound = match sound {
+                Sound::System => "system",
+                Sound::App => "app",
+                Sound::Off => "off",
+            }
+            .into();
         });
         cx.emit(Dismiss);
         (self.on_pick)(choice, window, cx);

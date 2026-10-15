@@ -39,6 +39,9 @@ enum Mode {
     Register,
 }
 
+/// The shortest time the loading screen shows: a sign-in quicker than this would make it blink.
+const LOADING_AT_LEAST: Duration = Duration::from_millis(700);
+
 pub struct ConnectView {
     focus: FocusHandle,
     server: Entity<TextField>,
@@ -55,6 +58,11 @@ pub struct ConnectView {
     health: Option<Health>,
     /// A saved sign-in for this nickname, so the password can stay empty.
     saved_token: bool,
+    /// Going straight in with the saved sign-in, to the server of this name: the loading screen
+    /// shows instead of the form until it is in, or the form with what went wrong.
+    resuming: Option<String>,
+    /// When the loading screen came up, so it stays long enough to be seen rather than blink.
+    resuming_since: std::time::Instant,
     /// Asks the server about itself while the address and its password are typed.
     probe: Task<()>,
 }
@@ -114,6 +122,8 @@ impl ConnectView {
             error,
             health: None,
             saved_token,
+            resuming: None,
+            resuming_since: std::time::Instant::now(),
             probe: Task::ready(()),
         };
         let first = if p.server_url.is_empty() {
@@ -127,6 +137,9 @@ impl ConnectView {
         this.probe(cx);
         // Remembered on this computer: go straight in, as a chat app does.
         if this.error.is_none() && saved_token && !p.server_url.is_empty() {
+            let saved = p.saved_server(&p.server_url);
+            let name = saved.map(|s| s.name.clone()).filter(|n| !n.is_empty());
+            this.resuming = Some(name.or_else(|| saved.map(|s| s.host())).unwrap_or_else(|| p.server_url.clone()));
             cx.defer_in(window, |this: &mut ConnectView, _, cx| this.connect(cx));
         }
         this
@@ -203,9 +216,19 @@ impl ConnectView {
                 match result {
                     Ok(done) => {
                         let connected = finish(done, api, &server, &door, &nickname, remember, cx);
-                        cx.emit(ConnectEvent::Connected(connected));
+                        let wait = if this.resuming.is_some() { LOADING_AT_LEAST.saturating_sub(this.resuming_since.elapsed()) } else { Duration::ZERO };
+                        if wait.is_zero() {
+                            cx.emit(ConnectEvent::Connected(connected));
+                        } else {
+                            cx.spawn(async move |this, cx| {
+                                cx.background_executor().timer(wait).await;
+                                let _ = this.update(cx, |_, cx| cx.emit(ConnectEvent::Connected(connected)));
+                            })
+                            .detach();
+                        }
                     }
                     Err(Failure { message, health, expired }) => {
+                        this.resuming = None;
                         if let Some(h) = health {
                             note_health(&server, &h, cx);
                             if h.has_accounts == Some(false) && this.mode == Mode::SignIn {
@@ -226,7 +249,12 @@ impl ConnectView {
         .detach();
     }
 
+    pub fn resuming(&self) -> bool {
+        self.resuming.is_some()
+    }
+
     fn fail(&mut self, message: &str, cx: &mut Context<Self>) {
+        self.resuming = None;
         self.error = Some(message.into());
         cx.notify();
     }
@@ -338,7 +366,7 @@ async fn sign_in(api: &Api, mode: Mode, nickname: &str, password: &str, owner_ke
         return Err(fail(
             tr!(
                 "This server is older than accounts. Update it to use this version of Ciranda.",
-                "Este servidor é de uma versão sem contas. Atualize-o para usar esta versão da Ciranda."
+                "Este servidor é de uma versão sem contas. Atualize-o para usar esta versão de Ciranda."
             )
             .into(),
             &health,
@@ -426,6 +454,15 @@ pub fn clear_text_warning(t: &Theme) -> gpui::Div {
 impl Render for ConnectView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = current();
+        if let Some(name) = &self.resuming {
+            let text = trf!("Entering {}", "Entrando em {}", name);
+            return div()
+                .key_context("Connect")
+                .track_focus(&self.focus)
+                .size_full()
+                .child(crate::ui::loading_screen(text.into(), &t))
+                .into_any_element();
+        }
         let register = self.mode == Mode::Register;
         let needs_owner = self.health.as_ref().is_some_and(|h| h.needs_owner);
         let door_needed = self.health.as_ref().map(|h| h.password_required);
@@ -626,6 +663,7 @@ impl Render for ConnectView {
                     ))
                     .child(form),
             )
+            .into_any_element()
     }
 }
 

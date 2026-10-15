@@ -43,7 +43,7 @@ pub fn init(window: AnyWindowHandle, instance: &Instance, cx: &mut App) {
     .detach();
 }
 
-fn hwnd(window: &Window) -> Option<isize> {
+pub(crate) fn hwnd(window: &Window) -> Option<isize> {
     match HasWindowHandle::window_handle(window).ok()?.as_raw() {
         RawWindowHandle::Win32(h) => Some(h.hwnd.get()),
         _ => None,
@@ -63,7 +63,7 @@ fn on_close(window: &mut Window, cx: &mut App) -> bool {
         set_prefs(cx, |p| p.tray_notice_seen = true);
         if let Some(tray) = &cx.global::<TrayState>().tray {
             tray.notify(
-                tr!("Ciranda is still running in the tray", "A Ciranda continua rodando na bandeja"),
+                tr!("Ciranda is still running in the tray", "Ciranda continua rodando na bandeja"),
                 tr!(
                     "Calls and messages keep going. Click the icon to open it again, or right-click it to quit.",
                     "Chamadas e mensagens continuam. Clique no ícone para abrir de novo, ou com o botão direito para sair."

@@ -1,10 +1,11 @@
 name: Release
 
 # Push a tag like v4.0.1, matching the version in client/Cargo.toml, to build the Windows client
-# and publish it as a release. The release carries ciranda-<version>-windows-x64.exe and its
-# SHA-256, the two files the client's updater looks for (by their -windows-x64.exe ending, so
-# Harmony 4.1.1 and earlier find them too); the notes are GitHub's list of what
-# changed since the last tag. Nothing is signed by a vendor: SmartScreen warns on first launch.
+# and publish it as a release. The release carries the installer, ciranda-<version>-setup.exe, for
+# people installing Ciranda, and ciranda-<version>-windows-x64.exe, the program
+# alone, which the client's updater swaps in (found by its -windows-x64.exe ending, so Harmony
+# 4.1.1 and earlier find it too). Each has its SHA-256 beside it; the notes are GitHub's list of
+# what changed since the last tag. Nothing is signed by a vendor: SmartScreen warns on first launch.
 on:
   push:
     tags: ["v*"]
@@ -51,6 +52,15 @@ jobs:
           New-Item -ItemType Directory ..\dist | Out-Null
           Copy-Item target\release\ciranda.exe "..\dist\$name"
           (Get-FileHash "..\dist\$name" -Algorithm SHA256).Hash.ToLower() + "  $name" | Out-File -Encoding ascii "..\dist\$name.sha256"
+      - name: Installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup --no-progress -y | Out-Null }
+          & $iscc /Qp /DVersion=${{ needs.version.outputs.version }} /DBuild=target\release packaging\ciranda.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $setup = "ciranda-${{ needs.version.outputs.version }}-setup.exe"
+          (Get-FileHash "..\dist\$setup" -Algorithm SHA256).Hash.ToLower() + "  $setup" | Out-File -Encoding ascii "..\dist\$setup.sha256"
       - uses: actions/upload-artifact@v4
         with:
           name: windows

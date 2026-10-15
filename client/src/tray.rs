@@ -28,7 +28,7 @@ pub struct Menu {
     pub call: Option<(bool, bool)>,
 }
 
-pub use platform::{Instance, Tray, flash_window, hide_window, show_window};
+pub use platform::{Instance, Tray, flash_window, hide_window, is_minimized, quit_running, show_window};
 
 #[cfg(windows)]
 mod platform {
@@ -42,7 +42,8 @@ mod platform {
     use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, WAIT_ABANDONED, WAIT_OBJECT_0, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::System::Threading::{
-        CreateEventW, CreateMutexW, EVENT_MODIFY_STATE, INFINITE, OpenEventW, SetEvent, WaitForSingleObject,
+        CreateEventW, CreateMutexW, EVENT_MODIFY_STATE, INFINITE, OpenEventW, OpenMutexW, ReleaseMutex, SYNCHRONIZATION_SYNCHRONIZE,
+        SetEvent, WaitForMultipleObjects, WaitForSingleObject,
     };
     use windows::Win32::UI::Shell::{
         NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_USER, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION,
@@ -88,9 +89,38 @@ mod platform {
     }
 
     /// The settings folder's claim: a mutex this (the main) thread holds until Ciranda exits,
-    /// and the event another start signals to have the window shown.
+    /// and the events another start signals to have the window shown, or Ciranda quit.
     pub struct Instance {
         show: Option<isize>,
+        quit: Option<isize>,
+    }
+
+    /// `Local\Ciranda-<hash of the settings folder>`, the mutex's name; the events add a suffix.
+    fn instance_name(app: &str, data_dir: &Path) -> String {
+        let hash = hex::encode(Sha256::digest(data_dir.to_string_lossy().to_lowercase().as_bytes()));
+        format!(r"Local\{app}-{}", &hash[..16])
+    }
+
+    /// Asks the Ciranda running on this settings folder to quit, as its menu's Quit would, and
+    /// waits up to `timeout` for it to be gone; false when it is still there. The installer
+    /// runs this (`--quit`) before it replaces or removes the program.
+    pub fn quit_running(data_dir: &Path, timeout: Duration) -> bool {
+        let name = instance_name("Ciranda", data_dir);
+        let (mutex, quit) = (wide(&name), wide(&format!("{name}-quit")));
+        // SAFETY: plain Win32 calls with nul-terminated names that outlive them; every handle
+        // opened here is closed when the process exits, moments later.
+        unsafe {
+            let Ok(m) = OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, PCWSTR(mutex.as_ptr())) else { return true };
+            if let Ok(ev) = OpenEventW(EVENT_MODIFY_STATE, false, PCWSTR(quit.as_ptr())) {
+                let _ = SetEvent(ev);
+            }
+            let got = WaitForSingleObject(m, timeout.as_millis().min(u32::MAX as u128) as u32);
+            let gone = got == WAIT_OBJECT_0 || got == WAIT_ABANDONED;
+            if gone {
+                let _ = ReleaseMutex(m);
+            }
+            gone
+        }
     }
 
     impl Instance {
@@ -108,15 +138,14 @@ mod platform {
         }
 
         fn claim_as(app: &str, data_dir: &Path, wait: bool) -> Option<Instance> {
-            let hash = hex::encode(Sha256::digest(data_dir.to_string_lossy().to_lowercase().as_bytes()));
-            let name = format!(r"Local\{app}-{}", &hash[..16]);
-            let (mutex, show) = (wide(&name), wide(&format!("{name}-show")));
+            let name = instance_name(app, data_dir);
+            let (mutex, show, quit) = (wide(&name), wide(&format!("{name}-show")), wide(&format!("{name}-quit")));
             // SAFETY: plain Win32 calls with nul-terminated names that outlive them. The handles
             // stay open for the life of the process.
             unsafe {
                 let Ok(m) = CreateMutexW(None, false, PCWSTR(mutex.as_ptr())) else {
                     log::warn!("single instance: no mutex, running anyway");
-                    return Some(Instance { show: None });
+                    return Some(Instance { show: None, quit: None });
                 };
                 // An abandoned mutex is one whose holder exited without letting go: it is ours.
                 let got = WaitForSingleObject(m, if wait { 15_000 } else { 0 });
@@ -129,18 +158,26 @@ mod platform {
                     }
                     return None;
                 }
-                let show = CreateEventW(None, false, false, PCWSTR(show.as_ptr())).ok().map(|h| h.0 as isize);
-                Some(Instance { show })
+                let event = |name: &[u16]| CreateEventW(None, false, false, PCWSTR(name.as_ptr())).ok().map(|h| h.0 as isize);
+                Some(Instance { show: event(&show), quit: event(&quit) })
             }
         }
 
-        /// Sends `Event::Open` each time another start asks for the window.
+        /// Sends `Event::Open` each time another start asks for the window, and `Event::Quit`
+        /// when `--quit` asks Ciranda to go.
         pub fn on_show(&self, events: async_channel::Sender<Event>) {
-            let Some(show) = self.show else { return };
+            // Each event, and whether it is the one asking to quit.
+            let events_of: Vec<(isize, bool)> = [(self.show, false), (self.quit, true)].into_iter().filter_map(|(h, q)| Some((h?, q))).collect();
+            if events_of.is_empty() {
+                return;
+            }
             let spawned = std::thread::Builder::new().name("ciranda-instance".into()).spawn(move || {
-                // SAFETY: the event stays open for the life of the process.
-                while unsafe { WaitForSingleObject(HANDLE(show as _), INFINITE) } == WAIT_OBJECT_0 {
-                    if events.send_blocking(Event::Open).is_err() {
+                let handles: Vec<HANDLE> = events_of.iter().map(|&(h, _)| HANDLE(h as _)).collect();
+                loop {
+                    // SAFETY: the events stay open for the life of the process.
+                    let got = unsafe { WaitForMultipleObjects(&handles, false, INFINITE) };
+                    let Some(&(_, quit)) = events_of.get(got.0.wrapping_sub(WAIT_OBJECT_0.0) as usize) else { break };
+                    if events.send_blocking(if quit { Event::Quit } else { Event::Open }).is_err() {
                         break;
                     }
                 }
@@ -234,6 +271,11 @@ mod platform {
         unsafe {
             let _ = ShowWindowAsync(HWND(hwnd as _), SW_SHOW);
         }
+    }
+
+    pub fn is_minimized(hwnd: isize) -> bool {
+        // SAFETY: a plain query; a window that is gone answers false.
+        unsafe { windows::Win32::UI::WindowsAndMessaging::IsIconic(HWND(hwnd as _)).as_bool() }
     }
 
     /// Flashes the window's taskbar button until it is brought to the front, as a call should.
@@ -393,7 +435,7 @@ mod platform {
             let separator = || {
                 let _ = AppendMenuW(m, MF_SEPARATOR, 0, PCWSTR::null());
             };
-            item(MENU_ITEM_FLAGS(0), OPEN, tr!("Open Ciranda", "Abrir a Ciranda"));
+            item(MENU_ITEM_FLAGS(0), OPEN, tr!("Open Ciranda", "Abrir Ciranda"));
             let _ = SetMenuDefaultItem(m, OPEN as u32, 0);
             if let Some((muted, deafened)) = menu.call {
                 let check = |on: bool| if on { MF_CHECKED } else { MENU_ITEM_FLAGS(0) };
@@ -402,7 +444,7 @@ mod platform {
                 item(check(deafened), DEAFEN, tr!("Deafen", "Desativar o som"));
             }
             separator();
-            item(MENU_ITEM_FLAGS(0), QUIT, tr!("Quit Ciranda", "Sair da Ciranda"));
+            item(MENU_ITEM_FLAGS(0), QUIT, tr!("Quit Ciranda", "Fechar Ciranda"));
             // Without the foreground the menu would not close when clicking elsewhere.
             let _ = SetForegroundWindow(hwnd);
             let (x, y) = ANCHOR.get();
@@ -441,6 +483,10 @@ mod platform {
         pub fn on_show(&self, _: async_channel::Sender<Event>) {}
     }
 
+    pub fn quit_running(_: &Path, _: std::time::Duration) -> bool {
+        true
+    }
+
     pub struct Tray;
 
     impl Tray {
@@ -462,4 +508,8 @@ mod platform {
     pub fn show_window(_: isize) {}
 
     pub fn flash_window(_: isize) {}
+
+    pub fn is_minimized(_: isize) -> bool {
+        false
+    }
 }

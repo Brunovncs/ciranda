@@ -793,7 +793,7 @@ impl Settings {
             .child(body(
                 tr!(
                     "These work anywhere, even while a game has focus, and only while you are in a call. A combination bound here is taken from every other program while Ciranda is open, so use Ctrl or Alt, or an F-key.",
-                    "Funcionam em qualquer lugar, até com um jogo em primeiro plano, e só enquanto você está em uma chamada. Uma combinação definida aqui deixa de funcionar nos outros programas enquanto a Ciranda estiver aberta, então use Ctrl ou Alt, ou uma tecla F."
+                    "Funcionam em qualquer lugar, até com um jogo em primeiro plano, e só enquanto você está em uma chamada. Uma combinação definida aqui deixa de funcionar nos outros programas enquanto Ciranda estiver rodando, então use Ctrl ou Alt, ou uma tecla F."
                 ),
                 t.text2,
             ))
@@ -821,7 +821,7 @@ impl Settings {
                     tr!("Close to the tray", "Fechar para a bandeja"),
                     tr!(
                         "Closing the window keeps Ciranda running by the clock, calls included. Quit from its icon there.",
-                        "Fechar a janela deixa a Ciranda rodando ao lado do relógio, inclusive em chamadas. Para sair, use o ícone dela ali."
+                        "Fechar a janela deixa Ciranda rodando ao lado do relógio, inclusive em chamadas. Para fechar de vez, use o ícone ali."
                     ),
                     p.close_to_tray,
                     t,

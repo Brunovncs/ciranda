@@ -77,9 +77,14 @@ workload) installed:
 cargo build --release --manifest-path client/Cargo.toml   # -> client/target/release/ciranda.exe
 ```
 
-Or download `ciranda-<version>-windows-x64.exe` from the
-[latest release](https://github.com/Brunovncs/ciranda/releases/latest) and keep
-it in a folder you can write to. When a newer release is out, an Update button
+Or download `ciranda-<version>-setup.exe` from the
+[latest release](https://github.com/Brunovncs/ciranda/releases/latest). It
+installs for your user only, with no administrator prompt, and asks whether to
+add Ciranda to the Start menu and the desktop. Uninstalling (from Windows'
+installed apps) asks whether to keep your settings or remove everything,
+`%APPDATA%\Ciranda` included. The same release has
+`ciranda-<version>-windows-x64.exe`, the program alone, to keep in any folder
+you can write to. When a newer release is out, an Update button
 shows at the top of the window. It downloads the new program, checks its
 SHA-256, swaps it in and restarts Ciranda, waiting for your voice call to end if
 you are in one. Ciranda asks GitHub for the latest release when it opens and

@@ -710,7 +710,7 @@ pub fn friendly(code: ErrorCode, body: &Value) -> Option<String> {
         E::NoKey => tr!("Set up private messages first.", "Ative as mensagens privadas primeiro."),
         E::PeerHasNoKey => tr!(
             "They can't receive private messages yet: they need to update Ciranda and open it once.",
-            "Essa pessoa ainda não pode receber mensagens privadas: ela precisa atualizar a Ciranda e abri-la uma vez."
+            "Essa pessoa ainda não pode receber mensagens privadas: precisa atualizar Ciranda e abrir o app uma vez."
         ),
         E::StaleKey => tr!("A security key changed. Try again.", "Uma chave de segurança mudou. Tente de novo."),
         E::Blocked => tr!("You can't send messages in this conversation.", "Não é possível enviar mensagens nesta conversa."),

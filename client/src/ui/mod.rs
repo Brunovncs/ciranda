@@ -18,7 +18,7 @@ use crate::widgets::*;
 use connect::{ConnectEvent, ConnectView, Connected};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent, ParentElement,
+    Animation, AnimationExt, AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent, ParentElement,
     Render, RenderImage, SharedString, Styled, Subscription, Window, div,
 };
 use overlay::{Overlay, Toast};
@@ -77,6 +77,24 @@ impl Root {
         // into pictures for a window nobody sees.
         subs.push(cx.observe_window_visibility(window, |_, visibility, _, _| {
             crate::media::video::set_window_hidden(visibility == gpui::WindowVisibility::Hidden);
+        }));
+        // Where the window is, for the next start; a minimised window's place says nothing.
+        subs.push(cx.observe_window_bounds(window, |_, window, cx| {
+            if tray::hwnd(window).is_some_and(crate::tray::is_minimized) {
+                return;
+            }
+            let (b, maximized) = match window.window_bounds() {
+                gpui::WindowBounds::Maximized(b) => (b, true),
+                gpui::WindowBounds::Windowed(b) | gpui::WindowBounds::Fullscreen(b) => (b, false),
+            };
+            let place = crate::core::settings::WindowPlace {
+                x: b.origin.x.into(),
+                y: b.origin.y.into(),
+                width: b.size.width.into(),
+                height: b.size.height.into(),
+                maximized,
+            };
+            crate::prefs::set_prefs(cx, |s| s.window = Some(place));
         }));
         let view =cx.new(|cx| ConnectView::new(None, window, cx));
         let mut root = Root {
@@ -137,6 +155,56 @@ pub fn brand_mark(size: f32, t: &Theme) -> gpui::Div {
         .children([0.18, 0.36, 0.52, 0.36, 0.18].map(bar))
 }
 
+/// What shows while a kept sign-in goes straight in: the mark alone, its bars rising and falling
+/// once like a voice, then resting a second in their usual shape before the next. It fades in,
+/// so a quick sign-in barely shows it.
+pub fn loading_screen(caption_text: SharedString, t: &Theme) -> impl IntoElement {
+    const MARK: f32 = 72.;
+    /// One pulse and the rest after it.
+    const CYCLE_MS: f32 = 1700.;
+    /// How long each bar takes to rise and fall, and how much later each pair from the middle
+    /// starts: the middle bar first, so the pulse spreads outward and the mark stays symmetric.
+    const RISE_MS: f32 = 500.;
+    const SPREAD_MS: f32 = 100.;
+    // The bars' heights in the mark (as `brand_mark` draws them) and at the top of a pulse.
+    let rest = [0.18, 0.36, 0.52, 0.36, 0.18];
+    let lift = 0.2;
+    let mark = div()
+        .flex_none()
+        .size(px(MARK))
+        .rounded(px(MARK * 0.26))
+        .bg(t.accent)
+        .flex()
+        .items_center()
+        .justify_center()
+        .gap(px(MARK * 0.055))
+        .with_animation("loading-mark", Animation::new(Duration::from_millis(CYCLE_MS as u64)).repeat(), {
+            let bar_color = t.on_accent;
+            move |d, delta| {
+                d.children(rest.iter().enumerate().map(|(i, rest)| {
+                    let from_middle = (i as f32 - 2.).abs();
+                    let x = (delta * CYCLE_MS - from_middle * SPREAD_MS) / RISE_MS;
+                    let pulse = if (0. ..=1.).contains(&x) { (std::f32::consts::PI * x).sin().powi(2) } else { 0. };
+                    let h = rest + lift * pulse;
+                    div().w(px(MARK * 0.085)).h(px(MARK * h)).rounded(px(MARK * 0.05)).bg(bar_color)
+                }))
+            }
+        });
+    div()
+        .size_full()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap(px(20.))
+        .bg(t.base)
+        .child(mark)
+        .child(caption(caption_text, t.text3))
+        .with_animation("loading-in", Animation::new(Duration::from_millis(150)).with_easing(gpui::ease_in_out), |d, delta| {
+            d.opacity(delta)
+        })
+}
+
 impl Render for Root {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         theme::set_scale(prefs(cx).ui_scale as f32 / 100.);
@@ -146,7 +214,11 @@ impl Render for Root {
             Screen::Connect { view, .. } => view.clone().into_any_element(),
             Screen::Server(v) => v.clone().into_any_element(),
         };
-        let rail = (!prefs(cx).saved_servers.is_empty()).then(|| self.render_rail(&t, cx));
+        // A kept sign-in going in shows the loading screen alone, without the rail beside it.
+        let resuming = matches!(&self.screen, Screen::Connect { view } if view.read(cx).resuming());
+        // So is a stream watched over the whole window.
+        let theater = matches!(&self.screen, Screen::Server(v) if v.read(cx).theater.is_some());
+        let rail = (!resuming && !theater && !prefs(cx).saved_servers.is_empty()).then(|| self.render_rail(&t, cx));
         div()
             .id("root")
             .key_context("Root")
@@ -161,7 +233,7 @@ impl Render for Root {
             .flex()
             .children(rail)
             .child(div().flex_1().min_w(px(0.)).h_full().child(screen))
-            .child(
+            .when(!theater, |d| d.child(
                 div()
                     .absolute()
                     .bottom_0()
@@ -171,7 +243,7 @@ impl Render for Root {
                     .text_color(t.text3)
                     .opacity(0.6)
                     .child(concat!("v", env!("CARGO_PKG_VERSION"))),
-            )
+            ))
             .children(self.render_overlay(&t, cx))
             .when(!self.toasts.is_empty(), |d| {
                 d.child(div().absolute().bottom(px(24.)).left_0().right_0().flex().flex_col().items_center().gap(px(8.)).children(

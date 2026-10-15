@@ -89,12 +89,7 @@ impl ServerView {
                             d.child(div().flex_1()).child(badge_text(mention_count(hidden_mentions), t.on_accent, t.accent))
                         })
                         .when(hidden_mentions == 0 && hidden_unread, |d| d.child(div().flex_1()).child(unread_dot(t).mr(px(2.))))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if !this.folded.remove(&gid) {
-                                this.folded.insert(gid);
-                            }
-                            cx.notify();
-                        }))
+                        .on_click(cx.listener(move |this, _, _, cx| this.toggle_fold(gid, cx)))
                         .when(admin, |d| {
                             let accent = t.accent;
                             d.drag_over::<DraggedChannel>(move |s, _, _, _| s.text_color(accent).bg(accent.opacity(0.12)))
@@ -183,12 +178,7 @@ impl ServerView {
                             });
                         })),
                 )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    if !this.folded.remove(&DMS_FOLD) {
-                        this.folded.insert(DMS_FOLD);
-                    }
-                    cx.notify();
-                })),
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_fold(DMS_FOLD, cx))),
         );
         if folded {
             return Some(col.into_any_element());

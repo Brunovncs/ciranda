@@ -79,6 +79,31 @@ pub struct Settings {
     pub confirm_voice_join: bool,
     /// Every voice channel is entered with the microphone off, switching between them included.
     pub join_muted: bool,
+    /// Where the window was and whether it was maximised, to open it there again.
+    pub window: Option<WindowPlace>,
+    /// How loud you hear each person, by server address and then by user id, as a percentage
+    /// (0 is "mute for me"); someone at 100 has no entry.
+    pub voice_volumes: BTreeMap<String, BTreeMap<String, u32>>,
+    /// The text channel last open on each server, by address, to open it again on connecting.
+    pub last_channels: BTreeMap<String, i64>,
+    /// The channel groups you folded in each server's list, by address.
+    pub folded_groups: BTreeMap<String, Vec<i64>>,
+    /// What the screen share picker last shared: "screen" or "window", and its sound: "system",
+    /// "app" or "off".
+    pub share_kind: String,
+    pub share_sound: String,
+}
+
+/// The window's place on the screens, in logical pixels: its size and position when not
+/// maximised, and whether it was.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct WindowPlace {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub maximized: bool,
 }
 
 /// A server in the rail: where it is, who you are there, and its name and picture as last seen,
@@ -144,8 +169,9 @@ pub fn same_server(a: &str, b: &str) -> bool {
 }
 
 impl Settings {
-    /// Whether the two differ in at most the levels a slider drags through. Nothing kept drawn
-    /// shows those, so such a change needs no window-wide redraw.
+    /// Whether the two differ in at most the levels a slider drags through and what is only
+    /// kept for the next start (the window's place, the last channel). Nothing kept drawn reads
+    /// those from here, so such a change needs no window-wide redraw.
     pub fn same_but_levels(&self, other: &Settings) -> bool {
         let mut a = self.clone();
         a.mic_gain = other.mic_gain;
@@ -153,6 +179,10 @@ impl Settings {
         a.sound_volume = other.sound_volume;
         a.soundpad_volume = other.soundpad_volume;
         a.media_cache_mb = other.media_cache_mb;
+        a.window = other.window;
+        a.voice_volumes.clone_from(&other.voice_volumes);
+        a.last_channels.clone_from(&other.last_channels);
+        a.folded_groups.clone_from(&other.folded_groups);
         a == *other
     }
 
@@ -338,19 +368,69 @@ impl Settings {
         .map_or("", String::as_str)
     }
 
+    /// The key a per-server map already has for `server`, or else the address it was saved with.
+    fn server_key<T>(&self, map: &BTreeMap<String, T>, server: &str) -> String {
+        map.keys()
+            .find(|url| same_server(url, server))
+            .cloned()
+            .or_else(|| self.saved_server(server).map(|s| s.url.clone()))
+            .unwrap_or_else(|| server.to_string())
+    }
+
+    fn on_server<'a, T>(map: &'a BTreeMap<String, T>, server: &str) -> Option<&'a T> {
+        map.iter().find(|(url, _)| same_server(url, server)).map(|(_, v)| v)
+    }
+
+    /// How loud you hear each person on `server`, by user id, as a gain (1 is as they are).
+    pub fn voice_volumes_on(&self, server: &str) -> HashMap<i64, f32> {
+        let Some(m) = Self::on_server(&self.voice_volumes, server) else { return HashMap::new() };
+        m.iter().filter_map(|(id, pct)| Some((id.parse().ok()?, *pct as f32 / 100.))).collect()
+    }
+
+    pub fn set_voice_volume(&mut self, server: &str, user: i64, gain: f32) {
+        let url = self.server_key(&self.voice_volumes, server);
+        let m = self.voice_volumes.entry(url.clone()).or_default();
+        let pct = (gain * 100.).round().max(0.) as u32;
+        if pct == 100 {
+            m.remove(&user.to_string());
+        } else {
+            m.insert(user.to_string(), pct);
+        }
+        if m.is_empty() {
+            self.voice_volumes.remove(&url);
+        }
+    }
+
+    pub fn last_channel(&self, server: &str) -> Option<i64> {
+        Self::on_server(&self.last_channels, server).copied()
+    }
+
+    pub fn set_last_channel(&mut self, server: &str, channel: i64) {
+        let url = self.server_key(&self.last_channels, server);
+        self.last_channels.insert(url, channel);
+    }
+
+    pub fn folded_groups_on(&self, server: &str) -> &[i64] {
+        Self::on_server(&self.folded_groups, server).map_or(&[], Vec::as_slice)
+    }
+
+    pub fn set_folded_groups(&mut self, server: &str, mut groups: Vec<i64>) {
+        let url = self.server_key(&self.folded_groups, server);
+        groups.sort_unstable();
+        if groups.is_empty() {
+            self.folded_groups.remove(&url);
+        } else {
+            self.folded_groups.insert(url, groups);
+        }
+    }
+
     /// Whether you silenced this channel on `server`.
     pub fn channel_muted(&self, server: &str, channel: i64) -> bool {
         self.muted_channels.iter().any(|(url, ids)| same_server(url, server) && ids.contains(&channel))
     }
 
     pub fn set_channel_muted(&mut self, server: &str, channel: i64, muted: bool) {
-        let url = self
-            .muted_channels
-            .keys()
-            .find(|url| same_server(url, server))
-            .cloned()
-            .or_else(|| self.saved_server(server).map(|s| s.url.clone()))
-            .unwrap_or_else(|| server.to_string());
+        let url = self.server_key(&self.muted_channels, server);
         let ids = self.muted_channels.entry(url.clone()).or_default();
         ids.retain(|&id| id != channel);
         if muted {
@@ -380,13 +460,7 @@ impl Settings {
                 v.clear();
             }
         }
-        let url = self
-            .clip_hotkeys
-            .keys()
-            .find(|url| same_server(url, server))
-            .cloned()
-            .or_else(|| self.saved_server(server).map(|s| s.url.clone()))
-            .unwrap_or_else(|| server.to_string());
+        let url = self.server_key(&self.clip_hotkeys, server);
         let clips = self.clip_hotkeys.entry(url.clone()).or_default();
         clips.retain(|id, v| *id == clip || !taken(v));
         if !name.is_empty() {
@@ -486,6 +560,12 @@ impl Default for Settings {
             tray_notice_seen: false,
             confirm_voice_join: true,
             join_muted: true,
+            window: None,
+            voice_volumes: BTreeMap::new(),
+            last_channels: BTreeMap::new(),
+            folded_groups: BTreeMap::new(),
+            share_kind: "screen".into(),
+            share_sound: "system".into(),
         }
     }
 }
@@ -1017,6 +1097,33 @@ mod tests {
         assert_eq!(s.muted_channels.values().flatten().count(), 1, "muting twice is once");
         s.set_channel_muted("https://a.example:8444", 3, false);
         assert!(s.muted_channels.is_empty(), "nothing left behind for a server with none");
+    }
+
+    #[test]
+    fn what_is_kept_for_the_next_start_belongs_to_its_server() {
+        let mut s = Settings::default();
+        s.set_voice_volume("https://a.example", 7, 0.);
+        s.set_voice_volume("https://A.example/", 8, 1.5);
+        assert_eq!(s.voice_volumes_on("https://a.example"), HashMap::from([(7, 0.), (8, 1.5)]));
+        assert!(s.voice_volumes_on("https://b.example").is_empty(), "user 7 elsewhere is someone else");
+        s.set_voice_volume("https://a.example", 7, 1.);
+        s.set_voice_volume("https://a.example", 8, 1.);
+        assert!(s.voice_volumes.is_empty(), "everyone as they are leaves nothing behind");
+
+        s.set_last_channel("https://a.example", 4);
+        s.set_last_channel("https://a.example/", 5);
+        assert_eq!(s.last_channel("https://a.example"), Some(5));
+        assert_eq!(s.last_channel("https://b.example"), None);
+
+        s.set_folded_groups("https://a.example", vec![3, 1]);
+        assert_eq!(s.folded_groups_on("https://A.example"), &[1, 3]);
+        s.set_folded_groups("https://a.example", Vec::new());
+        assert!(s.folded_groups.is_empty());
+
+        let before = s.clone();
+        s.window = Some(WindowPlace { x: 10., y: 20., width: 900., height: 700., maximized: true });
+        s.set_voice_volume("https://a.example", 7, 0.5);
+        assert!(s.same_but_levels(&before), "none of it needs the window drawn again");
     }
 
     #[test]
