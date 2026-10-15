@@ -99,6 +99,12 @@ export const MAX_EMOJIS = 200;
 const PAGE_SIZE = 50;
 
 /**
+ * Earlier versions kept per message. Enough for anybody fixing typos; a
+ * loop of edits cannot grow one message's history without bound.
+ */
+export const MAX_VERSIONS = 25;
+
+/**
  * Turn arbitrary text into one FTS5 phrase.
  *
  * Verified necessary: `a"b(c` passed to MATCH raw throws "unterminated
@@ -174,14 +180,24 @@ export class Chat {
     this.#q = {
       insertMessage: db.prepare(
         'INSERT INTO messages '
-        + '(channel_id, user_id, body, attachment_hash, attachment_name, media_type, created_at) '
-        + 'VALUES (?, ?, ?, ?, ?, ?, ?)',
+        + '(channel_id, user_id, body, attachment_hash, attachment_name, media_type, reply_to, created_at) '
+        + 'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
       ),
       insertFts: db.prepare(
         'INSERT INTO messages_fts (rowid, body, nickname, media_type) VALUES (?, ?, ?, ?)',
       ),
       deleteFts: db.prepare('DELETE FROM messages_fts WHERE rowid = ?'),
       editMessage: db.prepare('UPDATE messages SET body = ?, edited_at = ? WHERE id = ?'),
+      keepVersion: db.prepare(
+        'INSERT INTO message_edits (message_id, body, written_at) VALUES (?, ?, ?)',
+      ),
+      trimVersions: db.prepare(`
+        DELETE FROM message_edits WHERE message_id = :id AND id NOT IN
+          (SELECT id FROM message_edits WHERE message_id = :id ORDER BY id DESC LIMIT :keep)
+      `),
+      versions: db.prepare(
+        'SELECT body, written_at FROM message_edits WHERE message_id = ? ORDER BY id',
+      ),
       setAttachment: db.prepare(
         'UPDATE messages SET attachment_hash = ?, attachment_name = ?, media_type = ?, '
         + 'edited_at = ? WHERE id = ?',
@@ -378,9 +394,15 @@ export class Chat {
     return safe || null;
   }
 
-  post({ channelId, user, body = '', attachmentHash = null, attachmentName = null }) {
+  post({ channelId, user, body = '', attachmentHash = null, attachmentName = null, replyTo = null }) {
     const text = String(body ?? '').slice(0, 4000);
     if (!text.trim() && !attachmentHash) return { ok: false, error: 'empty_message' };
+
+    // Only a message in the same channel can be answered. One that is gone
+    // (or never was) drops the reply rather than the message: it was deleted
+    // while this was being typed, and the words are still worth sending.
+    const answered = Number.isSafeInteger(Number(replyTo)) ? this.#q.messageById.get(Number(replyTo)) : null;
+    const reply = answered?.channel_id === channelId ? answered.id : null;
 
     let mediaType = null;
     if (attachmentHash) {
@@ -399,6 +421,7 @@ export class Chat {
         attachmentHash,
         attachmentHash ? Chat.cleanFilename(attachmentName) : null,
         mediaType,
+        reply,
         Date.now(),
       );
       const id = Number(info.lastInsertRowid);
@@ -442,6 +465,8 @@ export class Chat {
 
     this.#db.exec('BEGIN');
     try {
+      this.#q.keepVersion.run(id, message.body, message.edited_at ?? message.created_at);
+      this.#q.trimVersions.run({ id, keep: MAX_VERSIONS });
       this.#q.editMessage.run(text, Date.now(), id);
       this.#q.deleteFts.run(id);
       this.#q.insertFts.run(id, text, message.nickname, message.media_type ?? '');
@@ -451,6 +476,19 @@ export class Chat {
       throw err;
     }
     return { ok: true, message: this.#q.messageById.get(id) };
+  }
+
+  /**
+   * Every text a message has had, oldest first, the current one last: what
+   * the "edited" marker opens. Each with the moment it was written.
+   */
+  versions(id) {
+    const message = this.#q.messageById.get(id);
+    if (!message) return null;
+    return [
+      ...this.#q.versions.all(id).map((v) => ({ body: v.body, at: v.written_at })),
+      { body: message.body, at: message.edited_at ?? message.created_at },
+    ];
   }
 
   remove(id) {
@@ -949,7 +987,20 @@ export const publicClip = (c) => (c ? {
  * than throwing -- which is also exactly right for a message created one
  * line ago.
  */
-export const publicMessage = (m, reactions = [], mentions = null) => (m ? {
+/**
+ * The message a reply answers, cut to a preview; just the id once it is
+ * deleted, which the client draws as "original message deleted".
+ */
+export const publicReply = (id, m) => (m ? {
+  id: m.id,
+  userId: m.user_id,
+  nickname: m.nickname,
+  body: [...m.body].slice(0, 200).join(''),
+  attachmentName: m.attachment_name ?? null,
+  mediaType: m.media_type ?? null,
+} : { id, deleted: true });
+
+export const publicMessage = (m, reactions = [], mentions = null, reply = null) => (m ? {
   id: m.id,
   channelId: m.channel_id,
   userId: m.user_id,
@@ -960,6 +1011,8 @@ export const publicMessage = (m, reactions = [], mentions = null) => (m ? {
   mediaType: m.media_type ?? null,
   pinned: Boolean(m.pinned),
   editedAt: m.edited_at ?? null,
+  replyTo: m.reply_to ?? null,
+  reply,
   reactions,
   // Ids, not names: the client already has the roster and would otherwise
   // have to fold and match nicknames a second time to know whether one of

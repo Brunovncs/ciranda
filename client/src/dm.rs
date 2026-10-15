@@ -42,6 +42,9 @@ pub struct Payload {
     pub body: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<SealedFile>,
+    /// The message this answers, with a preview of it: the server can't make one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply: Option<ReplyTo>,
 }
 
 /// Why something could not be sealed for the other person.
@@ -265,6 +268,7 @@ impl Vault {
         let from_me = m.user_id == self.me;
         let mut private = Private::default();
         let mut body = String::new();
+        let mut reply = None;
         if m.kind == "call" {
             private.call = m.meta.clone();
         } else {
@@ -278,6 +282,7 @@ impl Vault {
                 Some(p) => {
                     body = p.body;
                     private.file = p.file;
+                    reply = p.reply;
                 }
                 None => private.unreadable = true,
             }
@@ -294,12 +299,26 @@ impl Vault {
             media_type,
             pinned: false,
             edited_at: m.edited_at,
+            reply,
             reactions: self.open_reactions(m.conversation_id, peer, m.id, &m.reactions),
             mentions: Vec::new(),
             mentions_everyone: false,
             created_at: m.created_at,
             private: Some(private),
         }
+    }
+
+    /// An earlier text of `m`, which `author` wrote: None if it doesn't open here.
+    pub fn open_version(&mut self, conversation: ConversationId, peer: UserId, author: UserId, v: &SealedVersion) -> Option<String> {
+        let plain = self.open(
+            conversation,
+            peer,
+            (v.sender_key, v.recipient_key),
+            author == self.me,
+            &aad::message(conversation, author),
+            &v.sealed,
+        )?;
+        serde_json::from_slice::<Payload>(&plain).ok().map(|p| p.body)
     }
 
     /// Everybody's sealed reactions to a message, opened and counted as a channel's are.
@@ -460,7 +479,7 @@ mod tests {
     #[test]
     fn a_message_opens_on_both_sides() {
         let (mut a, mut b) = pair_up();
-        let sealed = a.seal_message(5, 2, &Payload { body: "oi, tudo bem?".into(), file: None }).unwrap();
+        let sealed = a.seal_message(5, 2, &Payload { body: "oi, tudo bem?".into(), ..Default::default() }).unwrap();
         let m = as_sent(sealed, 1, 1);
         assert_eq!(b.open_message(&m, 1).body, "oi, tudo bem?");
         assert_eq!(a.open_message(&m, 2).body, "oi, tudo bem?", "your own message opens too, on any of your computers");
@@ -469,7 +488,7 @@ mod tests {
     #[test]
     fn a_message_moved_to_another_conversation_or_sender_does_not_open() {
         let (mut a, mut b) = pair_up();
-        let sealed = a.seal_message(5, 2, &Payload { body: "x".into(), file: None }).unwrap();
+        let sealed = a.seal_message(5, 2, &Payload { body: "x".into(), ..Default::default() }).unwrap();
         let mut m = as_sent(sealed, 1, 1);
         m.user_id = 2;
         let opened = b.open_message(&m, 1);
@@ -477,6 +496,18 @@ mod tests {
         m.user_id = 1;
         m.conversation_id = 6;
         assert!(b.open_message(&m, 1).private.unwrap().unreadable);
+    }
+
+    #[test]
+    fn a_reply_and_an_earlier_version_open_on_the_other_side() {
+        let (mut a, mut b) = pair_up();
+        let reply = ReplyTo { id: 7, user_id: Some(2), body: "bora jogar?".into(), attachment_name: None, deleted: false };
+        let sealed = a.seal_message(5, 2, &Payload { body: "bora".into(), reply: Some(reply.clone()), ..Default::default() }).unwrap();
+        let v = SealedVersion { sender_key: sealed.sender_key, recipient_key: sealed.recipient_key, sealed: sealed.text.clone(), at: 1 };
+        let m = as_sent(sealed, 8, 1);
+        assert_eq!(b.open_message(&m, 1).reply, Some(reply));
+        assert_eq!(b.open_version(5, 1, 1, &v).as_deref(), Some("bora"));
+        assert_eq!(b.open_version(5, 1, 2, &v), None, "passed off as the other person's, it doesn't open");
     }
 
     #[test]

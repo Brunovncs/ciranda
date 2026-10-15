@@ -332,11 +332,20 @@ impl Api {
         self.get(&format!("/api/channels/{channel}/messages{q}")).await
     }
 
-    pub async fn send_message(&self, channel: ChannelId, body: &str, attachment: Option<(&str, &str)>) -> Result<Message> {
+    pub async fn send_message(
+        &self,
+        channel: ChannelId,
+        body: &str,
+        attachment: Option<(&str, &str)>,
+        reply_to: Option<MessageId>,
+    ) -> Result<Message> {
         let mut b = json!({ "body": body });
         if let Some((hash, name)) = attachment {
             b["attachmentHash"] = json!(hash);
             b["attachmentName"] = json!(name);
+        }
+        if let Some(id) = reply_to {
+            b["replyTo"] = json!(id);
         }
         Ok(self.post::<MessageReply>(&format!("/api/channels/{channel}/messages"), b).await?.message)
     }
@@ -347,6 +356,11 @@ impl Api {
 
     pub async fn edit(&self, id: MessageId, body: &str) -> Result<Message> {
         Ok(self.post::<MessageReply>(&format!("/api/messages/{id}/edit"), json!({ "body": body })).await?.message)
+    }
+
+    /// Every text a message has had, oldest first, the current one last.
+    pub async fn versions(&self, id: MessageId) -> Result<Vec<Version>> {
+        Ok(self.get::<VersionsReply<Version>>(&format!("/api/messages/{id}/edits")).await?.versions)
     }
 
     pub async fn replace_attachment(&self, id: MessageId, hash: Option<&str>, name: Option<&str>) -> Result<Message> {
@@ -416,6 +430,11 @@ impl Api {
     pub async fn edit_dm(&self, message: MessageId, sealed: &Sealed) -> Result<SealedMessage> {
         let body = json!({ "sealed": sealed.text, "senderKey": sealed.sender_key, "recipientKey": sealed.recipient_key });
         Ok(self.post::<SealedReply>(&format!("/api/dm-messages/{message}/edit"), body).await?.message)
+    }
+
+    /// A private message's earlier texts, sealed, oldest first; the current one is the message.
+    pub async fn dm_versions(&self, message: MessageId) -> Result<Vec<SealedVersion>> {
+        Ok(self.get::<VersionsReply<SealedVersion>>(&format!("/api/dm-messages/{message}/edits")).await?.versions)
     }
 
     pub async fn delete_dm(&self, message: MessageId) -> Result<Value> {

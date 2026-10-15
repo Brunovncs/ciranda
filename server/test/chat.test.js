@@ -730,6 +730,81 @@ describe('editing a message', () => {
     });
     assert.equal(res.status, 404);
   });
+
+  it('keeps every earlier version, oldest first, the current one last', async () => {
+    await api(`/api/messages/${mine}/edit`, {
+      method: 'POST', body: { body: 'first post!' }, token: memberToken,
+    });
+    const res = await api(`/api/messages/${mine}/edits`, { token: ownerToken });
+    assert.equal(res.status, 200);
+    assert.deepEqual(res.body.versions.map((v) => v.body), ['frist post', 'first post', 'first post!'],
+      'a refused or unchanged save is not a version');
+    const at = res.body.versions.map((v) => v.at);
+    assert.deepEqual(at, [...at].sort((x, y) => x - y));
+  });
+
+  it('takes the history along when the message is deleted', async () => {
+    const id = (await api(`/api/channels/${textChannelId}/messages`, {
+      method: 'POST', body: { body: 'oops, my password' }, token: memberToken,
+    })).body.message.id;
+    await api(`/api/messages/${id}/edit`, { method: 'POST', body: { body: 'nothing' }, token: memberToken });
+    await api(`/api/messages/${id}/delete`, { method: 'POST', token: memberToken });
+    assert.equal((await api(`/api/messages/${id}/edits`, { token: memberToken })).status, 404);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Replies
+// ---------------------------------------------------------------------------
+
+describe('replying to a message', () => {
+  let asked;
+
+  before(async () => {
+    asked = (await api(`/api/channels/${textChannelId}/messages`, {
+      method: 'POST', body: { body: 'who is up for a game tonight?' }, token: ownerToken,
+    })).body.message;
+  });
+
+  it('carries what it answers, and tells its author like a mention', async () => {
+    const res = await api(`/api/channels/${textChannelId}/messages`, {
+      method: 'POST', body: { body: 'me!', replyTo: asked.id }, token: memberToken,
+    });
+    assert.equal(res.status, 201);
+    const m = res.body.message;
+    assert.equal(m.replyTo, asked.id);
+    assert.equal(m.reply.id, asked.id);
+    assert.equal(m.reply.userId, asked.userId);
+    assert.equal(m.reply.body, 'who is up for a game tonight?');
+    assert.ok(m.mentions.includes(asked.userId));
+
+    const page = await api(`/api/channels/${textChannelId}/messages`, { token: memberToken });
+    assert.equal(page.body.messages.find((x) => x.id === m.id).reply.id, asked.id, 'and history says the same');
+  });
+
+  it('does not answer a message in another channel, but still sends', async () => {
+    const elsewhere = (await api('/api/channels', {
+      method: 'POST', body: { name: 'reply-elsewhere', kind: 'text' }, token: ownerToken,
+    })).body.channel;
+    const res = await api(`/api/channels/${elsewhere.id}/messages`, {
+      method: 'POST', body: { body: 'out of nowhere', replyTo: asked.id }, token: ownerToken,
+    });
+    assert.equal(res.status, 201);
+    assert.equal(res.body.message.replyTo, null);
+    assert.equal(res.body.message.reply, null);
+  });
+
+  it('survives the original being deleted, and says so', async () => {
+    const original = (await api(`/api/channels/${textChannelId}/messages`, {
+      method: 'POST', body: { body: 'soon gone' }, token: memberToken,
+    })).body.message.id;
+    const reply = (await api(`/api/channels/${textChannelId}/messages`, {
+      method: 'POST', body: { body: 'answer', replyTo: original }, token: ownerToken,
+    })).body.message.id;
+    await api(`/api/messages/${original}/delete`, { method: 'POST', token: memberToken });
+    const page = await api(`/api/channels/${textChannelId}/messages`, { token: ownerToken });
+    assert.deepEqual(page.body.messages.find((x) => x.id === reply).reply, { id: original, deleted: true });
+  });
 });
 
 // ---------------------------------------------------------------------------

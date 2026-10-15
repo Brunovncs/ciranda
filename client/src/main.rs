@@ -12,6 +12,7 @@ mod core;
 mod dm;
 mod elsewhere;
 mod emoji;
+mod files;
 mod hotkeys;
 mod icons;
 mod markdown;

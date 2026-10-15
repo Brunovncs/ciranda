@@ -302,6 +302,11 @@ export function mountDirectMessages(app, { requireLogin, dms, chat, accounts, pu
     return res.json({ message });
   });
 
+  /** What a message said before each edit, sealed as it was; the client opens them. */
+  app.get('/api/dm-messages/:id/edits', requireLogin, dmMessage, (req, res) => {
+    res.json({ versions: dms.versions(req.dmMessage) });
+  });
+
   /** Your own only -- unlike a channel, an admin has no say over somebody's private words. */
   app.post('/api/dm-messages/:id/delete', requireLogin, dmMessage, (req, res) => {
     const m = req.dmMessage;

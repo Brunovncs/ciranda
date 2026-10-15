@@ -2,22 +2,25 @@
 //! and the box you write in, with attachments, emoji and @mentions.
 
 use super::emoji_picker::EmojiPicker;
+use super::picker::Picker;
 use super::rich::{self, Lookup};
 use super::sidebar::{Menu, MenuEntry};
 use crate::core::types::*;
 use crate::core::{self};
+use crate::files;
 use crate::prefs::{prefs, set_prefs};
 use crate::session::{Fetch, Picture, Session, SessionEvent, decode_picture};
 use crate::text_field::{TextField, TextFieldEvent};
 use crate::theme::{MONO, Theme, current, px, radius};
-use crate::ui::overlay::{self, Ask, Dismiss, Field, dialog_card};
+use crate::ui::overlay::{self, Ask, Dismiss, dialog_card};
 use crate::widgets::*;
 use chrono::{Local, TimeZone};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, App, AppContext, ClipboardEntry, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, InteractiveElement,
-    IntoElement, KeyDownEvent, ListAlignment, ListState, MouseButton, MouseDownEvent, ParentElement, PathPromptOptions, Render,
-    RenderImage, SharedString, StatefulInteractiveElement, Styled, StyledImage, Subscription, Task, Window, div, img, list,
+    AnyElement, App, AppContext, ClickEvent, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    FontWeight, InteractiveElement, IntoElement, KeyDownEvent, ListAlignment, ListState, MouseButton, MouseDownEvent, ParentElement,
+    PathPromptOptions, Render, RenderImage, SharedString, StatefulInteractiveElement, Styled, StyledImage, Subscription, Task, WeakEntity,
+    Window, div, img, list,
 };
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -32,6 +35,22 @@ struct Pending {
     content_type: String,
     name: String,
     preview: Option<Arc<RenderImage>>,
+}
+
+/// What the box is doing besides writing a new message.
+enum Mode {
+    /// The next message answers this one.
+    Reply(Message),
+    /// The box holds one of your messages, to change it.
+    Edit(Message),
+}
+
+/// What a reply's quote shows of the message it answers.
+struct Quoted {
+    user: Option<UserId>,
+    text: String,
+    /// Deleted since: there is nothing to show or go to.
+    gone: bool,
 }
 
 /// What a chat pane asks of the window around it.
@@ -55,6 +74,9 @@ pub struct ChatView {
     pending: Option<Pending>,
     uploading: bool,
     sending: bool,
+    mode: Option<Mode>,
+    /// What was in the box when an edit took it over, put back when the edit is done.
+    draft: Option<String>,
     flash: Option<(MessageId, Instant)>,
     mention: Option<(String, usize)>,
     /// Parsed bodies by message, until it is edited; dropped when the server's emoji change.
@@ -127,6 +149,8 @@ impl ChatView {
             pending: None,
             uploading: false,
             sending: false,
+            mode: None,
+            draft: None,
             flash: None,
             mention: None,
             bodies: HashMap::new(),
@@ -212,21 +236,32 @@ impl ChatView {
             self.accept_mention(ix, window, cx);
             return;
         }
+        if let Some(Mode::Edit(m)) = &self.mode {
+            let m = m.clone();
+            self.save_edit(&m, window, cx);
+            return;
+        }
         let text = self.composer.read(cx).text().trim().to_string();
         if (text.is_empty() && self.pending.is_none()) || self.sending {
             return;
         }
         self.sending = true;
         let pending = self.pending.take();
+        let answering = match self.mode.take() {
+            Some(Mode::Reply(m)) => Some(m),
+            _ => None,
+        };
+        let reply_to = answering.as_ref().map(|m| m.id);
         self.uploading = pending.is_some();
         self.composer.update(cx, |f, cx| f.clear(cx));
         cx.notify();
         if let Room::Dm(conversation) = self.room {
             let file = pending.map(|p| crate::session::Outgoing { bytes: p.bytes, name: p.name, mime: p.content_type });
-            let task = self.session.update(cx, |s, cx| s.send_dm(conversation, text.clone(), file, cx));
+            let reply = answering.as_ref().map(preview_of);
+            let task = self.session.update(cx, |s, cx| s.send_dm(conversation, text.clone(), file, reply, cx));
             cx.spawn(async move |this, cx| {
                 let result = task.await;
-                let _ = this.update(cx, |this, cx| this.sent(result.err().map(|e| (e.message, text)), cx));
+                let _ = this.update(cx, |this, cx| this.sent(result.err().map(|e| (e.message, text)), answering, cx));
             })
             .detach();
             return;
@@ -247,7 +282,7 @@ impl ChatView {
                     None => None,
                 };
                 let body = if text.is_empty() { String::new() } else { text.clone() };
-                api.send_message(channel, &body, attachment.as_ref().map(|(h, n)| (h.as_str(), n.as_str())))
+                api.send_message(channel, &body, attachment.as_ref().map(|(h, n)| (h.as_str(), n.as_str())), reply_to)
                     .await
                     .map_err(|e| (e, text))
                     .map(|_| ())
@@ -259,35 +294,140 @@ impl ChatView {
                     let text = if let serde_json::Value::String(text) = &e.body { text.clone() } else { String::new() };
                     (e.message, text)
                 });
-                this.sent(failed, cx)
+                this.sent(failed, answering, cx)
             });
         })
         .detach();
     }
 
-    /// A send finished. On failure the text goes back in the box, so nothing typed is lost.
-    fn sent(&mut self, failed: Option<(String, String)>, cx: &mut Context<Self>) {
+    /// A send finished. On failure the text goes back in the box, and what it answered, so
+    /// nothing typed is lost.
+    fn sent(&mut self, failed: Option<(String, String)>, answering: Option<Message>, cx: &mut Context<Self>) {
         self.sending = false;
         self.uploading = false;
         if let Some((why, text)) = failed {
             if self.composer.read(cx).text().is_empty() {
                 self.composer.update(cx, |f, cx| f.set_text(&text, cx));
+                if self.mode.is_none() {
+                    self.mode = answering.map(Mode::Reply);
+                }
             }
             overlay::toast(why, cx);
         }
         cx.notify();
     }
 
-    fn attach(&mut self, cx: &mut Context<Self>) {
-        let paths = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some(tr!("Attach", "Anexar").into()),
+    // Answering and editing in the box.
+
+    /// Whether you can write here now: the same rule that shows the box.
+    fn writable(&self, cx: &App) -> bool {
+        let s = self.session.read(cx);
+        let readable = match self.room {
+            Room::Channel(id) => s.channel(id).is_some_and(|c| s.can_read(c)),
+            Room::Dm(_) => self.dm(cx).is_some(),
+        };
+        readable && self.blocked_reason(cx).is_none()
+    }
+
+    fn start_reply(&mut self, m: &Message, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.writable(cx) || m.private.as_ref().is_some_and(|p| p.unreadable || p.call.is_some()) {
+            return;
+        }
+        if matches!(self.mode, Some(Mode::Edit(_))) {
+            self.cancel_mode(cx);
+        }
+        self.mode = Some(Mode::Reply(m.clone()));
+        self.focus_composer(window, cx);
+        cx.notify();
+    }
+
+    /// Puts one of your messages in the box to change it; what you were writing waits until
+    /// the edit is saved or let go.
+    fn start_edit(&mut self, m: &Message, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.writable(cx) {
+            return;
+        }
+        if !matches!(self.mode, Some(Mode::Edit(_))) {
+            self.draft = Some(self.composer.read(cx).text());
+        }
+        self.mode = Some(Mode::Edit(m.clone()));
+        self.mention = None;
+        self.composer.update(cx, |f, cx| f.set_text(&m.body, cx));
+        self.focus_composer(window, cx);
+        cx.notify();
+    }
+
+    fn cancel_mode(&mut self, cx: &mut Context<Self>) {
+        if let Some(Mode::Edit(_)) = self.mode.take() {
+            let draft = self.draft.take().unwrap_or_default();
+            self.composer.update(cx, |f, cx| f.set_text(&draft, cx));
+        }
+        cx.notify();
+    }
+
+    /// Enter while editing. Emptied, a message with nothing else in it is offered for deleting,
+    /// as there is nothing left to save.
+    fn save_edit(&mut self, m: &Message, window: &mut Window, cx: &mut Context<Self>) {
+        let body = self.composer.read(cx).text().trim().to_string();
+        let unchanged = body == m.body.trim();
+        let empty = body.is_empty() && m.attachment_hash.is_none();
+        self.cancel_mode(cx);
+        if unchanged {
+            return;
+        }
+        if empty {
+            self.delete(m, window, cx);
+            return;
+        }
+        if self.room.conversation().is_some() {
+            let task = self.session.update(cx, |s, cx| s.edit_dm(m, body, cx));
+            toast_failure(task, cx);
+            return;
+        }
+        let id = m.id;
+        self.session.update(cx, |s, cx| s.call(cx, move |api| Box::pin(async move { api.edit(id, &body).await }), |_, _, _| {}));
+    }
+
+    /// Up in an empty box: your last message here, to change it.
+    fn edit_last(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let me = self.session.read(cx).me.id;
+        let last = self.session.read(cx).chats.get(&self.room).and_then(|l| {
+            l.messages
+                .iter()
+                .rev()
+                .find(|m| m.user_id == Some(me) && !m.private.as_ref().is_some_and(|p| p.unreadable || p.call.is_some()))
+                .cloned()
         });
+        let Some(m) = last else { return false };
+        if self.results.is_some() {
+            self.clear_search(cx);
+        }
+        if let Some(ix) = self.shown.iter().position(|id| *id == m.id) {
+            self.list.scroll_to_reveal_item(ix);
+        }
+        self.start_edit(&m, window, cx);
+        true
+    }
+
+    /// What a reply's quote shows: the message itself when it is loaded, so an edit shows up;
+    /// otherwise what the reply carried with it.
+    fn quoted(&self, r: &ReplyTo, cx: &App) -> Quoted {
+        let s = self.session.read(cx);
+        let log = s.chats.get(&self.room);
+        if let Some(m) = log.and_then(|l| l.messages.iter().find(|m| m.id == r.id)) {
+            return Quoted { user: m.user_id, text: summary(&m.body, m.attachment_name.as_deref(), m.media_type, s), gone: false };
+        }
+        // Inside what is loaded and not there: deleted since.
+        let within = log.and_then(|l| l.messages.first()).is_some_and(|first| first.id < r.id);
+        if r.deleted || within {
+            return Quoted { user: r.user_id, text: String::new(), gone: true };
+        }
+        Quoted { user: r.user_id, text: summary(&r.body, r.attachment_name.as_deref(), None, s), gone: false }
+    }
+
+    fn attach(&mut self, kind: files::Kind, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
-            let Ok(Ok(Some(paths))) = paths.await else { return };
-            let Some(path) = paths.into_iter().next() else { return };
+            let Some(path) = files::pick(kind, cx).await else { return };
             let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "file".into());
             let bytes = std::fs::read(&path);
             let _ = this.update(cx, |this, cx| match bytes {
@@ -329,33 +469,25 @@ impl ChatView {
         {
             for entry in item.entries() {
                 if let ClipboardEntry::Image(image) = entry {
-                    let ext = match image.format {
-                        gpui::ImageFormat::Png => "png",
-                        gpui::ImageFormat::Jpeg => "jpg",
-                        gpui::ImageFormat::Gif => "gif",
-                        gpui::ImageFormat::Webp => "webp",
-                        _ => "png",
-                    };
-                    let name = format!("pasted-{}.{ext}", Local::now().format("%Y%m%dT%H%M%S"));
+                    let name = format!("pasted-{}.{}", Local::now().format("%Y%m%dT%H%M%S"), image_ext(image.format));
                     self.set_pending(image.bytes.clone(), content_type_for(&name), name, cx);
                     cx.stop_propagation();
                     return;
                 }
             }
         }
-        if self.mention.is_some() {
-            let n = self.mention_matches(cx).len();
+        if self.mention.is_none() && !k.modifiers.modified() {
             match k.key.as_str() {
-                "up" if n > 0 => {
-                    if let Some((_, ix)) = &mut self.mention {
-                        *ix = (*ix + n - 1) % n;
-                    }
+                "escape" if self.mode.is_some() => {
+                    self.cancel_mode(cx);
+                    cx.stop_propagation();
+                    return;
                 }
-                "down" if n > 0 => {
-                    if let Some((_, ix)) = &mut self.mention {
-                        *ix = (*ix + 1) % n;
-                    }
-                }
+                _ => {}
+            }
+        }
+        if self.mention.is_some() {
+            match k.key.as_str() {
                 "tab" => {
                     let ix = self.mention.as_ref().map(|m| m.1).unwrap_or(0);
                     self.accept_mention(ix, window, cx);
@@ -366,6 +498,38 @@ impl ChatView {
             cx.stop_propagation();
             cx.notify();
         }
+    }
+
+    /// Up and down are the box's own bindings, which run before any key listener, so they are
+    /// caught on their way to it: through the @mention list when it is open, and in an empty box,
+    /// up edits your last message.
+    fn on_up(&mut self, _: &crate::text_field::Up, window: &mut Window, cx: &mut Context<Self>) {
+        if self.step_mention(-1, cx) {
+            cx.stop_propagation();
+            return;
+        }
+        if !matches!(self.mode, Some(Mode::Edit(_)))
+            && self.composer.read(cx).text().is_empty()
+            && self.composer.focus_handle(cx).is_focused(window)
+            && self.edit_last(window, cx)
+        {
+            cx.stop_propagation();
+        }
+    }
+
+    fn on_down(&mut self, _: &crate::text_field::Down, _: &mut Window, cx: &mut Context<Self>) {
+        if self.step_mention(1, cx) {
+            cx.stop_propagation();
+        }
+    }
+
+    /// Moves the @mention pick, if the list is open.
+    fn step_mention(&mut self, by: isize, cx: &mut Context<Self>) -> bool {
+        let n = self.mention_matches(cx).len();
+        let Some((_, ix)) = self.mention.as_mut().filter(|_| n > 0) else { return false };
+        *ix = (*ix as isize + by).rem_euclid(n as isize) as usize;
+        cx.notify();
+        true
     }
 
     // @mentions.
@@ -512,36 +676,166 @@ impl ChatView {
         overlay::open_menu(picker, at, cx);
     }
 
-    fn edit(&mut self, m: &Message, window: &mut Window, cx: &mut Context<Self>) {
-        let session = self.session.clone();
-        let id = m.id;
-        let private = self.room.conversation().is_some().then(|| m.clone());
-        Ask::open(
-            tr!("Edit message", "Editar mensagem"),
-            None,
-            tr!("Save", "Salvar"),
-            false,
-            vec![Field::Text {
-                label: tr!("Message", "Mensagem"),
-                value: m.body.clone(),
-                placeholder: "",
-                secret: false,
-                multiline: true,
-                max: 4000,
-            }],
-            window,
-            cx,
-            move |v, _, cx| {
-                let body = v[0].trim().to_string();
-                if let Some(m) = &private {
-                    let task = session.update(cx, |s, cx| s.edit_dm(m, body, cx));
-                    toast_failure(task, cx);
-                    return None;
-                }
-                session.update(cx, |s, cx| s.call(cx, move |api| Box::pin(async move { api.edit(id, &body).await }), |_, _, _| {}));
-                None
-            },
-        );
+    /// Every text a message has had, newest first, in a dialog that fills in as they arrive.
+    fn show_versions(&mut self, m: &Message, window: &mut Window, cx: &mut Context<Self>) {
+        let task: Task<Result<Vec<Version>, crate::core::api::ApiError>> = if self.room.conversation().is_some() {
+            self.session.update(cx, |s, cx| s.dm_versions(m, cx))
+        } else {
+            let (api, id) = (self.session.read(cx).api.clone(), m.id);
+            cx.spawn(async move |_, _| core::run(async move { api.versions(id).await }).await)
+        };
+        let view = cx.new(|cx| {
+            let load = cx.spawn(async move |this, cx| {
+                let got = task.await.map_err(|e| {
+                    if e.status == 404 {
+                        tr!(
+                            "This server doesn't keep edit history yet: it needs updating.",
+                            "Este servidor ainda não guarda o histórico de edições: ele precisa ser atualizado."
+                        )
+                        .to_string()
+                    } else {
+                        e.message
+                    }
+                });
+                let _ = this.update(cx, |this: &mut Versions, cx| {
+                    this.list = Some(got);
+                    cx.notify();
+                });
+            });
+            Versions { list: None, focus: cx.focus_handle(), _load: load }
+        });
+        overlay::open_dialog(view, window, cx);
+    }
+
+    /// Right-click on a message: everything that can be done to it, in one place.
+    fn message_menu(&mut self, m: Message, at: gpui::Point<gpui::Pixels>, cx: &mut Context<Self>) {
+        let s = self.session.read(cx);
+        let me = s.me.clone();
+        let mine = m.user_id == Some(me.id);
+        let private = self.room.conversation().is_some();
+        let unreadable = m.private.as_ref().is_some_and(|p| p.unreadable);
+        let can_delete = mine || (!private && me.role.is_admin());
+        let writable = self.writable(cx);
+        let this = cx.entity().downgrade();
+        let mut items = Vec::new();
+        if writable && !unreadable {
+            let m = m.clone();
+            items.push(MenuEntry::item("reply", tr!("Reply", "Responder"), false, act(&this, move |v, w, cx| v.start_reply(&m, w, cx))));
+        }
+        {
+            let m = m.clone();
+            items.push(MenuEntry::item(
+                "smile-plus",
+                tr!("Add a reaction", "Adicionar reação"),
+                false,
+                act(&this, move |v, w, cx| v.pick_reaction(m.clone(), at, w, cx)),
+            ));
+        }
+        if !m.body.trim().is_empty() {
+            let body = m.body.clone();
+            items.push(MenuEntry::item("copy", tr!("Copy text", "Copiar texto"), false, move |_, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(body.clone()));
+                overlay::toast(tr!("Copied.", "Copiado."), cx);
+            }));
+        }
+        if mine && !unreadable && writable {
+            let m = m.clone();
+            items.push(MenuEntry::item("edit", tr!("Edit", "Editar"), false, act(&this, move |v, w, cx| v.start_edit(&m, w, cx))));
+        }
+        if m.edited_at.is_some() && !unreadable {
+            let m = m.clone();
+            items.push(MenuEntry::item(
+                "history",
+                tr!("Edit history", "Histórico de edições"),
+                false,
+                act(&this, move |v, w, cx| v.show_versions(&m, w, cx)),
+            ));
+        }
+        if !private {
+            let m = m.clone();
+            let label = if m.pinned { tr!("Unpin", "Desafixar") } else { tr!("Pin to the channel", "Fixar no canal") };
+            items.push(MenuEntry::item("pin", label, false, act(&this, move |v, _, cx| v.pin(&m, cx))));
+        }
+        if can_delete {
+            items.push(MenuEntry::rule());
+            let m = m.clone();
+            items.push(MenuEntry::item("delete", tr!("Delete", "Apagar"), true, act(&this, move |v, w, cx| v.delete(&m, w, cx))));
+        }
+        overlay::open_menu(cx.new(|_| Menu { items }), at, cx);
+    }
+
+    /// The + by the box: kinds of thing to send.
+    fn attach_menu(&mut self, at: gpui::Point<gpui::Pixels>, cx: &mut Context<Self>) {
+        let this = cx.entity().downgrade();
+        let copied_image = cx.read_from_clipboard().is_some_and(|c| c.entries().iter().any(|e| matches!(e, ClipboardEntry::Image(_))));
+        let mut items = vec![
+            MenuEntry::item(
+                "image",
+                tr!("Picture or video", "Imagem ou vídeo"),
+                false,
+                act(&this, |v, _, cx| v.attach(files::Kind::Media, cx)),
+            ),
+            MenuEntry::item("file-text", tr!("Document", "Documento"), false, act(&this, |v, _, cx| v.attach(files::Kind::Document, cx))),
+            MenuEntry::item("scan", tr!("Screenshot", "Captura de tela"), false, act(&this, |v, w, cx| v.screenshot(w, cx))),
+        ];
+        if copied_image {
+            items.push(MenuEntry::item(
+                "clipboard",
+                tr!("Paste the copied picture", "Colar a imagem copiada"),
+                false,
+                act(&this, |v, _, cx| v.paste_image(cx)),
+            ));
+        }
+        items.push(MenuEntry::rule());
+        items.push(MenuEntry::item("code", tr!("Code block", "Bloco de código"), false, act(&this, |v, w, cx| v.code_block(w, cx))));
+        overlay::open_menu_above(cx.new(|_| Menu { items }), at, cx);
+    }
+
+    /// A screen or window, picked like a share, attached as a picture at its own size.
+    fn screenshot(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let this = cx.entity().downgrade();
+        let picker = cx.new(|cx| {
+            Picker::snapshot(cx, move |choice, _, cx| {
+                let Some(this) = this.upgrade() else { return };
+                let (kind, id) = (choice.source.kind, choice.source.id);
+                this.update(cx, |_, cx| {
+                    cx.spawn(async move |this, cx| {
+                        // Long enough for the picker to be gone from the screen being taken.
+                        cx.background_executor().timer(Duration::from_millis(250)).await;
+                        let png = cx.background_executor().spawn(async move { crate::media::screen::snapshot(kind, id) }).await;
+                        let _ = this.update(cx, |this, cx| match png {
+                            Some(png) => {
+                                let name = format!("{}-{}.png", tr!("screenshot", "captura"), Local::now().format("%Y%m%d-%H%M%S"));
+                                this.set_pending(png, "image/png".into(), name, cx);
+                            }
+                            None => overlay::toast(tr!("Couldn't take that screenshot.", "Não foi possível fazer essa captura."), cx),
+                        });
+                    })
+                    .detach();
+                });
+            })
+        });
+        overlay::open_dialog(picker, window, cx);
+    }
+
+    /// The picture on the clipboard, as Ctrl+V would attach it.
+    fn paste_image(&mut self, cx: &mut Context<Self>) {
+        let Some(item) = cx.read_from_clipboard() else { return };
+        for entry in item.entries() {
+            if let ClipboardEntry::Image(image) = entry {
+                let name = format!("pasted-{}.{}", Local::now().format("%Y%m%dT%H%M%S"), image_ext(image.format));
+                self.set_pending(image.bytes.clone(), content_type_for(&name), name, cx);
+                return;
+            }
+        }
+    }
+
+    /// A fenced block around the selection, or an empty one, with the caret inside.
+    fn code_block(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.composer.read(cx).text();
+        let before = if text.is_empty() || text.ends_with('\n') { "```\n" } else { "\n```\n" };
+        self.composer.update(cx, |f, cx| f.surround(before, "\n```", cx));
+        self.focus_composer(window, cx);
     }
 
     fn delete(&mut self, m: &Message, window: &mut Window, cx: &mut Context<Self>) {
@@ -660,7 +954,8 @@ impl ChatView {
         if let Some(due) = self.session.update(cx, |s, _| s.take_frame_due()) {
             self.wake_at(due, cx);
         }
-        el
+        // Padding, not margin, for the same reason as the call lines: the list measures the box.
+        if ix + 1 == self.shown.len() { div().pb(px(18.)).child(el).into_any_element() } else { el }
     }
 
     /// Draws again at `due`, unless a wake no later than that is already set.
@@ -691,6 +986,7 @@ impl ChatView {
             p.user_id == m.user_id
                 && !p.pinned
                 && !m.pinned
+                && m.reply.is_none()
                 && !is_line(p)
                 && m.created_at - p.created_at < GROUP_WINDOW_MS
                 && self.results.is_none()
@@ -733,8 +1029,29 @@ impl ChatView {
                 rich::body(format!("body-{id}"), &parsed, 14., &t, &mut look, cx)
             }))
         };
-        let attachment = self.render_attachment(&m, &t, window, cx);
-        let reactions = self.render_reactions(&m, &t, cx);
+        let attachment = self
+            .render_attachment(&m, &t, window, cx)
+            .map(|a| div().id(("attachment-box", m.id as u64)).on_click(|_, _, cx| cx.stop_propagation()).child(a).into_any_element());
+        let reactions = self
+            .render_reactions(&m, &t, cx)
+            .map(|r| div().id(("reactions-box", m.id as u64)).on_click(|_, _, cx| cx.stop_propagation()).child(r).into_any_element());
+        let quote = m.reply.as_ref().map(|r| self.render_quote(m.id, r, &t, cx));
+        let writable = self.writable(cx);
+        let edited = m.edited_at.is_some().then(|| {
+            let m2 = m.clone();
+            div()
+                .id(("edited", m.id as u64))
+                .text_size(px(11.))
+                .text_color(t.text3)
+                .cursor_pointer()
+                .hover(|s| s.underline())
+                .child(tr!("(edited)", "(editada)"))
+                .tooltip(tip(tr!("See the edit history", "Ver o histórico de edições"), &t))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.show_versions(&m2, window, cx)
+                }))
+        });
         let time = Local.timestamp_millis_opt(m.created_at).single();
         let hhmm = time.map(|d| d.format("%H:%M").to_string()).unwrap_or_default();
         let stamp = time.map(|d| crate::i18n::message_time(&d, &Local::now())).unwrap_or_default();
@@ -742,8 +1059,10 @@ impl ChatView {
 
         let group_name = SharedString::from(format!("msg-{}", m.id));
         let tools = {
-            let (m1, m2, m3, m4) = (m.clone(), m.clone(), m.clone(), m.clone());
+            let (m1, m2, m3, m4, m5) = (m.clone(), m.clone(), m.clone(), m.clone(), m.clone());
             div()
+                .id(("tools", m.id as u64))
+                .on_click(|_, _, cx| cx.stop_propagation())
                 .absolute()
                 .top(px(-14.))
                 .right(px(12.))
@@ -757,6 +1076,13 @@ impl ChatView {
                 .shadow_md()
                 .invisible()
                 .group_hover(group_name.clone(), |s| s.visible())
+                .when(writable && !unreadable, |d| {
+                    d.child(
+                        tool_button(("reply", m.id as u64), "reply", false, t.text2, &t)
+                            .tooltip(tip(tr!("Reply (or double-click the message)", "Responder (ou clique duas vezes na mensagem)"), &t))
+                            .on_click(cx.listener(move |this, _, window, cx| this.start_reply(&m5, window, cx))),
+                    )
+                })
                 .child(
                     tool_button(("react", m.id as u64), "smile-plus", false, t.text2, &t)
                         .tooltip(tip(tr!("Add a reaction", "Adicionar uma reação"), &t))
@@ -775,11 +1101,14 @@ impl ChatView {
                             .on_click(cx.listener(move |this, _, _, cx| this.pin(&m2, cx))),
                     )
                 })
-                .when(mine && !unreadable, |d| {
+                .when(mine && !unreadable && writable, |d| {
                     d.child(
                         tool_button(("edit", m.id as u64), "edit", false, t.text2, &t)
-                            .tooltip(tip(tr!("Edit", "Editar"), &t))
-                            .on_click(cx.listener(move |this, _, window, cx| this.edit(&m3, window, cx))),
+                            .tooltip(tip(
+                                tr!("Edit (↑ in an empty box edits your last one)", "Editar (↑ com a caixa vazia edita a sua última)"),
+                                &t,
+                            ))
+                            .on_click(cx.listener(move |this, _, window, cx| this.start_edit(&m3, window, cx))),
                     )
                 })
                 .when(can_delete, |d| {
@@ -791,6 +1120,7 @@ impl ChatView {
                 })
         };
 
+        let (edited_head, edited_tail) = if grouped { (None, edited) } else { (edited, None) };
         let hover = t.layer;
         let content = div()
             .flex()
@@ -817,28 +1147,18 @@ impl ChatView {
                                 .tooltip(tip(full.clone(), &t)),
                         )
                         .when(m.pinned, |d| d.child(chip(tr!("Pinned", "Fixada"), t.accent)))
-                        .when(m.edited_at.is_some(), |d| {
-                            d.child(div().text_size(px(11.)).text_color(t.text3).child(tr!("(edited)", "(editada)")))
-                        }),
+                        .children(edited_head),
                 )
             })
             .children(body_el)
+            .children(edited_tail)
             .children(attachment)
             .children(reactions);
 
-        div()
-            .id(("message", m.id as u64))
-            .group(group_name.clone())
-            .relative()
-            .w_full()
+        let (m_reply, m_menu) = (m.clone(), m.clone());
+        let row = div()
             .flex()
             .gap(px(12.))
-            .px(px(16.))
-            .py(px(if grouped { 2. } else { 6. }))
-            .when(!grouped, |d| d.mt(px(8.)))
-            .hover(move |s| s.bg(hover))
-            .when(for_me, |d| d.bg(t.tint(t.caution)).border_l_2().border_color(t.caution))
-            .when(flashing, |d| d.bg(t.accent_soft))
             .child(if grouped {
                 div().w(px(36.)).flex_none().flex().justify_end().pt(px(2.)).child(
                     div()
@@ -846,14 +1166,100 @@ impl ChatView {
                         .text_size(px(10.))
                         .text_color(t.text3)
                         .invisible()
-                        .group_hover(group_name, |s| s.visible())
+                        .group_hover(group_name.clone(), |s| s.visible())
                         .child(hhmm),
                 )
             } else {
                 div().flex_none().pt(px(2.)).child(avatar(&name, avatar_img, 36., None))
             })
-            .child(content)
+            .child(content);
+        div()
+            .id(("message", m.id as u64))
+            .group(group_name)
+            .relative()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .px(px(16.))
+            .py(px(if grouped { 2. } else { 6. }))
+            .when(!grouped, |d| d.mt(px(8.)))
+            .hover(move |s| s.bg(hover))
+            .when(for_me, |d| d.bg(t.tint(t.caution)).border_l_2().border_color(t.caution))
+            .when(flashing, |d| d.bg(t.accent_soft))
+            .children(quote)
+            .child(row)
             .child(tools)
+            .on_click(cx.listener(move |this, e: &ClickEvent, window, cx| {
+                if e.click_count() == 2 {
+                    this.start_reply(&m_reply, window, cx);
+                }
+            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.message_menu(m_menu.clone(), e.position, cx);
+                }),
+            )
+            .into_any_element()
+    }
+
+    /// The line above a reply: who it answers and how that began, to jump to it. The bent line
+    /// runs from where the answered message's picture would be to this one's.
+    fn render_quote(&mut self, id: MessageId, r: &ReplyTo, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let q = self.quoted(r, cx);
+        let name = self.session.read(cx).display_name(q.user, None);
+        let img = q.user.and_then(|u| self.session.update(cx, |s, cx| s.avatar(u, cx)));
+        let target = r.id;
+        let hover = t.text;
+        div()
+            .id(("quote", id as u64))
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .h(px(18.))
+            .min_w(px(0.))
+            .child(div().w(px(18.)).flex_none())
+            .child(
+                div()
+                    .w(px(26.))
+                    .h(px(9.))
+                    .mt(px(9.))
+                    .flex_none()
+                    .border_l_2()
+                    .border_t_2()
+                    .rounded_tl(px(6.))
+                    .border_color(t.stroke_strong),
+            )
+            .when(!q.gone, |d| {
+                d.cursor_pointer()
+                    .child(avatar(&name, img, 16., None))
+                    .child(div().flex_none().text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).text_color(t.text2).child(name.clone()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_size(px(12.5))
+                            .text_color(t.text3)
+                            .hover(move |s| s.text_color(hover))
+                            .child(q.text),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.jump_to(target, cx)
+                    }))
+            })
+            .when(q.gone, |d| {
+                d.child(icon("delete", 12., t.text3)).child(
+                    div()
+                        .text_size(px(12.5))
+                        .italic()
+                        .text_color(t.text3)
+                        .child(tr!("Original message deleted", "Mensagem original apagada")),
+                )
+            })
             .into_any_element()
     }
 
@@ -1331,6 +1737,46 @@ impl ChatView {
         Some(div().border_b_1().border_color(t.stroke).bg(t.layer).child(col).into_any_element())
     }
 
+    /// "Replying to Ana", "Editing your message": above the box, with the way out.
+    fn render_mode(&mut self, t: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (glyph, lead, text) = match self.mode.as_ref()? {
+            Mode::Reply(m) => {
+                let s = self.session.read(cx);
+                let who = s.display_name(m.user_id, m.nickname.as_deref());
+                let text = summary(&m.body, m.attachment_name.as_deref(), m.media_type, s);
+                ("reply", trf!("Replying to {}", "Respondendo a {}", who), text)
+            }
+            Mode::Edit(_) => (
+                "edit",
+                tr!("Editing your message", "Editando sua mensagem").to_string(),
+                tr!("Enter saves · Esc cancels", "Enter salva · Esc cancela").to_string(),
+            ),
+        };
+        Some(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .pl(px(12.))
+                .pr(px(4.))
+                .h(px(34.))
+                .rounded(px(radius::CONTROL))
+                .bg(t.layer)
+                .border_1()
+                .border_color(t.stroke)
+                .child(icon(glyph, 14., t.accent))
+                .child(div().flex_none().text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).text_color(t.text).child(lead))
+                .child(div().flex_1().min_w(px(0.)).truncate().text_size(px(12.5)).text_color(t.text3).child(text))
+                .child(
+                    icon_button("mode-cancel", "close", t)
+                        .size(px(26.))
+                        .tooltip(tip(tr!("Cancel (Esc)", "Cancelar (Esc)"), t))
+                        .on_click(cx.listener(|this, _, _, cx| this.cancel_mode(cx))),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_composer(&mut self, t: &Theme, cx: &mut Context<Self>) -> gpui::Div {
         let can_send = !self.composer.read(cx).is_blank() || self.pending.is_some();
         let mention_list = self.mention_matches(cx);
@@ -1387,6 +1833,7 @@ impl ChatView {
                 }
                 d.child(menu)
             })
+            .when_some(self.render_mode(t, cx), |d, strip| d.child(strip))
             .when_some(self.pending.as_ref(), |d, p| {
                 d.child(
                     div()
@@ -1439,8 +1886,14 @@ impl ChatView {
                     .border_color(t.stroke)
                     .child(
                         icon_button("attach", "plus", t)
-                            .tooltip(tip(tr!("Attach a file", "Anexar um arquivo"), t))
-                            .on_click(cx.listener(|this, _, _, cx| this.attach(cx))),
+                            .tooltip(tip(tr!("Send a file, a screenshot…", "Enviar arquivo, captura…"), t))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, e: &MouseDownEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    this.attach_menu(e.position, cx)
+                                }),
+                            ),
                     )
                     .child(div().flex_1().min_w(px(0.)).py(px(6.)).child(self.composer.clone()))
                     .child(icon_button("emoji", "smile", t).tooltip(tip(tr!("Emoji", "Emoji"), t)).on_mouse_down(
@@ -1552,6 +2005,8 @@ impl Render for ChatView {
             .key_context("Chat")
             .track_focus(&self.focus)
             .capture_key_down(cx.listener(Self::on_key))
+            .capture_action(cx.listener(Self::on_up))
+            .capture_action(cx.listener(Self::on_down))
             .group("chat-drop")
             .relative()
             .flex()
@@ -1669,6 +2124,54 @@ fn notice(glyph: &'static str, text: String, color: gpui::Hsla, t: &Theme) -> gp
         .child(div().flex_1().min_w(px(0.)).child(caption(text, t.text)))
 }
 
+/// A menu action that reaches the chat, if it is still open.
+fn act(
+    this: &WeakEntity<ChatView>,
+    f: impl Fn(&mut ChatView, &mut Window, &mut Context<ChatView>) + 'static,
+) -> impl Fn(&mut Window, &mut App) + 'static {
+    let this = this.clone();
+    move |window, cx| {
+        if let Some(this) = this.upgrade() {
+            this.update(cx, |v, cx| f(v, window, cx));
+        }
+    }
+}
+
+/// What a private reply carries of the message it answers, so it shows even when that part of
+/// the conversation isn't loaded.
+fn preview_of(m: &Message) -> ReplyTo {
+    ReplyTo {
+        id: m.id,
+        user_id: m.user_id,
+        body: m.body.chars().take(200).collect(),
+        attachment_name: m.attachment_name.clone(),
+        deleted: false,
+    }
+}
+
+/// A message in one line, for a quote: its words, or what it carries when it has none.
+fn summary(body: &str, attachment: Option<&str>, media: Option<MediaType>, s: &Session) -> String {
+    let text = rich::plain(body, s);
+    let line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim().to_string();
+    if !line.is_empty() {
+        return line;
+    }
+    match (media, attachment) {
+        (Some(MediaType::Image), _) => tr!("Picture", "Imagem").into(),
+        (_, Some(name)) => name.to_string(),
+        _ => tr!("Attachment", "Anexo").into(),
+    }
+}
+
+fn image_ext(format: gpui::ImageFormat) -> &'static str {
+    match format {
+        gpui::ImageFormat::Jpeg => "jpg",
+        gpui::ImageFormat::Gif => "gif",
+        gpui::ImageFormat::Webp => "webp",
+        _ => "png",
+    }
+}
+
 /// Toasts what went wrong when a background send fails.
 fn toast_failure(task: Task<Result<(), crate::core::api::ApiError>>, cx: &mut App) {
     cx.spawn(async move |cx| {
@@ -1730,6 +2233,89 @@ fn remember_emoji(emoji: &str, cx: &mut App) {
         s.recent_emoji.truncate(24);
     });
     let _ = prefs(cx);
+}
+
+/// Every text a message has had, the current one first.
+struct Versions {
+    list: Option<Result<Vec<Version>, String>>,
+    focus: FocusHandle,
+    _load: Task<()>,
+}
+
+impl EventEmitter<Dismiss> for Versions {}
+
+impl Focusable for Versions {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
+impl Render for Versions {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = current();
+        let mut list = div().id("versions").flex().flex_col().gap(px(8.)).max_h(px(440.)).overflow_y_scroll().px(px(22.)).pb(px(18.));
+        let mut count = 0;
+        match &self.list {
+            None => list = list.child(div().py(px(30.)).flex().justify_center().child(caption(tr!("Loading…", "Carregando…"), t.text3))),
+            Some(Err(e)) => list = list.child(div().py(px(20.)).child(caption(e.clone(), t.text2))),
+            Some(Ok(versions)) => {
+                count = versions.len();
+                let last = versions.len().saturating_sub(1);
+                for (i, v) in versions.iter().enumerate().rev() {
+                    let label: String = if i == last {
+                        tr!("Now", "Atual").into()
+                    } else if i == 0 {
+                        tr!("Original", "Original").into()
+                    } else {
+                        trf!("Edit {}", "Edição {}", i)
+                    };
+                    let when = Local.timestamp_millis_opt(v.at).single().map(|d| crate::i18n::date_time(&d)).unwrap_or_default();
+                    list = list.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.))
+                            .p(px(12.))
+                            .rounded(px(radius::CARD))
+                            .bg(t.layer)
+                            .border_1()
+                            .border_color(if i == last { t.accent.opacity(0.5) } else { t.stroke })
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.))
+                                    .child(chip(label, if i == last { t.accent } else { t.text2 }))
+                                    .child(mono(when, t.text3)),
+                            )
+                            .child(if v.body.trim().is_empty() {
+                                caption(tr!("(no text)", "(sem texto)"), t.text3).into_any_element()
+                            } else {
+                                div().text_size(px(13.5)).text_color(t.text).child(v.body.clone()).into_any_element()
+                            }),
+                    );
+                }
+            }
+        }
+        dialog_card(&t, 540.)
+            .track_focus(&self.focus)
+            .child(div().flex().flex_col().gap(px(2.)).p(px(22.)).child(title(tr!("Edit history", "Histórico de edições"), t.text)).when(
+                count > 0,
+                |d| {
+                    d.child(caption(
+                        match count {
+                            2 => tr!("Edited once.", "Editada uma vez.").to_string(),
+                            n => trf!("Edited {} times.", "Editada {} vezes.", n - 1),
+                        },
+                        t.text2,
+                    ))
+                },
+            ))
+            .child(list)
+            .child(div().flex().justify_end().px(px(22.)).py(px(14.)).bg(t.layer).border_t_1().border_color(t.stroke).child(
+                button("versions-close", tr!("Close", "Fechar"), Kind::Primary, &t).on_click(cx.listener(|_, _, _, cx| cx.emit(Dismiss))),
+            ))
+    }
 }
 
 /// A picture, big, with Save.

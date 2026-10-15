@@ -29,6 +29,8 @@ pub struct Picker {
     sound: Sound,
     /// Starting a share, or changing one already running.
     changing: bool,
+    /// Picking something to take a screenshot of, not to share: no stream settings.
+    snapshot: bool,
     on_pick: OnPick,
     _load: Task<()>,
 }
@@ -63,11 +65,19 @@ impl Picker {
                 _ => Sound::System,
             }),
             changing: current.is_some(),
+            snapshot: false,
             on_pick: Rc::new(on_pick),
             _load: Task::ready(()),
         };
         cx.on_release(|this: &mut Picker, cx| this.drop_stills(cx)).detach();
         picker.load(cx);
+        picker
+    }
+
+    /// The same picker, to choose a screen or window to take a picture of.
+    pub fn snapshot(cx: &mut Context<Self>, on_pick: impl Fn(ScreenChoice, &mut Window, &mut App) + 'static) -> Picker {
+        let mut picker = Picker::new(None, cx, on_pick);
+        picker.snapshot = true;
         picker
     }
 
@@ -122,6 +132,11 @@ impl Picker {
         let sound = if self.sound == Sound::App && source.kind == SourceKind::Screen { Sound::System } else { self.sound };
         let choice = ScreenChoice { source, resolution: self.resolution, fps: self.fps, sharp: self.sharp, sound };
         let (res, fps, sharp, kind, sound) = (self.resolution, self.fps, self.sharp, self.kind, self.sound);
+        if self.snapshot {
+            cx.emit(Dismiss);
+            (self.on_pick)(choice, window, cx);
+            return;
+        }
         set_prefs(cx, |p| {
             p.resolution = res.setting().into();
             p.framerate = fps;
@@ -255,7 +270,9 @@ impl Render for Picker {
                             .flex_col()
                             .gap(px(2.))
                             .child(title(
-                                if self.changing {
+                                if self.snapshot {
+                                    tr!("Send a screenshot", "Enviar uma captura de tela")
+                                } else if self.changing {
                                     tr!("Change what you share", "Trocar o que você compartilha")
                                 } else {
                                     tr!("Choose what to share", "Escolha o que compartilhar")
@@ -263,7 +280,14 @@ impl Render for Picker {
                                 t.text,
                             ))
                             .child(caption(
-                                tr!("People in the channel see it as a tile.", "Quem está no canal vê isso num quadro."),
+                                if self.snapshot {
+                                    tr!(
+                                        "It goes into your message at full size, for you to send or drop.",
+                                        "Ela entra na sua mensagem em tamanho real, para você enviar ou descartar."
+                                    )
+                                } else {
+                                    tr!("People in the channel see it as a tile.", "Quem está no canal vê isso num quadro.")
+                                },
                                 t.text2,
                             )),
                     )
@@ -292,73 +316,75 @@ impl Render for Picker {
                             ),
                     )
                     .child(grid)
-                    .child(
-                        div()
-                            .flex()
-                            .gap(px(14.))
-                            .child(div().flex_1().child(field(
-                                tr!("Resolution", "Resolução"),
-                                segmented(
-                                    "res",
-                                    vec![
-                                        (Resolution::P480, "480p".into()),
-                                        (Resolution::P720, "720p".into()),
-                                        (Resolution::P1080, "1080p".into()),
-                                        (Resolution::Native, tr!("Native", "Nativa").into()),
-                                    ],
-                                    self.resolution,
-                                    &t,
-                                    cx,
-                                    |this, r, _, cx| {
-                                        this.resolution = r;
+                    .when(!self.snapshot, |d| {
+                        d.child(
+                            div()
+                                .flex()
+                                .gap(px(14.))
+                                .child(div().flex_1().child(field(
+                                    tr!("Resolution", "Resolução"),
+                                    segmented(
+                                        "res",
+                                        vec![
+                                            (Resolution::P480, "480p".into()),
+                                            (Resolution::P720, "720p".into()),
+                                            (Resolution::P1080, "1080p".into()),
+                                            (Resolution::Native, tr!("Native", "Nativa").into()),
+                                        ],
+                                        self.resolution,
+                                        &t,
+                                        cx,
+                                        |this, r, _, cx| {
+                                            this.resolution = r;
+                                            cx.notify();
+                                        },
+                                    ),
+                                )))
+                                .child(div().w(px(230.)).child(field(
+                                    tr!("Frame rate", "Quadros por segundo"),
+                                    segmented(
+                                        "fps",
+                                        vec![(30, "30".into()), (60, "60".into()), (120, "120".into())],
+                                        self.fps,
+                                        &t,
+                                        cx,
+                                        |this, f, _, cx| {
+                                            this.fps = f;
+                                            cx.notify();
+                                        },
+                                    ),
+                                ))),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap(px(14.))
+                                .child(div().flex_1().child(field(
+                                    tr!("When the connection is tight", "Se a conexão piorar"),
+                                    segmented(
+                                        "priority",
+                                        vec![
+                                            (true, tr!("Keep it sharp", "Priorizar a nitidez").into()),
+                                            (false, tr!("Keep it smooth", "Priorizar a fluidez").into()),
+                                        ],
+                                        self.sharp,
+                                        &t,
+                                        cx,
+                                        |this, s, _, cx| {
+                                            this.sharp = s;
+                                            cx.notify();
+                                        },
+                                    ),
+                                )))
+                                .child(div().flex_1().child(field(
+                                    tr!("Sound", "Som"),
+                                    segmented("sound", sound_choices, sound, &t, cx, |this, s, _, cx| {
+                                        this.sound = s;
                                         cx.notify();
-                                    },
-                                ),
-                            )))
-                            .child(div().w(px(230.)).child(field(
-                                tr!("Frame rate", "Quadros por segundo"),
-                                segmented(
-                                    "fps",
-                                    vec![(30, "30".into()), (60, "60".into()), (120, "120".into())],
-                                    self.fps,
-                                    &t,
-                                    cx,
-                                    |this, f, _, cx| {
-                                        this.fps = f;
-                                        cx.notify();
-                                    },
-                                ),
-                            ))),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .gap(px(14.))
-                            .child(div().flex_1().child(field(
-                                tr!("When the connection is tight", "Se a conexão piorar"),
-                                segmented(
-                                    "priority",
-                                    vec![
-                                        (true, tr!("Keep it sharp", "Priorizar a nitidez").into()),
-                                        (false, tr!("Keep it smooth", "Priorizar a fluidez").into()),
-                                    ],
-                                    self.sharp,
-                                    &t,
-                                    cx,
-                                    |this, s, _, cx| {
-                                        this.sharp = s;
-                                        cx.notify();
-                                    },
-                                ),
-                            )))
-                            .child(div().flex_1().child(field(
-                                tr!("Sound", "Som"),
-                                segmented("sound", sound_choices, sound, &t, cx, |this, s, _, cx| {
-                                    this.sound = s;
-                                    cx.notify();
-                                }),
-                            ))),
-                    ),
+                                    }),
+                                ))),
+                        )
+                    }),
             )
             .child(
                 div()
@@ -370,7 +396,7 @@ impl Render for Picker {
                     .bg(t.layer)
                     .border_t_1()
                     .border_color(t.stroke)
-                    .child(div().flex_1().child(caption(note, t.text2)))
+                    .child(div().flex_1().when(!self.snapshot, |d| d.child(caption(note, t.text2))))
                     .child(
                         button("picker-cancel", tr!("Cancel", "Cancelar"), Kind::Standard, &t)
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(Dismiss))),
@@ -378,7 +404,13 @@ impl Render for Picker {
                     .child(
                         button(
                             "picker-start",
-                            if self.changing { tr!("Use this", "Usar") } else { tr!("Start sharing", "Começar a compartilhar") },
+                            if self.snapshot {
+                                tr!("Capture", "Capturar")
+                            } else if self.changing {
+                                tr!("Use this", "Usar")
+                            } else {
+                                tr!("Start sharing", "Começar a compartilhar")
+                            },
                             Kind::Primary,
                             &t,
                         )

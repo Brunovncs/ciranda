@@ -18,6 +18,8 @@
 // 404 as a conversation that does not exist -- so a stranger cannot even
 // learn which conversations there are.
 
+import { MAX_VERSIONS } from './chat.js';
+
 /** Messages per page, as channels page them. */
 const PAGE_SIZE = 50;
 
@@ -111,6 +113,15 @@ export class DirectMessages {
         + 'WHERE id = ?',
       ),
       deleteMessage: db.prepare('DELETE FROM dm_messages WHERE id = ?'),
+      keepVersion: db.prepare(`
+        INSERT INTO dm_message_edits (message_id, sender_key, recipient_key, sealed, written_at)
+        VALUES (?, ?, ?, ?, ?)
+      `),
+      trimVersions: db.prepare(`
+        DELETE FROM dm_message_edits WHERE message_id = :id AND id NOT IN
+          (SELECT id FROM dm_message_edits WHERE message_id = :id ORDER BY id DESC LIMIT :keep)
+      `),
+      versions: db.prepare('SELECT * FROM dm_message_edits WHERE message_id = ? ORDER BY id'),
       history: db.prepare(`
         SELECT * FROM dm_messages WHERE conversation_id = ? AND id < ?
         ORDER BY id DESC LIMIT ?
@@ -368,8 +379,26 @@ export class DirectMessages {
     if (!isSealedText(sealed)) return { ok: false, error: 'bad_message' };
     const keys = this.checkKeys(conversation, message.user_id, senderKey, recipientKey);
     if (!keys.ok) return keys;
-    this.#q.editMessage.run(sealed, Number(senderKey), Number(recipientKey), Date.now(), message.id);
-    return { ok: true, message: this.#q.message.get(message.id) };
+    return this.#transaction(() => {
+      // The words being replaced, kept as sealed as they came: still only the two can read them.
+      this.#q.keepVersion.run(
+        message.id, message.sender_key, message.recipient_key, message.sealed,
+        message.edited_at ?? message.created_at,
+      );
+      this.#q.trimVersions.run({ id: message.id, keep: MAX_VERSIONS });
+      this.#q.editMessage.run(sealed, Number(senderKey), Number(recipientKey), Date.now(), message.id);
+      return { ok: true, message: this.#q.message.get(message.id) };
+    });
+  }
+
+  /** A message's earlier versions, sealed, oldest first; the current one is the message itself. */
+  versions(message) {
+    return this.#q.versions.all(message.id).map((v) => ({
+      senderKey: v.sender_key,
+      recipientKey: v.recipient_key,
+      sealed: v.sealed,
+      at: v.written_at,
+    }));
   }
 
   /**

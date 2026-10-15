@@ -37,7 +37,7 @@ import { mountDirectMessages } from './dm-routes.js';
 import { Calls } from './calls.js';
 import {
   Chat, Soundpad, Emojis,
-  publicMessage, publicClip, publicEmoji, allowedTypes, mediaTypeOf, mentionsIn,
+  publicMessage, publicReply, publicClip, publicEmoji, allowedTypes, mediaTypeOf, mentionsIn,
   MAX_UPLOAD_BYTES, MAX_AVATAR_BYTES, MAX_CLIP_BYTES, MAX_EMOJI_BYTES, MAX_EMOJIS,
 } from './chat.js';
 
@@ -260,7 +260,7 @@ app.get('/api/health', (req, res) => {
     authenticated: authed,
     // `inbox`: GET /api/inbox and `scope: 'private'` sockets, so a client can
     // keep this server's private messages in the background cheaply.
-    features: ['inbox'],
+    features: ['inbox', 'replies', 'edit-history'],
     ...(authed
       ? {
           name: serverSettings.name,
@@ -1057,9 +1057,17 @@ function forClient(messages) {
   // is cheaper than the eleven-row query it replaces per message.
   const ids = new Map(accounts.list().map((u) => [u.nickname, u.id]));
   const idOf = (nickname) => ids.get(nickname) ?? null;
-  return list.map(
-    (m) => publicMessage(m, byId.get(m.id) ?? [], mentionsIn(m.body, idOf)),
-  );
+  return list.map((m) => {
+    const mentions = mentionsIn(m.body, idOf);
+    // What a reply answers, as much as a reader needs to recognise it without
+    // having that page loaded. Answering somebody tells them, as a mention would.
+    const answered = m.reply_to ? chat.get(m.reply_to) : null;
+    if (answered && answered.user_id !== m.user_id && !mentions.userIds.includes(answered.user_id)) {
+      mentions.userIds.push(answered.user_id);
+    }
+    const reply = m.reply_to ? publicReply(m.reply_to, answered) : null;
+    return publicMessage(m, byId.get(m.id) ?? [], mentions, reply);
+  });
 }
 
 const oneForClient = (message) => forClient([message])[0] ?? null;
@@ -1105,6 +1113,7 @@ app.post('/api/channels/:id/messages', requireLogin, (req, res) => {
     body: req.body?.body,
     attachmentHash: req.body?.attachmentHash ?? null,
     attachmentName: req.body?.attachmentName ?? null,
+    replyTo: req.body?.replyTo ?? null,
   });
   if (!result.ok) return res.status(400).json({ error: result.error });
 
@@ -1158,6 +1167,16 @@ app.post('/api/messages/:id/edit', requireLogin, (req, res) => {
   const message = oneForClient(result.message);
   toChannelReaders(existing.channel_id, { type: 'message:updated', message });
   return res.json({ message });
+});
+
+/** What a message said before each edit, for anybody who may read it. */
+app.get('/api/messages/:id/edits', requireLogin, (req, res) => {
+  const id = Number.parseInt(req.params.id, 10);
+  const existing = chat.get(id);
+  if (!existing || !readableChannel(req, existing.channel_id)) {
+    return res.status(404).json({ error: 'no_such_message' });
+  }
+  return res.json({ versions: chat.versions(id) });
 });
 
 /**

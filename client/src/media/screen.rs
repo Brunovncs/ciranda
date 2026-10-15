@@ -118,11 +118,15 @@ impl ScreenChoice {
 }
 
 fn capturer(kind: SourceKind) -> Option<DesktopCapturer> {
+    capturer_with(kind, true)
+}
+
+fn capturer_with(kind: SourceKind, cursor: bool) -> Option<DesktopCapturer> {
     let mut opts = DesktopCapturerOptions::new(match kind {
         SourceKind::Screen => DesktopCaptureSourceType::Screen,
         SourceKind::Window => DesktopCaptureSourceType::Window,
     });
-    opts.set_include_cursor(true);
+    opts.set_include_cursor(cursor);
     DesktopCapturer::new(opts)
 }
 
@@ -196,6 +200,43 @@ fn still(kind: SourceKind, id: u64) -> Option<Still> {
         }
     }
 }
+/// A screen or window at its own size, without the pointer, as a PNG: a screenshot to send.
+/// Blocks for up to a second, so it runs off the UI thread.
+pub fn snapshot(kind: SourceKind, id: u64) -> Option<Vec<u8>> {
+    let mut c = capturer_with(kind, false)?;
+    let src = c.get_source_list().into_iter().find(|s| s.id() == id)?;
+    let (tx, rx) = mpsc::channel();
+    c.start_capture(Some(src), move |frame| {
+        if let Ok(f) = frame {
+            let (w, h, stride) = (f.width() as u32, f.height() as u32, f.stride() as usize);
+            if w == 0 || h == 0 {
+                return;
+            }
+            let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+            for row in f.data().chunks(stride).take(h as usize) {
+                for p in row[..(w * 4) as usize].chunks_exact(4) {
+                    rgba.extend_from_slice(&[p[2], p[1], p[0], 255]);
+                }
+            }
+            let _ = tx.send((w, h, rgba));
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let (w, h, rgba) = loop {
+        c.capture_frame();
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left.min(Duration::from_millis(50))) {
+            Ok(got) => break got,
+            Err(_) if left.is_zero() => return None,
+            Err(_) => {}
+        }
+    };
+    let img = image::RgbaImage::from_raw(w, h, rgba)?;
+    let mut png = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).ok()?;
+    Some(png)
+}
+
 /// The newest captured frame, made into the encoder's frame inside the capturer's callback (no
 /// copy of the BGRA), and the preview when one was asked for.
 #[derive(Default)]

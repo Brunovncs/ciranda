@@ -405,6 +405,46 @@ const MIGRATIONS = [
       );
     `);
   },
+
+  /*
+   * v13 -- replies, and what a message said before it was edited.
+   *
+   * reply_to is a plain integer, not a foreign key: the message answered
+   * may be deleted later, and the reply has to survive that and say so,
+   * not vanish with it or block the delete. A private conversation's reply
+   * travels sealed inside the message, so dm_messages has no such column.
+   *
+   * The edit history reverses v10's call, on request: people asked to see
+   * what a message said before, the way most chats now show it. The bargain
+   * v10 was protecting still has a way out -- deleting a message takes every
+   * version of it along (ON DELETE CASCADE), so words somebody really wants
+   * gone can still go. Each row is a version that was REPLACED, with the
+   * moment it was written; the current text stays where it always was.
+   * A private conversation's versions are as sealed as the message.
+   */
+  (db) => {
+    db.exec(`
+      ALTER TABLE messages ADD COLUMN reply_to INTEGER;
+
+      CREATE TABLE message_edits (
+        id         INTEGER PRIMARY KEY,
+        message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+        body       TEXT    NOT NULL,
+        written_at INTEGER NOT NULL
+      );
+      CREATE INDEX message_edits_message ON message_edits(message_id, id);
+
+      CREATE TABLE dm_message_edits (
+        id            INTEGER PRIMARY KEY,
+        message_id    INTEGER NOT NULL REFERENCES dm_messages(id) ON DELETE CASCADE,
+        sender_key    INTEGER NOT NULL,
+        recipient_key INTEGER NOT NULL,
+        sealed        TEXT    NOT NULL,
+        written_at    INTEGER NOT NULL
+      );
+      CREATE INDEX dm_message_edits_message ON dm_message_edits(message_id, id);
+    `);
+  },
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

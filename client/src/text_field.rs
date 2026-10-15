@@ -292,6 +292,16 @@ impl TextField {
         self.moved(cx);
     }
 
+    /// Puts `before` and `after` around the selection, or at the caret, and leaves the caret
+    /// inside them: what a formatting button does.
+    pub fn surround(&mut self, before: &str, after: &str, cx: &mut Context<Self>) {
+        let selected = self.buf.selected.clone();
+        let inner = self.buf.text[selected.clone()].to_string();
+        let inserted = self.buf.replace(selected, &format!("{before}{inner}{after}"));
+        self.buf.move_to(inserted.end.saturating_sub(after.len()).max(inserted.start));
+        self.moved(cx);
+    }
+
     /// Nothing but spaces, without copying the text.
     pub fn is_blank(&self) -> bool {
         self.buf.text.trim().is_empty()

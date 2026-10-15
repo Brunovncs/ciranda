@@ -302,7 +302,14 @@ impl Session {
 
     /// Sends a message, sealing its file first if it has one. It shows when the server echoes it
     /// back, exactly as in a channel.
-    pub fn send_dm(&mut self, conversation: ConversationId, body: String, file: Option<Outgoing>, cx: &mut Context<Self>) -> Task<Result<(), ApiError>> {
+    pub fn send_dm(
+        &mut self,
+        conversation: ConversationId,
+        body: String,
+        file: Option<Outgoing>,
+        reply: Option<ReplyTo>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(), ApiError>> {
         let Some(peer) = self.peer_of(conversation) else { return Task::ready(Err(gone())) };
         // In the background the socket opens now, so the echo and the reply come back on it.
         self.wake(cx);
@@ -323,7 +330,7 @@ impl Session {
                 attachment = Some((up.hash, file));
             }
             let hash = attachment.as_ref().map(|(h, _)| h.clone());
-            let payload = Payload { body, file: attachment.map(|(_, f)| f) };
+            let payload = Payload { body, file: attachment.map(|(_, f)| f), reply };
             let task = this
                 .update(cx, |s, cx| {
                     s.send_sealed(
@@ -340,17 +347,38 @@ impl Session {
         })
     }
 
-    /// Replaces what one of your messages says, keeping its file.
+    /// Replaces what one of your messages says, keeping its file and what it answers.
     pub fn edit_dm(&mut self, message: &Message, body: String, cx: &mut Context<Self>) -> Task<Result<(), ApiError>> {
         let conversation = message.channel_id;
         let Some(peer) = self.peer_of(conversation) else { return Task::ready(Err(gone())) };
-        let payload = Payload { body, file: message.private.as_ref().and_then(|p| p.file.clone()) };
+        let payload = Payload { body, file: message.private.as_ref().and_then(|p| p.file.clone()), reply: message.reply.clone() };
         let id = message.id;
         self.send_sealed(
             move |v| v.seal_message(conversation, peer, &payload),
             move |api, sealed| Box::pin(async move { api.edit_dm(id, &sealed).await.map(|_| ()) }),
             cx,
         )
+    }
+
+    /// Every text one of this conversation's messages has had, opened here, oldest first and the
+    /// current one last. One that doesn't open here is left out.
+    pub fn dm_versions(&mut self, message: &Message, cx: &mut Context<Self>) -> Task<Result<Vec<Version>, ApiError>> {
+        let conversation = message.channel_id;
+        let (Some(peer), Some(author)) = (self.peer_of(conversation), message.user_id) else { return Task::ready(Err(gone())) };
+        let (api, id) = (self.api.clone(), message.id);
+        let current = Version { body: message.body.clone(), at: message.edited_at.unwrap_or(message.created_at) };
+        cx.spawn(async move |this, cx| {
+            let sealed = core::run(async move { api.dm_versions(id).await }).await?;
+            this.update(cx, |s, _| {
+                let mut out: Vec<Version> = sealed
+                    .iter()
+                    .filter_map(|v| Some(Version { body: s.vault.open_version(conversation, peer, author, v)?, at: v.at }))
+                    .collect();
+                out.push(current);
+                out
+            })
+            .map_err(|_| gone())
+        })
     }
 
     /// Adds your `emoji` to a message, or takes it off if it is there.

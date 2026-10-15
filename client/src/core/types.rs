@@ -256,6 +256,9 @@ pub struct Message {
     pub pinned: bool,
     #[serde(default)]
     pub edited_at: Option<i64>,
+    /// The message this one answers.
+    #[serde(default)]
+    pub reply: Option<ReplyTo>,
     #[serde(default, deserialize_with = "lenient")]
     pub reactions: Vec<Reaction>,
     #[serde(default)]
@@ -267,6 +270,47 @@ pub struct Message {
     /// A private conversation's message, as opened on this computer; none for a channel's.
     #[serde(skip)]
     pub private: Option<Private>,
+}
+
+/// The message a reply answers, as much of it as a reader needs to recognise it when that part of
+/// the conversation is not loaded: the server's preview for a channel, sealed in the message for a
+/// private one.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplyTo {
+    pub id: MessageId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<UserId>,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment_name: Option<String>,
+    /// It was deleted since.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deleted: bool,
+}
+
+/// One text a message has had, and when it was written.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct Version {
+    #[serde(default)]
+    pub body: String,
+    pub at: i64,
+}
+
+/// An earlier text of a private message, sealed as it was sent.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SealedVersion {
+    pub sender_key: KeyId,
+    pub recipient_key: KeyId,
+    pub sealed: String,
+    pub at: i64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct VersionsReply<T> {
+    pub versions: Vec<T>,
 }
 
 /// What only the two people in a private conversation know about one of its messages, once it is

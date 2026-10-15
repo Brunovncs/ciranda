@@ -429,6 +429,21 @@ describe('conversations and messages', () => {
     assert.equal((await api(`/api/dm-messages/${id}/delete`, { method: 'POST', token: tokens.alice })).status, 200);
   });
 
+  it('keeps what a message said before, sealed, for the two of them only', async () => {
+    const first = sealed();
+    const r = await send('alice', 'bob', convo, { sealed: first });
+    const id = r.body.message.id;
+    await api(`/api/dm-messages/${id}/edit`, {
+      method: 'POST', token: tokens.alice, body: { sealed: sealed(), senderKey: keyOf.alice, recipientKey: keyOf.bob },
+    });
+    const seen = await api(`/api/dm-messages/${id}/edits`, { token: tokens.bob });
+    assert.equal(seen.status, 200);
+    assert.equal(seen.body.versions.length, 1);
+    assert.equal(seen.body.versions[0].sealed, first);
+    assert.equal(seen.body.versions[0].senderKey, keyOf.alice);
+    assert.equal((await api(`/api/dm-messages/${id}/edits`, { token: tokens.boss })).status, 404);
+  });
+
   it('keeps one sealed reaction blob per person, and clears it', async () => {
     const r = await send('alice', 'bob', convo);
     const id = r.body.message.id;
