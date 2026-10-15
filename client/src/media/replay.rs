@@ -312,6 +312,18 @@ mod imp {
         }
     }
 
+    /// Tests set it to use Microsoft's software encoder, as a machine without the graphics card's
+    /// does (CI's, for one).
+    #[cfg(test)]
+    static SOFTWARE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    fn hardware_first() -> bool {
+        #[cfg(test)]
+        return !SOFTWARE.load(Ordering::Relaxed);
+        #[cfg(not(test))]
+        true
+    }
+
     /// One MP4 being written.
     struct Segment {
         writer: IMFSinkWriter,
@@ -328,7 +340,7 @@ mod imp {
     impl Segment {
         fn open(path: &Path, size: (u32, u32), fps: u32, bitrate: u32, sound: bool, start: Instant) -> Result<Segment> {
             // The graphics card's encoder first; where it won't take this, Microsoft's own.
-            let writer = unsafe { writer(path, size, fps, bitrate, sound, true) }.or_else(|e| {
+            let writer = unsafe { writer(path, size, fps, bitrate, sound, hardware_first()) }.or_else(|e| {
                 log::info!("replay: no hardware encoder ({e}); using software");
                 unsafe { writer(path, size, fps, bitrate, sound, false) }
             })?;
@@ -421,7 +433,10 @@ mod imp {
             let writer = MFCreateSinkWriterFromURL(&HSTRING::from(path.as_os_str()), None, &attrs)?;
             let out = video_type(&MFVideoFormat_H264, size, fps)?;
             out.SetUINT32(&MF_MT_AVG_BITRATE, bitrate)?;
-            out.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Main.0 as u32)?;
+            // Baseline has no reordered (B) frames: joined without encoding again, frames whose
+            // time goes back would be dropped by the MP4 writer (Microsoft's software encoder
+            // puts them in Main, and a replay kept one frame in three).
+            out.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base.0 as u32)?;
             // A key frame every two seconds, so a replay can start close to where it is cut.
             out.SetUINT32(&MF_MT_MAX_KEYFRAME_SPACING, fps * 2)?;
             let video = writer.AddStream(&out)?;
@@ -567,9 +582,17 @@ mod imp {
         use super::*;
 
         /// Records a moving picture with a tone for a while, saves a replay shorter than that,
-        /// and reads it back.
+        /// and reads it back: with the graphics card's encoder where there is one, and with
+        /// Microsoft's software one.
         #[test]
         fn a_replay_holds_the_last_seconds() {
+            for software in [false, true] {
+                SOFTWARE.store(software, Ordering::Relaxed);
+                record_and_read_back(software);
+            }
+        }
+
+        fn record_and_read_back(software: bool) {
             let (tx, rx) = mpsc::channel();
             let backlog = Arc::new(AtomicUsize::new(0));
             let b = backlog.clone();
@@ -618,12 +641,9 @@ mod imp {
                 })
                 .unwrap();
                 let secs = (last - first.unwrap()) as f64 / HNS as f64;
-                // At zero, give or take what an encoder with reordered frames shifts the
-                // pictures by (Microsoft's software one: about 15 ms).
-                let start = first.unwrap() as f64 / HNS as f64;
-                assert!(start.abs() < 0.1, "starts at {start} s");
-                assert!((4.5..=9.5).contains(&secs), "{secs} s kept");
-                assert!(frames as f64 >= secs * fps as f64 * 0.9, "{frames} frames");
+                assert_eq!(first, Some(0), "starts at a key frame, at zero (software: {software})");
+                assert!((4.5..=9.5).contains(&secs), "{secs} s kept (software: {software})");
+                assert!(frames as f64 >= secs * fps as f64 * 0.9, "{frames} frames (software: {software})");
                 drop(r);
                 let _ = MFShutdown();
             }
