@@ -1,7 +1,7 @@
 # Harmony server, the usual way.
 #
 #   cp .env.example .env     # edit it, then:
-#   docker compose up -d
+#   docker compose up -d --build
 #   docker compose logs -f
 #
 # Both processes -- the control server and MediaMTX -- live in this one
@@ -11,10 +11,11 @@
 
 services:
   harmony:
-    image: pedrolucasmiguel/harmony-server:3.0.0
-    # To build from a checkout instead of pulling:
-    # build:
-    #   context: ../server
+    # Built from this checkout, so the server matches the client release next to it.
+    # `git pull && docker compose up -d --build` upgrades it.
+    image: ciranda-server:local
+    build:
+      context: ../server
     container_name: harmony
     restart: unless-stopped
 

@@ -1320,16 +1320,21 @@ impl ChatView {
             return Some(match pic {
                 Picture::Ready(image) => {
                     let (img2, h2, n2, f2) = (image.clone(), hash.clone(), name.clone(), how.clone());
+                    // Sized to the picture's own shape inside 420 by 300, so a wide or tall one gets
+                    // no bars; never bigger than the thumbnail, which is twice that at most.
+                    let size = image.size(0);
+                    let (w, h) = (size.width.0.max(1) as f32, size.height.0.max(1) as f32);
+                    let k = (420. / w).min(300. / h).min(1.);
                     div()
                         .id(("attachment", m.id as u64))
-                        .max_w(px(420.))
-                        .max_h(px(300.))
+                        .w(px(w * k))
+                        .h(px(h * k))
                         .rounded(px(radius::CARD))
                         .overflow_hidden()
                         .border_1()
                         .border_color(t.stroke)
                         .cursor_pointer()
-                        .child(img(image).max_w(px(420.)).max_h(px(300.)).object_fit(gpui::ObjectFit::Contain))
+                        .child(img(image).size_full().object_fit(gpui::ObjectFit::Cover))
                         .on_click(
                             cx.listener(move |this, _, window, cx| this.open_image(img2.clone(), h2.clone(), n2.clone(), f2.clone(), window, cx)),
                         )

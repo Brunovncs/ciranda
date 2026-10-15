@@ -1,12 +1,8 @@
 # Running the Harmony server in Docker
 
 ```bash
-docker run -d --name harmony \
-  -p 8080:8080 -p 8889:8889 \
-  -p 8189:8189/udp -p 8189:8189/tcp \
-  -e MTX_WEBRTCADDITIONALHOSTS=stream.example.com \
-  -e HARMONY_SIGNALING_URL=https://stream.example.com:8444 \
-  pedrolucasmiguel/harmony-server:3.0.0
+cp .env.example .env        # fill in the two settings below
+docker compose up -d --build
 ```
 
 | File | What |
@@ -15,9 +11,9 @@ docker run -d --name harmony \
 | [docker-run.sh](docker-run.sh) | The same thing as one `docker run`, for trying it out. |
 | [.env.example](.env.example) | The two settings you must fill in, and the optional password. |
 
-**Image:** [`pedrolucasmiguel/harmony-server`](https://hub.docker.com/r/pedrolucasmiguel/harmony-server)
-— `linux/amd64` and `linux/arm64`, so the same tag runs on a mini-PC and on a
-Raspberry Pi 5.
+**Image:** built from [`../server`](../server) on the machine that runs it, so it
+always matches the checkout. It builds on `linux/amd64` and `linux/arm64` alike,
+a mini-PC or a Raspberry Pi. To upgrade: `git pull && docker compose up -d --build`.
 
 ## The two things you must set
 
@@ -65,10 +61,11 @@ On a Linux host this sidesteps port mapping entirely, and lets MediaMTX see the
 real interfaces so LAN clients connect directly:
 
 ```bash
+docker build -t ciranda-server:local ../server
 docker run -d --name harmony --network host \
   -e MTX_WEBRTCADDITIONALHOSTS=stream.example.com \
   -e HARMONY_SIGNALING_URL=https://stream.example.com:8444 \
-  pedrolucasmiguel/harmony-server:3.0.0
+  ciranda-server:local
 ```
 
 Note this also exposes MediaMTX's control API on port 9997 to the host's

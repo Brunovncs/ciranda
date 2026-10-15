@@ -81,15 +81,16 @@ files you can edit in place.
 ### With Docker
 
 ```bash
-docker run -d --name harmony --restart unless-stopped \
-  -p 8080:8080 -p 8889:8889 -p 8189:8189/udp -p 8189:8189/tcp \
-  -e MTX_WEBRTCADDITIONALHOSTS=stream.example.com \
-  -e HARMONY_SIGNALING_URL=https://stream.example.com:8444 \
-  pedrolucasmiguel/harmony-server:3.0.0
+git clone https://github.com/Brunovncs/ciranda.git
+cd ciranda/docker
+cp .env.example .env        # the public host and the signaling URL, see section 2
+docker compose up -d --build
 ```
 
-Published for `linux/amd64` and `linux/arm64`. Compose and shell examples, plus
-the reasoning, are in [docker/](docker/); the settings below are all passed as
+The image is built from `server/` in the checkout, on `linux/amd64` or
+`linux/arm64`, so it always matches the client release next to it; upgrading is
+`git pull && docker compose up -d --build`. A single `docker run` version and the
+reasoning are in [docker/](docker/); the settings below are all passed as
 environment variables. Two things specific to containers:
 
 - **The media ports must be published 1:1.** MediaMTX advertises the port it
@@ -104,8 +105,8 @@ environment variables. Two things specific to containers:
 ### With the installer
 
 ```bash
-git clone https://github.com/PedroLucasMiguel/harmony.git
-cd harmony/server
+git clone https://github.com/Brunovncs/ciranda.git
+cd ciranda/server
 sudo ./install.sh
 ```
 

@@ -5,7 +5,7 @@
 #   HARMONY_PASSWORD=hunter2 ./docker-run.sh stream.example.com
 #
 # Reach for compose if you want this to survive a reboot; this script is for
-# trying the image out.
+# trying the image out. It builds the image from ../server first.
 
 set -euo pipefail
 
@@ -21,7 +21,10 @@ USAGE
   exit 2
 fi
 
-IMAGE="${HARMONY_IMAGE:-pedrolucasmiguel/harmony-server:3.0.0}"
+IMAGE="${HARMONY_IMAGE:-ciranda-server:local}"
+if [ -z "${HARMONY_IMAGE:-}" ]; then
+  docker build -t "$IMAGE" "$(dirname "$0")/../server"
+fi
 NAME="${HARMONY_NAME:-harmony}"
 SIGNALING_URL="${HARMONY_SIGNALING_URL:-http://${PUBLIC_HOST}:8889}"
 
