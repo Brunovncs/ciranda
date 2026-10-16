@@ -77,21 +77,24 @@ export class DirectMessages {
         'INSERT INTO dm_conversations (user_a, user_b, created_at, last_at) VALUES (?, ?, ?, ?)',
       ),
       touchConversation: db.prepare('UPDATE dm_conversations SET last_at = ? WHERE id = ?'),
-      // Only conversations somebody actually wrote in: opening one and
-      // walking away must not put an empty row in the other person's list.
+      // Only conversations with something in them you have not deleted:
+      // opening one and walking away must not put an empty row in the other
+      // person's list, and one you deleted stays gone until something new.
       list: db.prepare(`
         SELECT c.*,
           IFNULL(r.last_read_id, 0) AS last_read_id,
-          (SELECT MAX(id) FROM dm_messages m WHERE m.conversation_id = c.id) AS last_id,
+          (SELECT MAX(id) FROM dm_messages m
+            WHERE m.conversation_id = c.id AND m.id > IFNULL(r.cleared_id, 0)) AS last_id,
           (SELECT COUNT(*) FROM dm_messages m
             WHERE m.conversation_id = c.id AND m.user_id != :me
-              AND m.id > IFNULL(r.last_read_id, 0)
+              AND m.id > MAX(IFNULL(r.last_read_id, 0), IFNULL(r.cleared_id, 0))
               -- A call both people were on is not news to either; a missed one is.
               AND NOT (m.kind = 'call' AND json_extract(m.meta, '$.outcome') = 'ended')) AS unread
         FROM dm_conversations c
         LEFT JOIN dm_reads r ON r.conversation_id = c.id AND r.user_id = :me
         WHERE (c.user_a = :me OR c.user_b = :me)
-          AND EXISTS (SELECT 1 FROM dm_messages m WHERE m.conversation_id = c.id)
+          AND EXISTS (SELECT 1 FROM dm_messages m
+            WHERE m.conversation_id = c.id AND m.id > IFNULL(r.cleared_id, 0))
         ORDER BY c.last_at DESC
       `),
       latest: db.prepare(`
@@ -101,11 +104,17 @@ export class DirectMessages {
       `),
 
       // --- messages ----------------------------------------------------------
+      // The id is chosen here, not left to SQLite: without AUTOINCREMENT it
+      // hands out the newest deleted id again, and a message given an id at
+      // or below somebody's cleared mark would be born deleted for them.
       insertMessage: db.prepare(`
         INSERT INTO dm_messages
-          (conversation_id, user_id, kind, sender_key, recipient_key, sealed, meta,
+          (id, conversation_id, user_id, kind, sender_key, recipient_key, sealed, meta,
            attachment_hash, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (
+          MAX(IFNULL((SELECT MAX(id) FROM dm_messages), 0),
+              IFNULL((SELECT MAX(cleared_id) FROM dm_reads), 0)) + 1,
+          ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `),
       message: db.prepare('SELECT * FROM dm_messages WHERE id = ?'),
       editMessage: db.prepare(
@@ -123,11 +132,11 @@ export class DirectMessages {
       `),
       versions: db.prepare('SELECT * FROM dm_message_edits WHERE message_id = ? ORDER BY id'),
       history: db.prepare(`
-        SELECT * FROM dm_messages WHERE conversation_id = ? AND id < ?
+        SELECT * FROM dm_messages WHERE conversation_id = ? AND id > ? AND id < ?
         ORDER BY id DESC LIMIT ?
       `),
       hasAttachment: db.prepare(
-        'SELECT 1 FROM dm_messages WHERE conversation_id = ? AND attachment_hash = ? LIMIT 1',
+        'SELECT 1 FROM dm_messages WHERE conversation_id = ? AND id > ? AND attachment_hash = ? LIMIT 1',
       ),
       maxId: db.prepare('SELECT MAX(id) AS id FROM dm_messages WHERE conversation_id = ?'),
 
@@ -148,6 +157,20 @@ export class DirectMessages {
       lastRead: db.prepare(
         'SELECT last_read_id FROM dm_reads WHERE conversation_id = ? AND user_id = ?',
       ),
+      clear: db.prepare(`
+        INSERT INTO dm_reads (conversation_id, user_id, last_read_id, cleared_id) VALUES (?, ?, ?, ?)
+        ON CONFLICT(conversation_id, user_id) DO UPDATE SET
+          last_read_id = MAX(last_read_id, excluded.last_read_id),
+          cleared_id = MAX(cleared_id, excluded.cleared_id)
+      `),
+      clearedId: db.prepare(
+        'SELECT cleared_id FROM dm_reads WHERE conversation_id = ? AND user_id = ?',
+      ),
+      purgedFiles: db.prepare(`
+        SELECT attachment_hash FROM dm_messages
+        WHERE conversation_id = ? AND id <= ? AND attachment_hash IS NOT NULL
+      `),
+      purge: db.prepare('DELETE FROM dm_messages WHERE conversation_id = ? AND id <= ?'),
       block: db.prepare(
         'INSERT OR IGNORE INTO dm_blocks (blocker_id, blocked_id, created_at) VALUES (?, ?, ?)',
       ),
@@ -413,15 +436,53 @@ export class DirectMessages {
     });
   }
 
-  history(conversationId, { before = Number.MAX_SAFE_INTEGER, limit = PAGE_SIZE } = {}) {
+  /** A page of what `userId` can still see here: nothing up to their cleared mark. */
+  history(conversationId, userId, { before = Number.MAX_SAFE_INTEGER, limit = PAGE_SIZE } = {}) {
     return this.#q.history
-      .all(conversationId, before, Math.min(limit, PAGE_SIZE))
+      .all(conversationId, this.clearedId(conversationId, userId), before, Math.min(limit, PAGE_SIZE))
       .reverse();
   }
 
-  /** Whether a sealed file was sent in this conversation, and so may be fetched from it. */
-  hasAttachment(conversationId, hash) {
-    return Boolean(this.#q.hasAttachment.get(conversationId, hash));
+  /** Whether a sealed file was sent in this conversation, and `userId` has not deleted it. */
+  hasAttachment(conversationId, userId, hash) {
+    return Boolean(this.#q.hasAttachment.get(conversationId, this.clearedId(conversationId, userId), hash));
+  }
+
+  // ---------------------------------------------------------- clearing
+
+  /** The newest message `userId` deleted from this conversation for themselves, 0 for none. */
+  clearedId(conversationId, userId) {
+    return this.#q.clearedId.get(conversationId, userId)?.cleared_id ?? 0;
+  }
+
+  /** Whether `userId` still sees this message: it is not behind their cleared mark. */
+  visibleTo(message, userId) {
+    return message.id > this.clearedId(message.conversation_id, userId);
+  }
+
+  /**
+   * Delete the conversation for `userId` alone: everything in it now, so it
+   * leaves their list and opens empty if it comes back. The other person
+   * keeps every word.
+   *
+   * What NEITHER can see any more -- both have cleared past it -- is deleted
+   * for real in the same transaction, files let go as remove() lets them go.
+   * Returns the new mark.
+   */
+  clear(conversation, userId) {
+    return this.#transaction(() => {
+      const max = this.#q.maxId.get(conversation.id)?.id ?? 0;
+      this.#q.clear.run(conversation.id, userId, max, max);
+      const marks = DirectMessages.members(conversation).map((id) => this.clearedId(conversation.id, id));
+      const gone = Math.min(...marks);
+      if (gone > 0) {
+        for (const { attachment_hash: hash } of this.#q.purgedFiles.all(conversation.id, gone)) {
+          this.#q.dropRef.run(hash);
+        }
+        this.#q.purge.run(conversation.id, gone);
+      }
+      return this.clearedId(conversation.id, userId);
+    });
   }
 
   // -------------------------------------------------------------- reactions

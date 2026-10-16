@@ -58,11 +58,11 @@ export function mountDirectMessages(app, { requireLogin, dms, chat, accounts, pu
     return next();
   };
 
-  /** The message in :id and its conversation, if the caller is in it. */
+  /** The message in :id and its conversation, if the caller is in it and has not deleted it. */
   const dmMessage = (req, res, next) => {
     const m = dms.message(Number.parseInt(req.params.id, 10));
     const c = m && dms.forUser(req.user.id, m.conversation_id);
-    if (!m || !c) return res.status(404).json({ error: 'no_such_message' });
+    if (!m || !c || !dms.visibleTo(m, req.user.id)) return res.status(404).json({ error: 'no_such_message' });
     req.dmMessage = m;
     req.conversation = c;
     return next();
@@ -108,6 +108,8 @@ export function mountDirectMessages(app, { requireLogin, dms, chat, accounts, pu
   };
 
   const members = (c) => DirectMessages.members(c);
+  /** Who is told about a change to `m`: not somebody who deleted it for themselves. */
+  const seeing = (c, m) => members(c).filter((id) => dms.visibleTo(m, id));
 
   // ------------------------------------------------------------------ keys
 
@@ -200,9 +202,20 @@ export function mountDirectMessages(app, { requireLogin, dms, chat, accounts, pu
 
   app.get('/api/dms/:id/messages', requireLogin, conversation, (req, res) => {
     const before = Number.parseInt(req.query.before ?? '', 10);
-    res.json(forClient(
-      dms.history(req.conversation.id, { before: Number.isFinite(before) ? before : undefined }),
-    ));
+    res.json(forClient(dms.history(req.conversation.id, req.user.id, {
+      before: Number.isFinite(before) ? before : undefined,
+    })));
+  });
+
+  /**
+   * Delete the conversation for yourself: what is in it now goes from your
+   * list and your history, and stays for the other person, who is not told.
+   * Your other windows are, so it goes from them too.
+   */
+  app.post('/api/dms/:id/clear', requireLogin, conversation, (req, res) => {
+    const clearedId = dms.clear(req.conversation, req.user.id);
+    push([req.user.id], { type: 'dm:cleared', conversationId: req.conversation.id, clearedId });
+    res.json({ clearedId });
   });
 
   app.post('/api/dms/:id/messages', requireLogin, conversation, throttled(sending), (req, res) => {
@@ -269,7 +282,7 @@ export function mountDirectMessages(app, { requireLogin, dms, chat, accounts, pu
   /** A sealed file, to the two people of the conversation it was sent in, and only them. */
   app.get('/api/dms/:id/uploads/:hash', requireLogin, conversation, (req, res) => {
     const hash = String(req.params.hash);
-    if (!/^[0-9a-f]{64}$/.test(hash) || !dms.hasAttachment(req.conversation.id, hash)) {
+    if (!/^[0-9a-f]{64}$/.test(hash) || !dms.hasAttachment(req.conversation.id, req.user.id, hash)) {
       return res.status(404).json({ error: 'no_such_file' });
     }
     const info = chat.fileInfo(hash);
@@ -298,7 +311,7 @@ export function mountDirectMessages(app, { requireLogin, dms, chat, accounts, pu
     });
     if (!result.ok) return refuse(res, result);
     const { messages: [message] } = forClient(result.message);
-    push(members(req.conversation), { type: 'dm:updated', message });
+    push(seeing(req.conversation, m), { type: 'dm:updated', message });
     return res.json({ message });
   });
 
@@ -314,7 +327,7 @@ export function mountDirectMessages(app, { requireLogin, dms, chat, accounts, pu
       return res.status(403).json({ error: 'forbidden', message: 'Not your message.' });
     }
     dms.remove(m);
-    push(members(req.conversation), {
+    push(seeing(req.conversation, m), {
       type: 'dm:deleted', id: m.id, conversationId: req.conversation.id,
     });
     return res.json({ ok: true });
@@ -340,7 +353,7 @@ export function mountDirectMessages(app, { requireLogin, dms, chat, accounts, pu
     });
     if (!result.ok) return refuse(res, result);
     const reactions = dms.reactionsFor([req.dmMessage.id]).get(req.dmMessage.id) ?? [];
-    push(members(c), {
+    push(seeing(c, req.dmMessage), {
       type: 'dm:reactions', id: req.dmMessage.id, conversationId: c.id, reactions,
     });
     return res.json({ reactions });

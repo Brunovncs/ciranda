@@ -468,15 +468,38 @@ impl Render for SafetyNumber {
 
 // The conversation's menu.
 
-pub fn conversation_menu(session: &Entity<Session>, peer: UserId, at: Point<Pixels>, _: &mut Window, cx: &mut App) {
+pub fn conversation_menu(
+    session: &Entity<Session>,
+    conversation: ConversationId,
+    peer: UserId,
+    at: Point<Pixels>,
+    _: &mut Window,
+    cx: &mut App,
+) {
     let blocked = session.read(cx).blocked.contains(&peer);
     let name = session.read(cx).display_name(Some(peer), None);
-    let (s1, s2) = (session.clone(), session.clone());
+    let (s1, s2, s3) = (session.clone(), session.clone(), session.clone());
     let items = vec![
         MenuEntry::item("shield-check", tr!("Compare safety number", "Comparar código de segurança"), false, move |window, cx| {
             safety_number(&s1, peer, window, cx)
         }),
         MenuEntry::rule(),
+        MenuEntry::item("delete", tr!("Delete conversation", "Apagar conversa"), true, move |window, cx| {
+            let session = s3.clone();
+            let name = s3.read(cx).display_name(Some(peer), None);
+            Ask::confirm_action(
+                tr!("Delete this conversation?", "Apagar esta conversa?"),
+                trf!(
+                    "Every message and call in it goes, for you only: {} keeps all of it and isn't told. If either of you writes again, it starts over from there. This can't be undone.",
+                    "Todas as mensagens e chamadas dela somem só para você: {} continua com tudo e não recebe nenhum aviso. Se algum dos dois escrever de novo, ela recomeça dali. Não dá para desfazer.",
+                    name
+                ),
+                tr!("Delete", "Apagar"),
+                window,
+                cx,
+                move |_, cx| session.update(cx, |s, cx| s.clear_dm(conversation, cx)),
+            );
+        }),
         MenuEntry::item(
             "ban",
             if blocked { trf!("Unblock {}", "Desbloquear {}", name) } else { trf!("Block {}", "Bloquear {}", name) },

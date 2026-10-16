@@ -1638,7 +1638,7 @@ impl ChatView {
                     MouseButton::Left,
                     cx.listener(move |this, e: &MouseDownEvent, window, cx| {
                         cx.stop_propagation();
-                        super::private::conversation_menu(&this.session, peer, e.position, window, cx);
+                        super::private::conversation_menu(&this.session, conversation, peer, e.position, window, cx);
                     }),
                 ),
             )

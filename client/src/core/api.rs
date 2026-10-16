@@ -454,6 +454,11 @@ impl Api {
         self.post(&format!("/api/dms/{id}/read"), json!({ "upTo": up_to })).await
     }
 
+    /// Deletes everything in the conversation for you; the other person keeps it.
+    pub async fn clear_dm(&self, id: ConversationId) -> Result<Value> {
+        self.post(&format!("/api/dms/{id}/clear"), json!({})).await
+    }
+
     pub async fn set_blocked(&self, user: UserId, blocked: bool) -> Result<Vec<UserId>> {
         #[derive(serde::Deserialize)]
         struct R {

@@ -445,6 +445,21 @@ const MIGRATIONS = [
       CREATE INDEX dm_message_edits_message ON dm_message_edits(message_id, id);
     `);
   },
+
+  /*
+   * v14 -- deleting a private conversation for yourself.
+   *
+   * A mark per person, beside the read mark it travels with: everything up
+   * to cleared_id is gone for that person and still there for the other.
+   * Something new brings the conversation back, starting from there. Once
+   * both have cleared past a message nobody can see it any more, and it is
+   * deleted for real.
+   */
+  (db) => {
+    db.exec(`
+      ALTER TABLE dm_reads ADD COLUMN cleared_id INTEGER NOT NULL DEFAULT 0;
+    `);
+  },
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

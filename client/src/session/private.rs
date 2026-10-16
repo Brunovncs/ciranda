@@ -405,6 +405,31 @@ impl Session {
         )
     }
 
+    /// Deletes the conversation for you alone: it leaves the list, and comes back with only what
+    /// is said after. The other person keeps all of it.
+    pub fn clear_dm(&mut self, conversation: ConversationId, cx: &mut Context<Self>) {
+        self.call(
+            cx,
+            move |api| Box::pin(async move { api.clear_dm(conversation).await }),
+            move |s, _, cx| {
+                s.forget_dm(conversation);
+                cx.notify();
+            },
+        );
+    }
+
+    fn forget_dm(&mut self, conversation: ConversationId) {
+        let room = Room::Dm(conversation);
+        self.dms.remove(&conversation);
+        self.chats.remove(&room);
+        if self.viewing == Some(room) {
+            self.viewing = None;
+        }
+        if self.open_room == Some(room) {
+            self.open_room = None;
+        }
+    }
+
     pub fn set_blocked(&mut self, user: UserId, blocked: bool, cx: &mut Context<Self>) {
         self.call(
             cx,
@@ -523,6 +548,8 @@ impl Session {
                     self.recount(conversation);
                 }
             }
+            // Deleted on this computer or another one of yours.
+            "dm:cleared" => self.forget_dm(int("conversationId")),
             "dm:blocks" => {
                 if let Some(list) = list_of::<UserId>(field("blocked")) {
                     self.blocked = list.into_iter().collect();

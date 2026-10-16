@@ -343,6 +343,9 @@ impl ServerView {
                 None => this.open_room(Room::Dm(id), window, cx),
                 Some(f) => this.open_away(f.clone(), id, window, cx),
             }))
+            .on_mouse_down(MouseButton::Right, move |e: &MouseDownEvent, window, cx| {
+                super::private::conversation_menu(&session, id, peer, e.position, window, cx);
+            })
             .into_any_element()
     }
 

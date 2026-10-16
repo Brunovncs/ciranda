@@ -469,6 +469,7 @@ describe('conversations and messages', () => {
         api(`/api/dms/${convo}/messages`, { token: t }),
         api(`/api/dms/${convo}/messages`, { method: 'POST', token: t, body: { sealed: sealed(), senderKey: 1, recipientKey: 1 } }),
         api(`/api/dms/${convo}/read`, { method: 'POST', token: t, body: { upTo: 1 } }),
+        api(`/api/dms/${convo}/clear`, { method: 'POST', token: t }),
         api(`/api/dms/${convo}/uploads`, { method: 'POST', token: t, raw: randomBytes(64) }),
         api(`/api/dms/${convo}/uploads/${'a'.repeat(64)}`, { token: t }),
         api(`/api/dm-messages/${m.id}/edit`, { method: 'POST', token: t, body: { sealed: sealed() } }),
@@ -583,6 +584,107 @@ describe('blocking', () => {
     assert.equal(r.error, 'blocked');
     await e.close();
     await api('/api/dms/blocks', { method: 'POST', token: tokens.alice, body: { userId: ids.eve, blocked: false } });
+  });
+});
+
+describe('deleting a conversation for yourself', () => {
+  let convo;
+  let early;
+  let hash;
+  const clear = (who) => api(`/api/dms/${convo}/clear`, { method: 'POST', token: tokens[who] });
+  const listed = async (who) => (await api('/api/dms', { token: tokens[who] })).body.conversations.find((c) => c.id === convo);
+  const history = async (who) => (await api(`/api/dms/${convo}/messages`, { token: tokens[who] })).body.messages.map((m) => m.id);
+
+  before(async () => {
+    convo = await open('bob', 'eve');
+    const up = await api(`/api/dms/${convo}/uploads`, { method: 'POST', token: tokens.eve, raw: randomBytes(512) });
+    hash = up.body.hash;
+    early = [
+      (await send('eve', 'bob', convo, { attachmentHash: hash })).body.message.id,
+      (await send('bob', 'eve', convo)).body.message.id,
+      (await send('eve', 'bob', convo)).body.message.id,
+    ];
+  });
+
+  it('takes it from your list and history, tells your windows, and leaves the other person every word', async () => {
+    const b = connect(tokens.bob);
+    const e = connect(tokens.eve);
+    await Promise.all([b.hello(), e.hello()]);
+
+    const r = await clear('bob');
+    assert.equal(r.status, 200);
+    assert.equal(r.body.clearedId, early.at(-1));
+    await b.next((m) => m.type === 'dm:cleared' && m.conversationId === convo && m.clearedId === early.at(-1));
+    await silent(e, (m) => m.type === 'dm:cleared');
+
+    assert.equal(await listed('bob'), undefined);
+    assert.deepEqual(await history('bob'), []);
+    assert.deepEqual(await history('eve'), early);
+    assert.equal((await listed('eve')).last.id, early.at(-1));
+    await Promise.all([b.close(), e.close()]);
+  });
+
+  it('makes what you deleted not exist for you on any route, while it still does for them', async () => {
+    const [first] = early;
+    const react = (who, peer) => api(`/api/dm-messages/${first}/react`, {
+      method: 'POST', token: tokens[who], body: { sealed: sealed(40), senderKey: keyOf[who], recipientKey: keyOf[peer] },
+    });
+    assert.equal((await react('bob', 'eve')).status, 404);
+    assert.equal((await api(`/api/dm-messages/${first}/edits`, { token: tokens.bob })).status, 404);
+    assert.equal((await api(`/api/dms/${convo}/uploads/${hash}`, { token: tokens.bob })).status, 404);
+    assert.equal((await api(`/api/dms/${convo}/uploads/${hash}`, { token: tokens.eve })).status, 200);
+
+    const b = connect(tokens.bob);
+    await b.hello();
+    assert.equal((await react('eve', 'bob')).status, 200);
+    await silent(b, (m) => m.type === 'dm:reactions');
+    await b.close();
+  });
+
+  it('comes back with something new, and only from there', async () => {
+    const r = await send('eve', 'bob', convo);
+    const row = await listed('bob');
+    assert.equal(row.last.id, r.body.message.id);
+    assert.equal(row.unread, 1);
+    assert.deepEqual(await history('bob'), [r.body.message.id]);
+    assert.deepEqual(await history('eve'), [...early, r.body.message.id]);
+  });
+
+  it('does not hide what comes after the newest message is deleted', async () => {
+    // SQLite would hand the deleted id out again, at the mark: born deleted for bob.
+    assert.equal((await clear('bob')).status, 200);
+    const newest = (await send('eve', 'bob', convo)).body.message.id;
+    assert.equal((await clear('bob')).body.clearedId, newest);
+    assert.equal((await api(`/api/dm-messages/${newest}/delete`, { method: 'POST', token: tokens.eve })).status, 200);
+    const next = (await send('eve', 'bob', convo)).body.message.id;
+    assert.ok(next > newest);
+    assert.deepEqual(await history('bob'), [next]);
+  });
+
+  it('deletes for real what neither can see any more, and keeps the conversation working', async () => {
+    const before_ = (await history('eve')).at(-1);
+    assert.equal((await clear('eve')).status, 200);
+    assert.equal((await clear('bob')).status, 200);
+
+    const db = new DatabaseSync(resolve(dataDir, 'harmony.db'), { readOnly: true });
+    try {
+      const left = db.prepare('SELECT COUNT(*) AS n FROM dm_messages WHERE conversation_id = ?').get(convo).n;
+      assert.equal(left, 0);
+      const refs = db.prepare('SELECT refs FROM uploads WHERE hash = ?').get(hash);
+      assert.ok(!refs || refs.refs === 0, 'the file is let go');
+    } finally {
+      db.close();
+    }
+
+    const r = await send('bob', 'eve', convo);
+    assert.ok(r.body.message.id > before_);
+    assert.deepEqual(await history('bob'), [r.body.message.id]);
+    assert.deepEqual(await history('eve'), [r.body.message.id]);
+    assert.equal((await listed('eve')).unread, 1);
+  });
+
+  it('says so in the health check', async () => {
+    assert.ok((await api('/api/health')).body.features.includes('dm-clear'));
   });
 });
 
