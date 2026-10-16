@@ -70,7 +70,8 @@ mod imp {
     use super::Rect;
     use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, RECT};
     use windows::Win32::Graphics::Dwm::{
-        DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DwmSetWindowAttribute,
+        DWMNCRP_DISABLED, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_NCRENDERING_POLICY, DWMWA_WINDOW_CORNER_PREFERENCE,
+        DWMWCP_DONOTROUND, DwmSetWindowAttribute,
     };
     use windows::Win32::Graphics::Gdi::{
         EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromWindow,
@@ -97,8 +98,11 @@ mod imp {
             // Layered and fully opaque: what is drawn stays as drawn, the transparent rest lets
             // the clicks through.
             let _ = SetLayeredWindowAttributes(h, COLORREF(0), 255, LWA_ALPHA);
-            // Windows 11 outlines and rounds top-level windows, a white line around the overlay
-            // otherwise. Older versions don't know these and say so, which changes nothing.
+            // Windows frames top-level windows: a shadow, and on Windows 11 a white outline and
+            // round corners, all around the overlay otherwise. Older versions don't know the last
+            // two and say so, which changes nothing.
+            let off = DWMNCRP_DISABLED;
+            let _ = DwmSetWindowAttribute(h, DWMWA_NCRENDERING_POLICY, &off as *const _ as _, size_of_val(&off) as u32);
             let none = DWMWA_COLOR_NONE;
             let _ = DwmSetWindowAttribute(h, DWMWA_BORDER_COLOR, &none as *const u32 as _, size_of::<u32>() as u32);
             let square = DWMWCP_DONOTROUND;
