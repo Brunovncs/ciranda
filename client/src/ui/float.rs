@@ -69,6 +69,9 @@ pub use imp::{foreground_monitor, screen_rect, window_rect};
 mod imp {
     use super::Rect;
     use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, RECT};
+    use windows::Win32::Graphics::Dwm::{
+        DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DwmSetWindowAttribute,
+    };
     use windows::Win32::Graphics::Gdi::{
         EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromWindow,
     };
@@ -94,6 +97,12 @@ mod imp {
             // Layered and fully opaque: what is drawn stays as drawn, the transparent rest lets
             // the clicks through.
             let _ = SetLayeredWindowAttributes(h, COLORREF(0), 255, LWA_ALPHA);
+            // Windows 11 outlines and rounds top-level windows, a white line around the overlay
+            // otherwise. Older versions don't know these and say so, which changes nothing.
+            let none = DWMWA_COLOR_NONE;
+            let _ = DwmSetWindowAttribute(h, DWMWA_BORDER_COLOR, &none as *const u32 as _, size_of::<u32>() as u32);
+            let square = DWMWCP_DONOTROUND;
+            let _ = DwmSetWindowAttribute(h, DWMWA_WINDOW_CORNER_PREFERENCE, &square as *const _ as _, size_of_val(&square) as u32);
             // A debug build can leave them in captures, for screenshots of them.
             let seen = cfg!(debug_assertions) && std::env::var_os("CIRANDA_FLOAT_CAPTURED").is_some();
             if !seen && let Err(e) = SetWindowDisplayAffinity(h, WDA_EXCLUDEFROMCAPTURE) {
