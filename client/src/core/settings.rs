@@ -297,6 +297,19 @@ impl Settings {
         }
     }
 
+    /// A password kept for this name on any server, the one in use first: what adding another
+    /// server as the same account starts from, or "" for none.
+    pub fn kept_password(&self, username: &str) -> &str {
+        let active = self.active_server().map(|i| &self.saved_servers[i]);
+        active
+            .into_iter()
+            .chain(&self.saved_servers)
+            .filter(|s| s.username == username)
+            .map(|s| s.account_password.as_str())
+            .find(|p| !p.is_empty())
+            .unwrap_or("")
+    }
+
     /// Drops a sign-in the server refused. A kept password stays: it is the way back in.
     pub fn forget_token(&mut self, url: &str, username: &str) {
         if let Some(s) = self.saved_servers.iter_mut().find(|s| s.is(url, username)) {
@@ -1114,6 +1127,8 @@ mod tests {
         let mut again = Store::load_from(path.clone());
         assert_eq!(again.values.account_password("http://PI.local:8080/", "predo"), "hunter22");
         assert_eq!(again.values.account_password("pi.local:8080", "lis"), "", "another name's is not it");
+        assert_eq!(again.values.kept_password("predo"), "hunter22", "box keeps none, pi's is the one");
+        assert_eq!(again.values.kept_password("lis"), "");
         again.update(|s| {
             s.switch_server("pi.local:8080", "predo");
             s.session_token.clear();

@@ -5,7 +5,7 @@
 use crate::core::api::{Api, ApiError, sends_in_the_clear};
 use crate::core::cache::Cache;
 use crate::core::settings::{SavedServer, same_server};
-use crate::core::types::{AuthReply, Health, IceServer, User};
+use crate::core::types::{AuthReply, ErrorCode, Health, IceServer, User};
 use crate::core::{self};
 use crate::prefs::{prefs, set_prefs};
 use crate::text_field::{TextField, TextFieldEvent};
@@ -263,7 +263,7 @@ impl ConnectView {
         cx.spawn(async move |this, cx| {
             let result = core::run({
                 let (api, nickname, password) = (api.clone(), nickname.clone(), password.clone());
-                async move { sign_in(&api, mode, &nickname, &password, &owner_key, token).await }
+                async move { sign_in(&api, mode, &nickname, &password, &owner_key, token, false).await }
             })
             .await;
             let _ = this.update(cx, |this, cx| {
@@ -282,7 +282,7 @@ impl ConnectView {
                             .detach();
                         }
                     }
-                    Err(Failure { message, health, expired }) => {
+                    Err(Failure { message, health, expired, .. }) => {
                         this.resuming = None;
                         if let Some(h) = health {
                             note_health(&server, &h, cx);
@@ -408,17 +408,29 @@ struct Failure {
     health: Option<Health>,
     /// The server refused the kept sign-in.
     expired: bool,
+    /// The server refused the password.
+    wrong_password: bool,
 }
 
 impl From<ApiError> for Failure {
     fn from(e: ApiError) -> Self {
-        Failure { message: e.message, health: None, expired: false }
+        Failure { message: e.message, health: None, expired: false, wrong_password: false }
     }
 }
 
-async fn sign_in(api: &Api, mode: Mode, nickname: &str, password: &str, owner_key: &str, token: Option<String>) -> Result<Done, Failure> {
+/// `or_create`: a name with no account on this server gets one with this password, as adding a
+/// server for the account in use with its kept password does: each server has its own accounts.
+async fn sign_in(
+    api: &Api,
+    mode: Mode,
+    nickname: &str,
+    password: &str,
+    owner_key: &str,
+    token: Option<String>,
+    or_create: bool,
+) -> Result<Done, Failure> {
     let health = api.health().await?;
-    let fail = |message: String, health: &Health| Failure { message, health: Some(health.clone()), expired: false };
+    let fail = |message: String, health: &Health| Failure { message, health: Some(health.clone()), expired: false, wrong_password: false };
     if health.password_required && !health.authenticated {
         let message = if api.base().is_empty() {
             tr!("Type the server password.", "Digite a senha do servidor.")
@@ -463,16 +475,39 @@ async fn sign_in(api: &Api, mode: Mode, nickname: &str, password: &str, owner_ke
                         ),
                         health: Some(health),
                         expired: true,
+                        wrong_password: false,
                     });
                 }
             }
         }
         None => {
             let reply: AuthReply = match mode {
-                Mode::SignIn => api.login(nickname, password, key).await,
+                Mode::SignIn => match api.login(nickname, password, key).await {
+                    // The server says the same for no account and a wrong password; creating the
+                    // account tells them apart, since the name is taken only in the second case.
+                    Err(e) if or_create && e.code == ErrorCode::BadCredentials => match api.register(nickname, password, key).await {
+                        Ok(reply) => {
+                            notes.push(tr!(
+                                "You had no account on this server, so it was made with the same name and password.",
+                                "Você não tinha conta neste servidor, então ela foi criada com o mesmo nome e senha."
+                            ));
+                            Ok(reply)
+                        }
+                        Err(taken) if taken.code == ErrorCode::NicknameTaken => Err(ApiError {
+                            message: tr!(
+                                "This server already has an account with your name, and the password saved on this computer is not its password. Type your password on this server.",
+                                "Este servidor já tem uma conta com o seu nome, e a senha salva neste computador não é a dela. Digite a sua senha neste servidor."
+                            )
+                            .into(),
+                            ..e
+                        }),
+                        Err(other) => Err(other),
+                    },
+                    other => other,
+                },
                 Mode::Register => api.register(nickname, password, key).await,
             }
-            .map_err(|e| fail(e.message, &health))?;
+            .map_err(|e| Failure { wrong_password: e.code == ErrorCode::BadCredentials, ..fail(e.message, &health) })?;
             api.set_token(&reply.token);
             if reply.owner_claimed {
                 notes.push(tr!("You are this server's owner now.", "Agora você é o dono deste servidor."));
@@ -859,8 +894,18 @@ impl AddServer {
             probe: Task::ready(()),
         };
         this.set_mode(if kind == Adding::NewAccount { Mode::Register } else { Mode::SignIn }, cx);
+        // The account in use, with the password kept for it: nothing to type but the address.
+        if let Some(me) = &this.me {
+            let kept = prefs(cx).kept_password(&me.username).to_string();
+            this.password.update(cx, |f, cx| f.set_saved_text(&kept, cx));
+        }
         this.probe(cx);
         this
+    }
+
+    /// The box holds the kept password as it was filled in.
+    fn password_is_kept(&self, cx: &App) -> bool {
+        self.password.read(cx).is_saved()
     }
 
     fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
@@ -896,6 +941,10 @@ impl AddServer {
     fn other_name(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(me) = self.me.take() else { return };
         self.nickname.update(cx, |f, cx| f.set_text(&me.username, cx));
+        // That password is the account in use's.
+        if self.password_is_kept(cx) {
+            self.password.update(cx, |f, cx| f.set_saved_text("", cx));
+        }
         self.nickname.focus_handle(cx).focus(window, cx);
         cx.notify();
     }
@@ -917,7 +966,7 @@ impl AddServer {
             Some(tr!("Type the name you use on this server.", "Digite o nome que você usa neste servidor."))
         } else if password.is_empty() {
             Some(tr!("Type your password.", "Digite sua senha."))
-        } else if self.mode == Mode::Register && password != confirm {
+        } else if self.confirm_needed(cx) && password != confirm {
             Some(tr!("The two passwords are not the same.", "As duas senhas não são iguais."))
         } else {
             None
@@ -932,12 +981,15 @@ impl AddServer {
         cx.notify();
 
         let mode = self.mode;
+        // A kept password already works for this name elsewhere, so it is no typo to make an
+        // account with; a typed one is checked by typing it twice, on "Create an account".
+        let or_create = self.me.is_some() && self.password_is_kept(cx);
         let api = Api::new();
         api.set_server(&server, &door);
         cx.spawn(async move |this, cx| {
             let result = core::run({
                 let (api, nickname, password) = (api.clone(), nickname.clone(), password.clone());
-                async move { sign_in(&api, mode, &nickname, &password, &owner_key, None).await }
+                async move { sign_in(&api, mode, &nickname, &password, &owner_key, None, or_create).await }
             })
             .await;
             let _ = this.update(cx, |this, cx| {
@@ -949,7 +1001,7 @@ impl AddServer {
                         cx.emit(ConnectEvent::Connected(connected));
                         cx.emit(Dismiss);
                     }
-                    Err(Failure { message, health, .. }) => {
+                    Err(Failure { message, health, wrong_password, .. }) => {
                         if let Some(h) = health {
                             note_health(&server, &h, cx);
                             if h.has_accounts == Some(false) {
@@ -957,6 +1009,20 @@ impl AddServer {
                             }
                             this.health = Some(h);
                         }
+                        // It was the kept one and did not do: this server wants its own.
+                        if or_create && wrong_password {
+                            this.password.update(cx, |f, cx| f.set_saved_text("", cx));
+                        }
+                        // Your name and password from another server: most likely no account here.
+                        let message = if wrong_password && !or_create && this.me.is_some() {
+                            tr!(
+                                "Wrong password, or you have no account on this server yet. Each server has its own accounts: to make one here, use \"Create an account on this server\".",
+                                "Senha incorreta, ou você ainda não tem conta neste servidor. Cada servidor tem as suas próprias contas: para criar uma aqui, use \"Criar uma conta neste servidor\"."
+                            )
+                            .into()
+                        } else {
+                            message
+                        };
                         this.error = Some(message);
                     }
                 }
@@ -964,6 +1030,11 @@ impl AddServer {
             });
         })
         .detach();
+    }
+
+    /// Creating an account asks for the password twice, unless it is the kept one.
+    fn confirm_needed(&self, cx: &App) -> bool {
+        self.mode == Mode::Register && !self.password_is_kept(cx)
     }
 
     fn header(&self, t: &Theme) -> gpui::Div {
@@ -1074,7 +1145,7 @@ impl Render for AddServer {
             .child(div().h(px(1.)).bg(t.stroke))
             .child(who)
             .child(field(tr!("Password", "Senha"), &self.password, &t))
-            .when(register, |d| d.child(field(tr!("Confirm password", "Confirme a senha"), &self.confirm, &t)))
+            .when(self.confirm_needed(cx), |d| d.child(field(tr!("Confirm password", "Confirme a senha"), &self.confirm, &t)))
             .when(needs_owner, |d| {
                 d.child(field(tr!("Owner key", "Chave de dono"), &self.owner_key, &t)).child(caption(
                     tr!(
