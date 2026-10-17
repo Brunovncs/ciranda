@@ -1,11 +1,14 @@
 name: Release
 
-# Push a tag like v4.0.1, matching the version in client/Cargo.toml, to build the Windows client
-# and publish it as a release. The release carries the installer, ciranda-<version>-windows-x64-setup.exe, for
-# people installing Ciranda, and ciranda-<version>-windows-x64.exe, the program
-# alone, which the client's updater swaps in (found by its -windows-x64.exe ending, so Harmony
-# 4.1.1 and earlier find it too). Each has its SHA-256 beside it; the notes are GitHub's list of
-# what changed since the last tag. Nothing is signed by a vendor: SmartScreen warns on first launch.
+# Push a tag like v4.0.1, matching the version in client/Cargo.toml, to build the client and
+# publish it as a release. For Windows the release carries the installer,
+# ciranda-<version>-windows-x64-setup.exe, for people installing Ciranda, and
+# ciranda-<version>-windows-x64.exe, the program alone, which the client's updater swaps in (found
+# by its -windows-x64.exe ending, so Harmony 4.1.1 and earlier find it too); the same pair for
+# Windows on Arm ends in -windows-arm64. Linux gets an AppImage and macOS a .dmg holding one
+# program for both Apple silicon and Intel. Each file has its SHA-256 beside it; the notes are
+# GitHub's list of what changed since the last tag. Nothing is signed by a vendor: SmartScreen
+# warns on first launch, and macOS asks for the app to be opened from its context menu.
 on:
   push:
     tags: ["v*"]
@@ -91,8 +94,135 @@ jobs:
           name: windows
           path: dist/*
 
+  # The same steps on an Arm runner: everything is built for its own processor, libwebrtc
+  # included, and the program's name keeps the x64 updater from taking it.
+  windows-arm64:
+    needs: version
+    runs-on: windows-11-arm
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - name: Tests
+        run: cargo test --release --locked
+      - name: Build
+        run: cargo build --release --locked
+      - name: Self-test
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          $p = Start-Process target\release\ciranda.exe -ArgumentList '--self-test' -NoNewWindow -Wait -PassThru `
+            -RedirectStandardOutput self-test.out -RedirectStandardError self-test.err
+          Get-Content self-test.out, self-test.err
+          if ($p.ExitCode -ne 0) { throw "self-test failed with exit code $($p.ExitCode)" }
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = "ciranda-${{ needs.version.outputs.version }}-windows-arm64.exe"
+          New-Item -ItemType Directory ..\dist | Out-Null
+          Copy-Item target\release\ciranda.exe "..\dist\$name"
+          (Get-FileHash "..\dist\$name" -Algorithm SHA256).Hash.ToLower() + "  $name" | Out-File -Encoding ascii "..\dist\$name.sha256"
+      - name: Installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup --no-progress -y | Out-Null }
+          & $iscc /Qp /DVersion=${{ needs.version.outputs.version }} /DBuild=target\release /DArch=arm64 packaging\ciranda.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $setup = "ciranda-${{ needs.version.outputs.version }}-windows-arm64-setup.exe"
+          (Get-FileHash "..\dist\$setup" -Algorithm SHA256).Hash.ToLower() + "  $setup" | Out-File -Encoding ascii "..\dist\$setup.sha256"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-arm64
+          path: dist/*
+
+  # Ubuntu 22.04: the AppImage runs on systems with its glibc (2.35) or newer.
+  linux:
+    needs: version
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: System libraries
+        run: sudo apt-get update -q && sudo apt-get install -yq --no-install-recommends file $(cat packaging/linux/build-deps.txt)
+      # libwebrtc is built against Chromium's own libc++, which only a recent clang compiles.
+      - name: Clang 21
+        run: |
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          sudo bash /tmp/llvm.sh 21
+          echo "CC=clang-21" >> "$GITHUB_ENV"
+          echo "CXX=clang++-21" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - name: Tests
+        run: cargo test --release --locked
+      - name: Build
+        run: cargo build --release --locked
+      - name: Self-test
+        timeout-minutes: 5
+        run: xvfb-run -a target/release/ciranda --self-test
+      - name: AppImage
+        run: packaging/linux/appimage.sh "${{ needs.version.outputs.version }}" target/release/ciranda ../dist
+      - name: Self-test the AppImage
+        timeout-minutes: 5
+        run: xvfb-run -a ../dist/ciranda-${{ needs.version.outputs.version }}-linux-x64.AppImage --appimage-extract-and-run --self-test
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux
+          path: dist/*
+
+  # Built twice, for Apple silicon and for Intel, and joined into one program with lipo, so one
+  # .dmg serves every Mac. The runner is Apple silicon: the tests and the self-tests run there.
+  macos:
+    needs: version
+    runs-on: macos-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - name: Tests
+        run: cargo test --release --locked --target aarch64-apple-darwin
+      - name: Build
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+          mkdir -p target/universal
+          lipo -create -output target/universal/ciranda target/aarch64-apple-darwin/release/ciranda target/x86_64-apple-darwin/release/ciranda
+      - name: Self-test
+        timeout-minutes: 5
+        run: target/universal/ciranda --self-test
+      - name: App and disk image
+        run: packaging/macos/bundle.sh "${{ needs.version.outputs.version }}" target/universal/ciranda ../dist
+      - name: Self-test the app in the disk image
+        timeout-minutes: 5
+        run: |
+          hdiutil attach -nobrowse -mountpoint /tmp/ciranda-dmg ../dist/ciranda-${{ needs.version.outputs.version }}-macos-universal.dmg
+          status=0
+          /tmp/ciranda-dmg/Ciranda.app/Contents/MacOS/ciranda --self-test || status=$?
+          hdiutil detach /tmp/ciranda-dmg || true
+          exit $status
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos
+          path: dist/*
+
   publish:
-    needs: [version, windows]
+    needs: [version, windows, windows-arm64, linux, macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -746,15 +746,19 @@ mod tests {
     }
 
     /// CI's Windows runners have no graphics card, so no hardware encoder to find.
+    #[cfg(windows)]
     fn no_gpu_here() -> bool {
         std::env::var_os("CI").is_some()
     }
 
+    #[cfg(windows)]
     fn hardware_listed() -> bool {
         let _ = factory();
         Backend::list_available().into_iter().any(|b| b == Backend::Hardware)
     }
 
+    // Media Foundation's encoder, which only the Windows build has (vendor/webrtc-sys).
+    #[cfg(windows)]
     #[test]
     fn hardware_encoder_is_listed() {
         if no_gpu_here() {
@@ -765,6 +769,7 @@ mod tests {
 
     /// A sender asking for the hardware encoder and a receiver, in this process: the stream has
     /// to arrive decoded, and from the Media Foundation encoder rather than OpenH264.
+    #[cfg(windows)]
     #[test]
     fn hardware_encoder_streams() {
         use libwebrtc::peer_connection_factory::native::PeerConnectionFactoryExt;

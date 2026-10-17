@@ -32,8 +32,8 @@ DefaultDirName={localappdata}\Programs\Ciranda
 DisableDirPage=auto
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
-ArchitecturesAllowed=x64compatible
-ArchitecturesInstallIn64BitMode=x64compatible
+ArchitecturesAllowed={#Allowed}
+ArchitecturesInstallIn64BitMode={#Allowed}
 MinVersion=10.0
 WizardStyle=modern
 ShowLanguageDialog=auto
@@ -45,8 +45,8 @@ RestartApplications=no
 Compression=lzma2/max
 SolidCompression=yes
 OutputDir={#Root}\..\dist
-; It must not end in -windows-x64.exe: the in-app updater takes the first asset that does.
-OutputBaseFilename=ciranda-{#Version}-windows-x64-setup
+; It must not end in -windows-x64.exe (or -arm64.exe): the in-app updater takes the first asset that does.
+OutputBaseFilename=ciranda-{#Version}-windows-{#Arch}-setup
 
 [Languages]
 Name: "en"; MessagesFile: "compiler:Default.isl"

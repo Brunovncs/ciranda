@@ -6,7 +6,8 @@
 //!
 //! Plain Win32. The icon lives on a thread of its own with a hidden window for the shell's
 //! messages, so its menu, which runs a modal loop until it closes, never holds up the window.
-//! Elsewhere than Windows there is no icon and closing the window quits.
+//! Elsewhere than Windows there is no icon and closing the window quits; one Ciranda at a time
+//! holds there too.
 //!
 //! In a call the icon says how you are in it, as Discord's does, and the window's thumbnail on the
 //! taskbar gets buttons to mute, deafen and leave (`set_thumbs`), so neither needs the window.
@@ -892,22 +893,89 @@ mod platform {
         true
     }
 
-    pub struct Instance;
-
-    impl Instance {
-        pub fn claim(_: &Path, _: bool) -> Option<Instance> {
-            Some(Instance)
-        }
-
-        pub fn claim_legacy(_: &Path, _: bool) -> Option<Instance> {
-            Some(Instance)
-        }
-
-        pub fn on_show(&self, _: async_channel::Sender<Event>) {}
+    /// One Ciranda per settings folder, as on Windows, through a socket in that folder: a start
+    /// that can connect to it finds a copy running, asks it to show its window and exits.
+    pub struct Instance {
+        listener: Option<std::os::unix::net::UnixListener>,
     }
 
-    pub fn quit_running(_: &Path, _: std::time::Duration) -> bool {
-        true
+    const SOCKET: &str = "instance.sock";
+
+    /// Says `what` to the copy listening on `dir`; false when none is.
+    fn tell(dir: &Path, what: &[u8]) -> bool {
+        use std::io::Write;
+        std::os::unix::net::UnixStream::connect(dir.join(SOCKET)).and_then(|mut s| s.write_all(what)).is_ok()
+    }
+
+    impl Instance {
+        /// `None` when another Ciranda runs on this settings folder: it has been asked to show its
+        /// window and this one should exit. After an update restarts Ciranda (`wait`), the copy
+        /// being replaced is given time to finish quitting first.
+        pub fn claim(data_dir: &Path, wait: bool) -> Option<Instance> {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(if wait { 15 } else { 0 });
+            loop {
+                match std::os::unix::net::UnixStream::connect(data_dir.join(SOCKET)) {
+                    Ok(_) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(200)),
+                    Ok(_) => return (!tell(data_dir, b"open")).then(|| Instance::listen(data_dir)),
+                    Err(_) => return Some(Instance::listen(data_dir)),
+                }
+            }
+        }
+
+        /// Harmony never ran here: there is nothing to wait for.
+        pub fn claim_legacy(_: &Path, _: bool) -> Option<Instance> {
+            Some(Instance { listener: None })
+        }
+
+        /// Listens on the folder's socket, replacing one left by a copy that did not exit cleanly.
+        fn listen(data_dir: &Path) -> Instance {
+            let path = data_dir.join(SOCKET);
+            let _ = std::fs::create_dir_all(data_dir);
+            let _ = std::fs::remove_file(&path);
+            let listener = std::os::unix::net::UnixListener::bind(&path)
+                .inspect_err(|e| log::warn!("single instance: {}: {e}, running anyway", path.display()))
+                .ok();
+            Instance { listener }
+        }
+
+        /// Sends `Event::Open` each time another start asks for the window, and `Event::Quit`
+        /// when `--quit` asks Ciranda to go.
+        pub fn on_show(&self, events: async_channel::Sender<Event>) {
+            let Some(listener) = self.listener.as_ref().and_then(|l| l.try_clone().ok()) else { return };
+            let spawned = std::thread::Builder::new().name("ciranda-instance".into()).spawn(move || {
+                use std::io::Read;
+                for stream in listener.incoming() {
+                    let mut what = Vec::new();
+                    // A start that is only waiting for this copy to go connects and says nothing.
+                    let Ok(_) = stream.and_then(|s| s.take(16).read_to_end(&mut what)) else { continue };
+                    if what.is_empty() {
+                        continue;
+                    }
+                    if events.send_blocking(if what == b"quit" { Event::Quit } else { Event::Open }).is_err() {
+                        break;
+                    }
+                }
+            });
+            if spawned.is_err() {
+                log::warn!("single instance: no thread to hear other starts");
+            }
+        }
+    }
+
+    /// Asks the Ciranda running on this settings folder to quit, and waits up to `timeout` for it
+    /// to be gone; false when it is still there.
+    pub fn quit_running(data_dir: &Path, timeout: std::time::Duration) -> bool {
+        if !tell(data_dir, b"quit") {
+            return true;
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if std::os::unix::net::UnixStream::connect(data_dir.join(SOCKET)).is_err() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        false
     }
 
     pub struct Tray;

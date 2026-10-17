@@ -33,7 +33,8 @@ pub fn relaunched() -> bool {
     std::env::var_os(RELAUNCH_VAR).is_some() || std::env::var_os(LEGACY_RELAUNCH_VAR).is_some()
 }
 
-const ASSET_SUFFIX: &str = "-windows-x64.exe";
+/// The program for this build's processor: an Arm build must not update itself to the x64 one.
+const ASSET_SUFFIX: &str = if cfg!(target_arch = "aarch64") { "-windows-arm64.exe" } else { "-windows-x64.exe" };
 
 /// The latest release, as far as an update needs to know.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -328,7 +329,7 @@ mod tests {
         assert_eq!(r.version, "4.1.0");
         assert_eq!(r.page, "https://example/v4.1.0");
         assert_eq!(r.notes, "Faster joins.");
-        if cfg!(windows) {
+        if cfg!(all(windows, target_arch = "x86_64")) {
             assert_eq!(r.exe, Some(("https://example/exe".into(), "https://example/sha".into())));
         }
         // The installer sits beside the program in a release, listed first or not; the updater
@@ -338,12 +339,31 @@ mod tests {
             {"name":"ciranda-4.2.1-windows-x64-setup.exe.sha256","browser_download_url":"https://example/setup-sha"},
             {"name":"ciranda-4.2.1-windows-x64.exe","browser_download_url":"https://example/exe"},
             {"name":"ciranda-4.2.1-windows-x64.exe.sha256","browser_download_url":"https://example/sha"}]}"#;
-        if cfg!(windows) {
+        if cfg!(all(windows, target_arch = "x86_64")) {
             assert_eq!(parse(with_installer).unwrap().exe, Some(("https://example/exe".into(), "https://example/sha".into())));
         }
         let without = parse(br#"{"tag_name":"v4.0.1","assets":[]}"#).unwrap();
         assert_eq!(without.exe, None);
         assert_eq!(without.page, RELEASES_PAGE);
+    }
+
+    /// A release has the program for each processor; a build takes its own.
+    #[test]
+    fn takes_the_program_for_this_processor() {
+        let json = br#"{"tag_name":"v4.5.0","assets":[
+            {"name":"ciranda-4.5.0-windows-arm64.exe","browser_download_url":"https://example/arm"},
+            {"name":"ciranda-4.5.0-windows-arm64.exe.sha256","browser_download_url":"https://example/arm-sha"},
+            {"name":"ciranda-4.5.0-windows-x64.exe","browser_download_url":"https://example/x64"},
+            {"name":"ciranda-4.5.0-windows-x64.exe.sha256","browser_download_url":"https://example/x64-sha"}]}"#;
+        let ours = |exe: &str, sha: &str| Some((format!("https://example/{exe}"), format!("https://example/{sha}")));
+        let want = if !cfg!(windows) {
+            None
+        } else if cfg!(target_arch = "aarch64") {
+            ours("arm", "arm-sha")
+        } else {
+            ours("x64", "x64-sha")
+        };
+        assert_eq!(parse(json).unwrap().exe, want);
     }
 
     fn scratch(name: &str) -> PathBuf {
