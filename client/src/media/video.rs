@@ -4,6 +4,10 @@
 //! them on the GPU, keeping each stream's textures from frame to frame. A tile is its own view,
 //! woken by the frames themselves, so a new frame redraws that tile and nothing that merely
 //! contains it.
+//!
+//! Only GPUI's Windows renderer draws YUV (see vendor/GPUI_VENDORED.md); elsewhere each frame a
+//! tile takes is converted to a BGRA picture once, as it arrives, and the previous one is let go
+//! of the window's atlas.
 
 use super::audio::{self, Source, SourceKind};
 use super::rtc::Track;
@@ -12,7 +16,7 @@ use super::yuv;
 use crate::core;
 use crate::core::types::*;
 use futures::StreamExt;
-use gpui::{App, AppContext, Context, Entity, SurfaceFormat, SurfaceFrame, SurfacePlane, Task};
+use gpui::{AnyElement, App, AppContext, Context, Entity, Pixels, SurfaceFormat, SurfaceFrame, SurfacePlane, Task};
 use libwebrtc::audio_stream::native::NativeAudioStream;
 use libwebrtc::prelude::*;
 use libwebrtc::video_stream::native::NativeVideoStream;
@@ -248,6 +252,9 @@ pub struct Tile {
     pub slot: Arc<FrameSlot>,
     /// What is on screen now.
     pub frame: Option<SurfaceFrame>,
+    /// `frame` as a picture, where the renderer cannot draw YUV.
+    #[cfg(not(windows))]
+    image: Option<Arc<gpui::RenderImage>>,
     /// The screen's sound, for someone else's screen.
     pub sound: Option<Arc<Source>>,
     /// Someone else's stream: the subscription, which `Voice` keeps alive.
@@ -265,6 +272,10 @@ impl Tile {
             loop {
                 let Ok(()) = this.update(cx, |t, cx| {
                     if let Some(frame) = t.slot.take_fresh() {
+                        #[cfg(not(windows))]
+                        if let Some(old) = t.image.replace(picture(&frame)) {
+                            cx.drop_image(old, None);
+                        }
                         t.frame = Some(frame);
                         cx.notify();
                     }
@@ -276,7 +287,20 @@ impl Tile {
                 }
             }
         });
-        Tile { user, mid, kind, local, slot, frame: None, sound: None, watch: Watch::default(), failed: false, _redraw: redraw }
+        Tile {
+            user,
+            mid,
+            kind,
+            local,
+            slot,
+            frame: None,
+            #[cfg(not(windows))]
+            image: None,
+            sound: None,
+            watch: Watch::default(),
+            failed: false,
+            _redraw: redraw,
+        }
     }
 
     /// A tile showing your own camera or screen, from the frames being published.
@@ -314,10 +338,56 @@ impl Tile {
             audio::audio().mixer.remove(&s);
         }
         self.frame = None;
+        #[cfg(not(windows))]
+        if let Some(old) = self.image.take() {
+            cx.drop_image(old, None);
+        }
         *self.slot.wake.lock() = None;
         self._redraw = Task::ready(());
         cx.notify();
     }
+}
+
+impl Tile {
+    /// The frame on screen now, filling the space it is given with its shape kept and its corners
+    /// rounded by `radius`.
+    pub fn picture(&self, radius: Pixels) -> Option<AnyElement> {
+        use gpui::{ObjectFit, Styled};
+        #[cfg(not(windows))]
+        use gpui::StyledImage;
+        #[cfg(windows)]
+        let el = gpui::surface(self.frame.clone()?);
+        #[cfg(not(windows))]
+        let el = gpui::img(self.image.clone()?);
+        Some(gpui::IntoElement::into_any_element(el.size_full().rounded(radius).object_fit(ObjectFit::Contain)))
+    }
+}
+
+/// `frame` as the BGRA picture GPUI draws, mirrored if the frame is.
+#[cfg(not(windows))]
+fn picture(frame: &SurfaceFrame) -> Arc<gpui::RenderImage> {
+    use libwebrtc::native::yuv_helper;
+    let (w, h) = (frame.width(), frame.height());
+    let mut px = vec![0u8; w as usize * h as usize * 4];
+    let (y, sy) = frame.plane(0);
+    match frame.format() {
+        SurfaceFormat::I420 => {
+            let ((u, su), (v, sv)) = (frame.plane(1), frame.plane(2));
+            yuv_helper::i420_to_argb(y, sy as u32, u, su as u32, v, sv as u32, &mut px, w * 4, w as i32, h as i32);
+        }
+        SurfaceFormat::Nv12 => {
+            let (uv, suv) = frame.plane(1);
+            yuv_helper::nv12_to_argb(y, sy as u32, uv, suv as u32, &mut px, w * 4, w as i32, h as i32);
+        }
+    }
+    if frame.is_mirrored() {
+        for row in px.chunks_exact_mut(w as usize * 4) {
+            let (pixels, _) = row.as_chunks_mut::<4>();
+            pixels.reverse();
+        }
+    }
+    let img = image::RgbaImage::from_raw(w, h, px).expect("frame size");
+    Arc::new(gpui::RenderImage::new(smallvec::SmallVec::from_elem(image::Frame::new(img), 1)))
 }
 
 /// Tiles the person closed, by (user, kind); they stay closed until that stream ends.

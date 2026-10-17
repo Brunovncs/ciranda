@@ -12,7 +12,7 @@ use crate::widgets::*;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Context, Div, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement,
-    PathPromptOptions, Render, SharedString, StatefulInteractiveElement, Styled, StyledImage, Window, div, img, surface,
+    PathPromptOptions, Render, SharedString, StatefulInteractiveElement, Styled, StyledImage, Window, div, img,
 };
 use std::rc::Rc;
 use std::sync::Arc;
@@ -62,7 +62,7 @@ impl Preview {
 
     /// The picture, or why there is none, filling a rounded frame the caller sizes.
     pub fn frame(&self, t: &Theme, cx: &App) -> Div {
-        let frame = self.tile.as_ref().and_then(|t| t.read(cx).frame.clone());
+        let frame = self.tile.as_ref().and_then(|t| t.read(cx).picture(px(radius::CARD + 1.)));
         let error = self.capture.as_ref().and_then(|c| c.error.lock().clone());
         div()
             .rounded(px(radius::CARD + 2.))
@@ -74,9 +74,7 @@ impl Preview {
             .items_center()
             .justify_center()
             .child(match (frame, error) {
-                (Some(f), _) => {
-                    surface(f).size_full().rounded(px(radius::CARD + 1.)).object_fit(gpui::ObjectFit::Contain).into_any_element()
-                }
+                (Some(picture), _) => picture,
                 (None, Some(e)) => div()
                     .flex()
                     .flex_col()

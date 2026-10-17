@@ -56,9 +56,15 @@ fn system_locale() -> Option<String> {
     (n > 1).then(|| String::from_utf16_lossy(&buf[..n as usize - 1]))
 }
 
-#[cfg(not(windows))]
+/// The language picked in System Settings: an app opened from the Finder gets no `LANG`.
+#[cfg(target_os = "macos")]
 fn system_locale() -> Option<String> {
-    std::env::var("LC_ALL").or_else(|_| std::env::var("LANG")).ok()
+    sys_locale::get_locale()
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn system_locale() -> Option<String> {
+    std::env::var("LC_ALL").or_else(|_| std::env::var("LC_MESSAGES")).or_else(|_| std::env::var("LANG")).ok()
 }
 
 /// The string for the current language.

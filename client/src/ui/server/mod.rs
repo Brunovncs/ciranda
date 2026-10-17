@@ -1064,7 +1064,7 @@ impl ServerView {
         let k = &ev.keystroke;
         // Over the whole window: Esc leaves the monitor's full screen first, then this; F toggles
         // the monitor's full screen.
-        if self.theater.is_some() && !k.modifiers.control && !k.modifiers.alt {
+        if self.theater.is_some() && !k.modifiers.secondary() && !k.modifiers.alt {
             match k.key.as_str() {
                 "escape" if window.is_fullscreen() => window.toggle_fullscreen(),
                 "escape" => self.leave_theater(window, cx),
@@ -1075,7 +1075,7 @@ impl ServerView {
             cx.notify();
             return;
         }
-        if k.modifiers.control && !k.modifiers.shift {
+        if k.modifiers.secondary() && !k.modifiers.shift {
             match k.key.as_str() {
                 "," => self.open_settings(window, cx),
                 "/" => {
@@ -1088,7 +1088,7 @@ impl ServerView {
             return;
         }
         // Ctrl+Shift+M and Ctrl+Shift+D, as most voice apps use.
-        if k.modifiers.control && k.modifiers.shift {
+        if k.modifiers.secondary() && k.modifiers.shift {
             match k.key.as_str() {
                 "m" => self.toggle_mute(cx),
                 "d" => self.toggle_deafen(cx),

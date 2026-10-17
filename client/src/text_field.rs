@@ -111,6 +111,32 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-y", Redo, c),
         KeyBinding::new("ctrl-shift-z", Redo, c),
     ]);
+    // And as a Mac's own text boxes do: Cmd where Windows has Ctrl, Option for words, Cmd and the
+    // arrows for the ends of the line and of the text.
+    #[cfg(target_os = "macos")]
+    cx.bind_keys([
+        KeyBinding::new("alt-backspace", DeleteWordLeft, c),
+        KeyBinding::new("alt-delete", DeleteWordRight, c),
+        KeyBinding::new("alt-left", WordLeft, c),
+        KeyBinding::new("alt-right", WordRight, c),
+        KeyBinding::new("alt-shift-left", SelectWordLeft, c),
+        KeyBinding::new("alt-shift-right", SelectWordRight, c),
+        KeyBinding::new("cmd-left", Home, c),
+        KeyBinding::new("cmd-right", End, c),
+        KeyBinding::new("cmd-shift-left", SelectHome, c),
+        KeyBinding::new("cmd-shift-right", SelectEnd, c),
+        KeyBinding::new("cmd-up", Top, c),
+        KeyBinding::new("cmd-down", Bottom, c),
+        KeyBinding::new("cmd-shift-up", SelectTop, c),
+        KeyBinding::new("cmd-shift-down", SelectBottom, c),
+        KeyBinding::new("cmd-a", SelectAll, c),
+        KeyBinding::new("cmd-c", Copy, c),
+        KeyBinding::new("cmd-x", Cut, c),
+        KeyBinding::new("cmd-v", Paste, c),
+        KeyBinding::new("cmd-enter", Submit, c),
+        KeyBinding::new("cmd-z", Undo, c),
+        KeyBinding::new("cmd-shift-z", Redo, c),
+    ]);
 }
 
 /// The text and selection before an edit, for Ctrl+Z.

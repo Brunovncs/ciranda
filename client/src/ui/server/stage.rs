@@ -21,7 +21,6 @@ use gpui::prelude::FluentBuilder;
 use gpui::{
     Animation, AnimationExt, AnyElement, App, AppContext, Context, Entity, EventEmitter, Focusable, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
     ParentElement, Pixels, Point, Render, SharedString, StatefulInteractiveElement, StyleRefinement, Styled, Window, anchored, div,
-    surface,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -805,10 +804,8 @@ impl ServerView {
 impl Render for Tile {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         let t = current();
-        match self.frame.clone() {
-            Some(frame) => {
-                surface(frame).size_full().rounded(px(radius::CARD + 1.)).object_fit(gpui::ObjectFit::Contain).into_any_element()
-            }
+        match self.picture(px(radius::CARD + 1.)) {
+            Some(picture) => picture,
             None => div()
                 .size_full()
                 .flex()

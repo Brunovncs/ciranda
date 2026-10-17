@@ -6,7 +6,9 @@ pub mod call;
 pub mod camera;
 pub mod composite;
 pub mod diagnose;
+#[cfg_attr(not(windows), allow(dead_code))]
 pub mod loopback;
+#[cfg_attr(not(windows), allow(dead_code))]
 pub mod replay;
 pub mod rtc;
 pub mod screen;

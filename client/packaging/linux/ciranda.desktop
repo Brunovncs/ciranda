@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Ciranda
+Comment=Voice, video and text chat with your friends
+Comment[pt_BR]=Chat de voz, vídeo e texto com os seus amigos
+Exec=ciranda
+Icon=ciranda
+Terminal=false
+Categories=Network;InstantMessaging;AudioVideo;
+StartupWMClass=ciranda

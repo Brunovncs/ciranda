@@ -42,8 +42,25 @@ pub struct Device {
     pub name: String,
 }
 
+#[cfg(windows)]
+const BACKEND: ApiBackend = ApiBackend::MediaFoundation;
+#[cfg(target_os = "macos")]
+const BACKEND: ApiBackend = ApiBackend::AVFoundation;
+#[cfg(target_os = "linux")]
+const BACKEND: ApiBackend = ApiBackend::Video4Linux;
+
+/// The cameras there are. On macOS the first call asks for the camera permission, and lists
+/// none until it is given.
+fn query() -> Result<Vec<nokhwa::utils::CameraInfo>, nokhwa::NokhwaError> {
+    #[cfg(target_os = "macos")]
+    if !nokhwa::nokhwa_check() {
+        nokhwa::nokhwa_initialize(|granted| log::info!("camera: access granted: {granted}"));
+    }
+    nokhwa::query(BACKEND)
+}
+
 pub fn devices() -> Vec<Device> {
-    nokhwa::query(ApiBackend::MediaFoundation)
+    query()
         .unwrap_or_default()
         .into_iter()
         .map(|c| Device { id: c.human_name(), name: c.human_name() })
@@ -237,7 +254,7 @@ fn best_format(formats: &[CameraFormat]) -> Option<CameraFormat> {
 }
 
 fn open(device: &str) -> anyhow::Result<Camera> {
-    let cams = nokhwa::query(ApiBackend::MediaFoundation)?;
+    let cams = query()?;
     let info = cams
         .iter()
         .find(|c| c.human_name() == device)

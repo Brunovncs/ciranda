@@ -661,6 +661,18 @@ const WEBRTC_SHA256: &[(&str, &str)] = &[
         "https://github.com/livekit/rust-sdks/releases/download/webrtc-89d790b/webrtc-win-arm64-release.zip",
         "b07a3a23fc7f98a7335e0f2334767fa4f0ed1c505e120c9b28ce114fb6fe12f4",
     ),
+    (
+        "https://github.com/livekit/rust-sdks/releases/download/webrtc-89d790b/webrtc-linux-x64-release.zip",
+        "b167adad5291cea0e4d66a0454d9d52d2ad714e6b0ed70f4410317d3ebde70c5",
+    ),
+    (
+        "https://github.com/livekit/rust-sdks/releases/download/webrtc-89d790b/webrtc-mac-arm64-release.zip",
+        "9f25fea48588deac18d68e120d18b33af7ef10f921f74b7c57f66b642262c348",
+    ),
+    (
+        "https://github.com/livekit/rust-sdks/releases/download/webrtc-89d790b/webrtc-mac-x64-release.zip",
+        "04eea79951eaefc1054099464f949f6dcfab9bc7460c16004811abc4f9ec15d4",
+    ),
 ];
 
 fn download_verified_webrtc(webrtc_dir: &Path) {

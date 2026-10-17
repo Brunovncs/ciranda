@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Info.plist for Ciranda.app, filled in by bundle.sh, which puts the version in for @VERSION@.
+  The usage descriptions are not optional: macOS ends an app that reaches the microphone, the
+  camera, the screen or the system's audio without one, instead of asking the person. The system
+  shows them in its permission prompts, so they say plainly what Ciranda does with each.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>Ciranda</string>
+	<key>CFBundleDisplayName</key>
+	<string>Ciranda</string>
+	<key>CFBundleIdentifier</key>
+	<string>io.github.brunovncs.ciranda</string>
+	<key>CFBundleExecutable</key>
+	<string>ciranda</string>
+	<key>CFBundleIconFile</key>
+	<string>ciranda</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleShortVersionString</key>
+	<string>@VERSION@</string>
+	<key>CFBundleVersion</key>
+	<string>@VERSION@</string>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleLocalizations</key>
+	<array>
+		<string>en</string>
+		<string>pt-BR</string>
+	</array>
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.social-networking</string>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Ciranda uses the microphone so the people in your voice calls can hear you.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Ciranda uses the camera when you turn it on in a call, so the people in it can see you.</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>Ciranda records the screens and windows you choose to share, so the people in your call can watch them.</string>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>Ciranda captures your computer's sound when you share your screen with audio, so the people in your call can hear it.</string>
+</dict>
+</plist>

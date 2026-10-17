@@ -1,8 +1,7 @@
 name: CI
 
 # Every push and pull request: the server's tests on Linux, where it is deployed, and the
-# client's on Windows, the one platform it builds for. Nothing is published; that is
-# release.yml, on a tag. On main the client is also built for release, only to keep a
+# client's on Windows, Linux and macOS. Nothing is published; that is release.yml, on a tag. On main the client is also built for release, only to keep a
 # release-profile cache warm for the next tag (see release-cache below).
 on:
   push:
@@ -61,6 +60,54 @@ jobs:
       - name: Self-test
         timeout-minutes: 5
         run: ./target/debug/ciranda.exe --self-test
+
+  # Ubuntu 22.04, as release.yml builds the AppImage on: its glibc is the oldest the AppImage
+  # asks of a system. The self-test needs a display for GPUI, so it gets a virtual one.
+  client-linux:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: System libraries
+        run: sudo apt-get update -q && sudo apt-get install -yq --no-install-recommends $(cat packaging/linux/build-deps.txt)
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: client
+          prefix-key: v1-rust
+          save-if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+      - run: cargo test --locked
+      - run: cargo build --locked
+      - name: Self-test
+        timeout-minutes: 5
+        run: xvfb-run -a ./target/debug/ciranda --self-test
+
+  client-macos:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: client
+          prefix-key: v1-rust
+          save-if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+      - run: cargo test --locked
+      - run: cargo build --locked
+      - name: Self-test
+        timeout-minutes: 5
+        run: ./target/debug/ciranda --self-test
 
   # A tag cannot restore a cache saved by another tag, and main's from the job above is for
   # the dev profile, so every release used to build all its dependencies from nothing. Caches

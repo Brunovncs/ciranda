@@ -747,7 +747,7 @@ impl ChatView {
     /// picture or file too.
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let k = &ev.keystroke;
-        if k.modifiers.control
+        if k.modifiers.secondary()
             && k.key == "v"
             && !matches!(self.mode, Some(Mode::Edit(_)))
             && self.writable(cx)

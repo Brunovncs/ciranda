@@ -15,7 +15,8 @@ path = "src/main.rs"
 # GPUI as published by the gpui-kit maintainers (`gpui-pre-*` snapshots of Zed). Pinned exactly:
 # its API moves with Zed.
 gpui = { package = "gpui-pre", version = "=0.3.7" }
-gpui_platform = { package = "gpui-pre-platform", version = "=0.3.7", features = ["font-kit"] }
+# x11 and wayland only reach the Linux backend; Windows and macOS build without them.
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.7", features = ["font-kit", "wayland", "x11"] }
 # LiveKit's bindings to Google's libwebrtc: peer connections, the audio processing module (echo
 # cancellation, noise suppression), desktop capture and libyuv.
 libwebrtc = "0.3.51"
@@ -41,7 +42,6 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 log = "0.4"
 mimalloc = { version = "0.1", default-features = false }
 env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
-nokhwa = { version = "0.10", default-features = false, features = ["input-msmf"] }
 parking_lot = "0.12"
 # The window's HWND, to hide it to the notification area. Already in the tree through GPUI.
 raw-window-handle = "0.6"
@@ -61,6 +61,25 @@ tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
 tract-onnx = "0.23"
 unicode-segmentation = "1"
 url = "2"
+
+# Cameras through each system's own capture API.
+[target.'cfg(windows)'.dependencies.nokhwa]
+version = "0.10"
+default-features = false
+features = ["input-msmf"]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+sys-locale = "0.3"
+
+[target.'cfg(target_os = "macos")'.dependencies.nokhwa]
+version = "0.10"
+default-features = false
+features = ["input-avfoundation"]
+
+[target.'cfg(target_os = "linux")'.dependencies.nokhwa]
+version = "0.10"
+default-features = false
+features = ["input-v4l"]
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

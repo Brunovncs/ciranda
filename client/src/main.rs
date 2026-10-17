@@ -13,6 +13,9 @@ mod dm;
 mod elsewhere;
 mod emoji;
 mod files;
+// Global hotkeys, the notification-area icon, game audio and replays are Windows only so far;
+// elsewhere their platform halves are stubs.
+#[cfg_attr(not(windows), allow(dead_code))]
 mod hotkeys;
 mod icons;
 mod markdown;
@@ -21,6 +24,7 @@ mod prefs;
 mod session;
 mod text_field;
 mod theme;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod tray;
 mod ui;
 mod widgets;
@@ -100,6 +104,24 @@ fn self_test() -> ! {
     fail("gpui", "the application returned without running")
 }
 
+#[cfg(target_os = "macos")]
+gpui::actions!(ciranda, [Quit, Hide]);
+
+/// The menu bar's application menu, which a Mac app is expected to have: without it Cmd+Q does
+/// nothing. Quitting is the same as from the tray icon's menu on Windows.
+#[cfg(target_os = "macos")]
+fn app_menu(cx: &mut gpui::App) {
+    use gpui::{KeyBinding, Menu, MenuItem};
+    cx.on_action(|_: &Quit, cx| cx.quit());
+    cx.on_action(|_: &Hide, cx| cx.hide());
+    cx.bind_keys([KeyBinding::new("cmd-q", Quit, None), KeyBinding::new("cmd-h", Hide, None)]);
+    cx.set_menus([Menu::new("Ciranda").items([
+        MenuItem::action(tr!("Hide Ciranda", "Ocultar Ciranda"), Hide),
+        MenuItem::separator(),
+        MenuItem::action(tr!("Quit Ciranda", "Encerrar Ciranda"), Quit),
+    ])]);
+}
+
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("ciranda=info,warn")).init();
     let smoke = std::env::args().any(|a| a == "--smoke");
@@ -154,6 +176,8 @@ fn main() {
             log::warn!("fonts did not load: {e}");
         }
         text_field::bind_keys(cx);
+        #[cfg(target_os = "macos")]
+        app_menu(cx);
         cx.set_global(prefs::Prefs::new(store));
         prefs::init(cx);
         ui::updates::init(cx);
