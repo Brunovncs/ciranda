@@ -375,4 +375,28 @@ describe('moving a user between channels', () => {
     admin.ws.close();
     target.ws.close();
   });
+
+  it('checks where to before taking anybody out of where they are', async () => {
+    const admin = connect(ownerToken);
+    const target = connect(memberToken);
+    await admin.hello();
+    const hello = await target.hello();
+    await target.request({ type: 'voice:join', channelId: voiceChannelId });
+    const textChannelId = (await api('/api/channels', { token: ownerToken }))
+      .body.channels.find((c) => c.kind === 'text').id;
+
+    for (const toChannelId of [99999, textChannelId]) {
+      const res = await admin.request({ type: 'admin:move', userId: hello.user.id, toChannelId });
+      assert.equal(res.error, 'no_such_channel');
+    }
+    const { rosters } = (await api('/api/channels', { token: ownerToken })).body;
+    assert.ok(rosters[voiceChannelId]?.some((m) => m.userId === hello.user.id),
+      'a refused move leaves them where they were');
+    await assert.rejects(target.next((m) => m.type === 'voice:moved', { timeoutMs: 300 }),
+      'and tells them nothing, since nothing happened');
+
+    await target.request({ type: 'voice:leave', channelId: voiceChannelId });
+    admin.ws.close();
+    target.ws.close();
+  });
 });

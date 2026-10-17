@@ -8,8 +8,6 @@
 // sealed blob except destroy somebody else's conversation, and that is not a
 // moderation tool, it is a way to make people distrust the feature.
 
-import express from 'express';
-
 import { MAX_SEALED_BYTES } from './chat.js';
 import {
   DirectMessages, ownKey, publicConversation, publicDmMessage, publicKey,
@@ -260,24 +258,41 @@ export function mountDirectMessages(app, { requireLogin, dms, chat, accounts, pu
    * Upload a sealed file. Raw bytes, any content type: the client encrypted
    * them, so there is nothing to check but the size. The quota and the
    * eviction of files nobody sent apply exactly as to any other upload.
+   *
+   * Read as a stream into a file, as /api/uploads is (see Chat.receive), not
+   * held whole in memory and written synchronously.
    */
-  app.post(
-    '/api/dms/:id/uploads',
-    requireLogin,
-    conversation,
-    throttled(uploading),
-    express.raw({ type: () => true, limit: MAX_SEALED_BYTES }),
-    (req, res) => {
-      if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
-        return res.status(400).json({ error: 'empty_file' });
-      }
-      const result = chat.store(req.body, null, { sealed: true });
-      if (!result.ok) {
-        return res.status(result.error === 'server_full' ? 507 : 400).json({ error: result.error });
-      }
-      return res.status(201).json({ hash: result.upload.hash, bytes: result.upload.bytes });
-    },
-  );
+  app.post('/api/dms/:id/uploads', requireLogin, conversation, throttled(uploading), async (req, res) => {
+    // A refusal before the body is all read hangs up after answering, rather
+    // than have Node read the rest only to throw it away.
+    const unread = () => { if (!req.complete) res.set('Connection', 'close'); };
+    const tooLarge = () => {
+      unread();
+      return res.status(413).json({
+        error: 'file_too_large',
+        message: `Files are limited to ${Math.round(MAX_SEALED_BYTES / 1024 / 1024)} MB.`,
+      });
+    };
+    if ((req.get('content-encoding') ?? 'identity').toLowerCase() !== 'identity') {
+      unread();
+      return res.status(415).json({ error: 'unsupported_encoding', message: 'Send the file uncompressed.' });
+    }
+    if (Number(req.get('content-length')) > MAX_SEALED_BYTES) return tooLarge();
+
+    let result;
+    try {
+      result = await chat.receive(req, null, { sealed: true });
+    } catch (err) {
+      unread();
+      throw err;
+    }
+    if (!result.ok) {
+      if (result.error === 'aborted') return undefined;
+      if (result.error === 'file_too_large') return tooLarge();
+      return res.status(result.error === 'server_full' ? 507 : 400).json({ error: result.error });
+    }
+    return res.status(201).json({ hash: result.upload.hash, bytes: result.upload.bytes });
+  });
 
   /** A sealed file, to the two people of the conversation it was sent in, and only them. */
   app.get('/api/dms/:id/uploads/:hash', requireLogin, conversation, (req, res) => {
@@ -293,7 +308,9 @@ export function mountDirectMessages(app, { requireLogin, dms, chat, accounts, pu
     // Content-addressed and sealed: it never changes, and no shared cache has
     // any business keeping a copy.
     res.set('Cache-Control', 'private, max-age=31536000, immutable');
-    return res.sendFile(info.path);
+    // The path is built from a checked hash, so a dot-folder in it is the data
+    // directory's (~/.ciranda): Express 5 would otherwise answer 404 for it.
+    return res.sendFile(info.path, { dotfiles: 'allow' });
   });
 
   // ------------------------------------------------------- one message

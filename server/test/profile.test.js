@@ -15,6 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { DatabaseSync } from 'node:sqlite';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const serverEntry = resolve(here, '..', 'src', 'index.js');
@@ -215,6 +216,27 @@ describe('profile pictures', () => {
     assert.equal(file.headers.get('content-type'), 'image/png');
   });
 
+  it('holds one reference however many times the same picture is set', async () => {
+    // Its own bytes, so no other test's references are counted in.
+    const hash = (await upload(Buffer.concat([PNG, Buffer.from('refs')]), 'image/png', ownerToken)).hash;
+    const refs = () => {
+      const db = new DatabaseSync(resolve(dataDir, 'harmony.db'), { readOnly: true });
+      try {
+        return db.prepare('SELECT refs FROM uploads WHERE hash = ?').get(hash).refs;
+      } finally {
+        db.close();
+      }
+    };
+    for (let i = 0; i < 3; i += 1) {
+      const res = await api('/api/accounts/avatar', { method: 'POST', body: { hash }, token: ownerToken });
+      assert.equal(res.status, 200);
+    }
+    assert.equal(refs(), 1, 'each re-set took one, and must give the last one back');
+
+    await api('/api/accounts/avatar', { method: 'POST', body: { hash: null }, token: ownerToken });
+    assert.equal(refs(), 0, 'nothing points at it now, so it can be evicted');
+  });
+
   it('is announced over the socket, so other clients repaint', async () => {
     const ws = new WebSocket(WS_URL);
     const seen = [];
@@ -237,6 +259,23 @@ describe('profile pictures', () => {
     assert.equal(event.user.avatarHash, pngHash);
     ws.close();
   });
+});
+
+describe('a clip or an emoji with no file named', () => {
+  // A missing hash used to reach node:sqlite as `undefined`, which it cannot
+  // bind: a 500 for leaving out a field.
+  for (const [path, body, token] of [
+    ['/api/soundpad', { name: 'nothing' }, () => ownerToken],
+    ['/api/soundpad', { name: 'object', hash: { a: 1 } }, () => ownerToken],
+    ['/api/emojis', { name: 'nothing' }, () => memberToken],
+    ['/api/emojis', { name: 'listed', hash: [1] }, () => memberToken],
+  ]) {
+    it(`is a 400 at ${path} for ${JSON.stringify(body.hash)}`, async () => {
+      const res = await api(path, { method: 'POST', body, token: token() });
+      assert.equal(res.status, 400);
+      assert.equal(res.body.error, 'no_such_upload');
+    });
+  }
 });
 
 describe('soundpad size cap', () => {

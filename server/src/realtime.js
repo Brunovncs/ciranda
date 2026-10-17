@@ -12,6 +12,7 @@
 // reply with the same `rid`; everything else is a server-initiated event.
 
 import { WebSocketServer } from 'ws';
+import { Throttle } from './throttle.js';
 
 import { publicChannel, publicGroup, VOICE_HARD_CAP } from './channels.js';
 import { publicUser } from './accounts.js';
@@ -20,6 +21,12 @@ import { DirectMessages } from './dms.js';
 
 /** A socket that has not answered a ping in this long is assumed dead. */
 const HEARTBEAT_MS = 15_000;
+/** What a member can say they publish: voice, camera, screen. */
+const PUBLISH_KINDS = new Set(['v', 'c', 's']);
+/** The largest frame a client may send. */
+const MAX_FRAME_BYTES = 256 * 1024;
+/** How much may wait unsent to one socket before it's taken for not reading. */
+const MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
 
 /**
  * How long a `GET /api/inbox` keeps somebody reachable with no socket open.
@@ -49,6 +56,17 @@ const INK_MAX_POINTS = 512;
 export class Realtime {
   #wss;
   #deps;
+
+  // Things one member does that land on everybody else: a sound on every
+  // speaker in the room, a missed call kept in the history, a password guess.
+  #soundpadThrottle = new Throttle({ burst: 5, perSecond: 1 });
+  #callThrottle = new Throttle({ burst: 20, perSecond: 1 / 3 });
+  #passwordThrottle = new Throttle({ burst: 5, perSecond: 1 / 20 });
+  // A mute toggle sends everybody a roster. Generous, since it is somebody
+  // clicking (or holding push-to-talk), but a script cannot make it a flood.
+  #muteThrottle = new Throttle({ burst: 20, perSecond: 4 });
+  /** Rosters owed to a room whose mute toggles came too fast to send each one. */
+  #owedRosters = new Set();
   /** Ink sent per person in the current second: { at, count }. */
   #inkRate = new Map();
   /**
@@ -57,7 +75,10 @@ export class Realtime {
    * (messages, calls), never the server's broadcasts, and does not count as
    * being online.
    *
-   * @type {Map<import('ws').WebSocket, {user: object, alive: boolean, host: string, scope: string}>}
+   * `session` is the token_hash of the session it said hello with, so that
+   * ending the session can end the socket too.
+   *
+   * @type {Map<import('ws').WebSocket, {user: object, session: string, alive: boolean, host: string, scope: string}>}
    */
   #clients = new Map();
   /** @type {Map<number, number>} by user id: until when an inbox poll keeps them reachable */
@@ -82,10 +103,20 @@ export class Realtime {
     // noServer: Express owns the HTTP server, and we only want to take over
     // sockets asking for /ws. Letting ws attach to the server directly would
     // have it answer upgrades on every path.
-    this.#wss = new WebSocketServer({ noServer: true });
+    // maxPayload: ws allows 100 MiB by default, which anyone can send before
+    // saying hello. The biggest real frame is a stroke of ink, a few KB.
+    this.#wss = new WebSocketServer({ noServer: true, maxPayload: MAX_FRAME_BYTES });
 
     deps.server.on('upgrade', (req, socket, head) => {
-      const { pathname } = new URL(req.url, 'http://localhost');
+      // A request line Node accepts can still be a URL that won't parse, and
+      // an exception here would end the process.
+      let pathname;
+      try {
+        ({ pathname } = new URL(req.url, 'http://localhost'));
+      } catch {
+        socket.destroy();
+        return;
+      }
       if (pathname !== '/ws') {
         socket.destroy();
         return;
@@ -106,7 +137,7 @@ export class Realtime {
     // cannot set request headers, so the token cannot travel in an
     // Authorization header. It arrives in a `hello` frame instead, and nothing
     // else is accepted until it does.
-    this.#clients.set(ws, { user: null, alive: true, host, scope: 'full' });
+    this.#clients.set(ws, { user: null, session: null, alive: true, host, scope: 'full' });
 
     ws.on('pong', () => {
       const client = this.#clients.get(ws);
@@ -247,7 +278,9 @@ export class Realtime {
 
   async #onMessage(ws, msg) {
     const client = this.#clients.get(ws);
-    if (!client) return;
+    // A socket being hung up on (its session ended, its account removed) is
+    // heard until the other end answers the close, which it may never do.
+    if (!client || ws.readyState !== ws.OPEN) return;
 
     /*
      * An application-level liveness check, answered before the hello gate.
@@ -273,6 +306,7 @@ export class Realtime {
         return ws.close(4401, 'bad token');
       }
       client.user = user;
+      client.session = user.token_hash;
       this.#deps.calls?.reconnected(user.id);
       // A call ringing for them, or one they were in before the socket
       // dropped: without it a reconnect mid-call would forget the call.
@@ -346,8 +380,15 @@ export class Realtime {
     const channel = this.#deps.channels.get(channelId);
     if (!channel || channel.kind !== 'voice') return { type: 'voice:error', error: 'no_such_channel' };
 
+    if (msg.password && !this.#deps.channels.hasGrant(channelId, user.id)
+      && !this.#passwordThrottle.take(`${user.id}:${channelId}`).allowed) {
+      return { type: 'voice:error', error: 'slow_down' };
+    }
     const verdict = await this.#deps.channels.admit(channelId, user.id, msg.password);
     if (verdict !== 'ok') return { type: 'voice:error', error: verdict };
+    // Checking a password takes a while; a socket that closed meanwhile has
+    // already been taken out of every room, and must not be put back in one.
+    if (!this.#clients.get(ws)?.user) return { type: 'voice:error', error: 'not_connected' };
 
     // Leaving the previous channel first keeps "one voice channel at a time"
     // true without the client having to sequence two requests. A private call
@@ -412,12 +453,29 @@ export class Realtime {
     return { type: 'voice:left', ...place.echo };
   }
 
+  /**
+   * Every toggle is kept, however fast: refusing one would leave the room
+   * seeing a microphone in the wrong state, since the client doesn't retry.
+   * What's limited is the roster sent to everybody for each; past the limit
+   * one goes out a second later, with whatever the state is by then.
+   */
   #voiceMute(user, msg) {
     const place = this.#place(msg);
     if (!place.rooms.setMuted(place.id, user.id, msg.muted, msg.deafened)) {
       return { type: 'voice:error', error: 'not_in_channel' };
     }
-    place.announce();
+    if (this.#muteThrottle.take(user.id).allowed) {
+      place.announce();
+    } else {
+      const key = `${msg.conversationId ? 'call' : 'channel'}:${place.id}`;
+      if (!this.#owedRosters.has(key)) {
+        this.#owedRosters.add(key);
+        setTimeout(() => {
+          this.#owedRosters.delete(key);
+          place.announce();
+        }, 1000).unref();
+      }
+    }
     return { type: 'voice:ok' };
   }
 
@@ -426,7 +484,8 @@ export class Realtime {
     const place = this.#place(msg);
     const found = place.rooms.find(place.id, user.id);
     if (!found) return { type: 'voice:error', error: 'not_in_channel' };
-    place.rooms.trackPublish(place.id, found.mid, String(msg.kind), Boolean(msg.on));
+    if (!PUBLISH_KINDS.has(msg.kind)) return { type: 'voice:error', error: 'bad_message' };
+    place.rooms.trackPublish(place.id, found.mid, msg.kind, Boolean(msg.on));
     place.announce();
     return { type: 'voice:ok' };
   }
@@ -477,6 +536,7 @@ export class Realtime {
     }
     const keys = this.#deps.dms.checkKeys(conversation, user.id, msg.senderKey, msg.recipientKey);
     if (!keys.ok) return { type: 'call:error', error: keys.error };
+    if (!this.#callThrottle.take(user.id).allowed) return { type: 'call:error', error: 'slow_down' };
 
     const result = this.#deps.calls.start({
       conversationId: conversation.id,
@@ -548,6 +608,7 @@ export class Realtime {
 
     const clip = this.#deps.soundpad?.get(Number(msg.clipId));
     if (!clip) return { type: 'voice:error', error: 'no_such_clip' };
+    if (!this.#soundpadThrottle.take(user.id).allowed) return { type: 'voice:error', error: 'slow_down' };
 
     for (const member of this.#deps.voice.roster(channelId)) {
       this.toUser(member.userId, {
@@ -619,10 +680,18 @@ export class Realtime {
 
   // ------------------------------------------------------------- admin
 
+  /**
+   * Whether this person is staff NOW. Not `user.role`: that is the row read
+   * at hello, and an admin demoted since -- or removed -- would keep these
+   * powers for as long as that socket stayed open.
+   */
+  #isAdmin(user) {
+    const role = this.#deps.accounts.byId(user.id)?.role;
+    return role === 'owner' || role === 'admin';
+  }
+
   async #adminForceMute(user, msg) {
-    if (user.role !== 'owner' && user.role !== 'admin') {
-      return { type: 'voice:error', error: 'forbidden' };
-    }
+    if (!this.#isAdmin(user)) return { type: 'voice:error', error: 'forbidden' };
     const channelId = Number(msg.channelId);
     const mid = Number(msg.mid);
     if (!this.#deps.voice.setForceMuted(channelId, mid, msg.muted)) {
@@ -641,21 +710,21 @@ export class Realtime {
 
   /** Move somebody out of a voice channel, or into one. */
   async #adminMove(user, msg) {
-    if (user.role !== 'owner' && user.role !== 'admin') {
-      return { type: 'voice:error', error: 'forbidden' };
-    }
+    if (!this.#isAdmin(user)) return { type: 'voice:error', error: 'forbidden' };
     const targetId = Number(msg.userId);
     const toId = msg.toChannelId == null ? null : Number(msg.toChannelId);
 
-    const left = this.#deps.voice.leaveAll(targetId);
-    for (const { channelId } of left) this.broadcastRoster(channelId);
-
+    // Before anybody is moved: a bad destination used to take them out of
+    // their channel anyway and never say so.
     if (toId != null) {
       const channel = this.#deps.channels.get(toId);
       if (!channel || channel.kind !== 'voice') {
         return { type: 'voice:error', error: 'no_such_channel' };
       }
     }
+
+    const left = this.#deps.voice.leaveAll(targetId);
+    for (const { channelId } of left) this.broadcastRoster(channelId);
 
     // The target does the actual join, because only their client can open the
     // peer connections. Telling them where to go keeps every WHIP/WHEP session
@@ -667,8 +736,22 @@ export class Realtime {
   // ------------------------------------------------------------- sending
 
   #send(ws, payload) {
-    if (ws.readyState !== ws.OPEN) return;
+    if (!this.#writable(ws)) return;
     try { ws.send(JSON.stringify(payload)); } catch { /* closing */ }
+  }
+
+  /**
+   * Open, and reading what it's sent. A client that keeps talking but never
+   * reads would otherwise have everything for it -- ink at 25 a second, every
+   * roster -- buffered here without end. Dropping frames would leave it with
+   * a wrong picture; hung up on, it reconnects and catches up.
+   */
+  #writable(ws) {
+    if (ws.readyState !== ws.OPEN) return false;
+    if (ws.bufferedAmount <= MAX_BUFFERED_BYTES) return true;
+    console.warn('[ws] a client stopped reading; hanging up on it');
+    ws.terminate();
+    return false;
   }
 
   /**
@@ -682,7 +765,7 @@ export class Realtime {
   #fanOut(payload, wants) {
     let text;
     for (const [ws, client] of this.#clients) {
-      if (!wants(client) || ws.readyState !== ws.OPEN) continue;
+      if (!wants(client) || !this.#writable(ws)) continue;
       try { ws.send(text ??= JSON.stringify(payload)); } catch { /* closing */ }
     }
   }
@@ -707,6 +790,34 @@ export class Realtime {
       this.#send(ws, { type: 'kicked', reason });
       try { ws.close(4403, reason); } catch { /* already going */ }
     }
+  }
+
+  /**
+   * Hang up the sockets one session opened, now that it has ended (signing
+   * out). 4401 is what a refused hello closes with, so the client takes it
+   * the same way: signed out, and not to be retried with that token.
+   */
+  closeSession(sessionHash) {
+    for (const [ws, client] of this.#clients) {
+      if (client.session === sessionHash) this.#endSocket(ws);
+    }
+  }
+
+  /**
+   * Hang up every socket of somebody's but those of the session `keep`, which
+   * are moved over to the session `renamed`: a password change ends every
+   * session and issues the one that made it a new token.
+   */
+  closeOtherSessions(userId, { keep, renamed }) {
+    for (const [ws, client] of this.#clients) {
+      if (client.user?.id !== userId) continue;
+      if (client.session === keep) client.session = renamed;
+      else this.#endSocket(ws);
+    }
+  }
+
+  #endSocket(ws) {
+    try { ws.close(4401, 'session ended'); } catch { /* already going */ }
   }
 
   /** Send to everyone authenticated with the server open (not to background sockets). */

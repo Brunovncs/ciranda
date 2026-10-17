@@ -16,6 +16,8 @@ set -euo pipefail
 HARMONY_PORT="${HARMONY_PORT:-8080}"
 MEDIAMTX_CONFIG="${MEDIAMTX_CONFIG:-/etc/harmony/mediamtx.yml}"
 STARTUP_TIMEOUT="${HARMONY_STARTUP_TIMEOUT:-30}"
+WATCHDOG_INTERVAL="${HARMONY_WATCHDOG_INTERVAL:-30}"
+WATCHDOG_FAILURES="${HARMONY_WATCHDOG_FAILURES:-3}"
 
 log() { printf '[entrypoint] %s\n' "$*"; }
 
@@ -50,25 +52,65 @@ log "control server is answering on :${HARMONY_PORT}"
 mediamtx "$MEDIAMTX_CONFIG" &
 mediamtx_pid=$!
 
+# The image's HEALTHCHECK only labels the container unhealthy, and nothing acts
+# on that label: plain compose and `restart: unless-stopped` react to an exit,
+# never to it. A server still running but no longer answering -- hung, or no
+# longer seeing MediaMTX -- would stay up and useless until someone noticed. So
+# this asks the HEALTHCHECK's question itself and, after WATCHDOG_FAILURES
+# wrong answers in a row, exits, which takes the container down below and lets
+# the restart policy bring it back. The first probe waits a full interval after
+# MediaMTX starts, and it takes several failures in a row, so a slow start
+# (MediaMTX reported "down" until the control server's first poll) is never
+# mistaken for a hang. HARMONY_WATCHDOG_INTERVAL=0 turns it off.
+watchdog() {
+  local failures=0
+  while :; do
+    sleep "$WATCHDOG_INTERVAL"
+    if wget -q -T 5 -O- "http://127.0.0.1:${HARMONY_PORT}/api/health" 2>/dev/null | grep -q '"mediamtx":"up"'; then
+      failures=0
+      continue
+    fi
+    failures=$(( failures + 1 ))
+    log "health check failed (${failures} of ${WATCHDOG_FAILURES})"
+    if [ "$failures" -ge "$WATCHDOG_FAILURES" ]; then
+      log 'unhealthy for too long -- exiting so the restart policy starts it again'
+      exit 3
+    fi
+  done
+}
+watchdog_pid=''
+if [ "$WATCHDOG_INTERVAL" -gt 0 ]; then
+  watchdog &
+  watchdog_pid=$!
+fi
+
 shutdown() {
   trap - TERM INT
   log 'shutting down'
-  kill -TERM "$mediamtx_pid" "$control_pid" 2>/dev/null || true
+  # shellcheck disable=SC2086 # empty when the watchdog is off, and must then vanish
+  kill -TERM $watchdog_pid "$mediamtx_pid" "$control_pid" 2>/dev/null || true
   wait "$mediamtx_pid" "$control_pid" 2>/dev/null || true
   exit 0
 }
 trap shutdown TERM INT
 
-# Whichever exits first takes the container with it.
-wait -n "$control_pid" "$mediamtx_pid"
-status=$?
+# Whichever exits first takes the container with it, the watchdog included.
+# `|| status=$?`, not `status=$?` on the next line: under `set -e` a non-zero
+# exit would end the script right at the `wait`, leaving the other process to be
+# killed without a word in the log.
+status=0
+# shellcheck disable=SC2086
+wait -n "$control_pid" "$mediamtx_pid" $watchdog_pid || status=$?
 
-if kill -0 "$control_pid" 2>/dev/null; then
+if [ -n "$watchdog_pid" ] && ! kill -0 "$watchdog_pid" 2>/dev/null; then
+  log "the health watchdog gave up (status ${status}) -- stopping both"
+elif kill -0 "$control_pid" 2>/dev/null; then
   log "mediamtx exited (status ${status}) -- stopping the control server"
 else
   log "the control server exited (status ${status}) -- stopping mediamtx"
 fi
-kill -TERM "$mediamtx_pid" "$control_pid" 2>/dev/null || true
+# shellcheck disable=SC2086
+kill -TERM $watchdog_pid "$mediamtx_pid" "$control_pid" 2>/dev/null || true
 wait 2>/dev/null || true
 
 # Never exit 0 here. Reaching this point means a process ended by itself rather

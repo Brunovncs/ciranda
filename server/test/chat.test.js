@@ -8,8 +8,9 @@ import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { createHash, randomBytes } from 'node:crypto';
 
 import {
   Chat, Emojis, ftsPhrase, mediaTypeOf, mentionsIn, MAX_UPLOAD_BYTES,
@@ -106,7 +107,10 @@ const PNG = Buffer.from(
 );
 
 before(async () => {
-  dataDir = mkdtempSync(resolve(tmpdir(), 'harmony-chat-'));
+  // A dot-folder on purpose, as a data directory under ~/.something would be:
+  // Express 5's sendFile refuses any path with one in it unless told not to,
+  // and every download below would be a 404.
+  dataDir = mkdtempSync(resolve(tmpdir(), '.harmony-chat-'));
   await startFakeMediaMtx();
   await startHarmony();
 
@@ -332,6 +336,15 @@ describe('uploads', () => {
     assert.equal(res.body.error, 'no_such_upload');
   });
 
+  it('refuses an attachment that is not even a hash as one never uploaded', async () => {
+    // An object reached node:sqlite as named parameters, and it threw: a 500.
+    const res = await api(`/api/channels/${textChannelId}/messages`, {
+      method: 'POST', body: { body: 'nope', attachmentHash: { a: 1 } }, token: memberToken,
+    });
+    assert.equal(res.status, 400);
+    assert.equal(res.body.error, 'no_such_upload');
+  });
+
   it('still refuses an oversized JSON body on a normal route', async () => {
     // Pinned so nobody "fixes" the upload route by loosening the global limit.
     const res = await api(`/api/channels/${textChannelId}/messages`, {
@@ -342,6 +355,144 @@ describe('uploads', () => {
 
   it('has a per-file cap well under the disk quota', () => {
     assert.ok(MAX_UPLOAD_BYTES <= 25 * 1024 * 1024);
+  });
+});
+
+/**
+ * POST /api/uploads by hand, announcing a length and sending nothing: fetch
+ * insists on sending the body it was given before it reads the answer.
+ */
+function announceUpload(token, length) {
+  return new Promise((done, fail) => {
+    const req = http.request(`${BASE}/api/uploads`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'image/png', 'Content-Length': String(length), Authorization: `Bearer ${token}` },
+    });
+    req.on('response', (res) => {
+      let text = '';
+      res.on('data', (b) => { text += b; });
+      res.on('end', () => {
+        req.destroy();
+        done({ status: res.statusCode, body: JSON.parse(text), connection: res.headers.connection });
+      });
+    });
+    req.on('error', fail);
+    req.flushHeaders();
+  });
+}
+
+describe('uploads arriving as a stream', () => {
+  let token;
+  before(async () => {
+    token = (await api('/api/accounts/register', {
+      method: 'POST', body: { nickname: 'uploader', password: 'hunter22' },
+    })).body.token;
+  });
+
+  it('stores a file of several megabytes exactly, under the hash of its bytes', async () => {
+    const bytes = randomBytes(3 * 1024 * 1024 + 17);
+    const res = await api('/api/uploads', { method: 'POST', raw: bytes, contentType: 'video/mp4', token });
+    assert.equal(res.status, 201);
+    assert.equal(res.body.hash, createHash('sha256').update(bytes).digest('hex'));
+    assert.equal(res.body.bytes, bytes.length);
+    assert.equal(res.body.deduplicated, false);
+
+    const back = await fetch(`${BASE}/api/uploads/${res.body.hash}`, { headers: { Authorization: `Bearer ${token}` } });
+    assert.deepEqual(Buffer.from(await back.arrayBuffer()), bytes);
+    assert.deepEqual(readdirSync(resolve(dataDir, 'uploads', 'incoming')), [], 'nothing left half-arrived');
+  });
+
+  it('refuses a body announced over the cap before reading any of it', async () => {
+    const res = await announceUpload(token, MAX_UPLOAD_BYTES + 1);
+    assert.equal(res.status, 413);
+    assert.equal(res.body.error, 'file_too_large', 'the code the client knows, not the parser\'s');
+    assert.equal(res.connection, 'close', 'the rest of that body is not going to be read');
+    assert.equal((await api('/api/health')).status, 200);
+  });
+
+  it('turns a burst of uploads into slow_down, with a hint', async () => {
+    const flood = (await api('/api/accounts/register', {
+      method: 'POST', body: { nickname: 'flooder', password: 'hunter22' },
+    })).body.token;
+    const statuses = [];
+    let refused;
+    for (let i = 0; i < 25; i += 1) {
+      const res = await api('/api/uploads', { method: 'POST', raw: PNG, contentType: 'image/png', token: flood });
+      statuses.push(res.status);
+      if (res.status === 429) refused ??= res;
+    }
+    assert.ok(statuses.slice(0, 20).every((s) => s === 201), `the burst is allowed: ${statuses}`);
+    assert.ok(refused, `then refused: ${statuses}`);
+    assert.equal(refused.body.error, 'slow_down');
+    assert.ok(Number(refused.headers.get('retry-after')) >= 1);
+  });
+});
+
+describe('Chat.receive', () => {
+  let dir;
+  let db;
+  let chat;
+  before(async () => {
+    const { openDatabase } = await import('../src/db.js');
+    dir = mkdtempSync(resolve(tmpdir(), 'harmony-receive-'));
+    db = openDatabase({ dataDir: dir });
+    chat = new Chat(db, { dataDir: dir, maxDiskBytes: 64 * 1024 * 1024 });
+  });
+  after(() => {
+    db.close();
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  });
+
+  const incoming = () => readdirSync(resolve(dir, 'uploads', 'incoming'));
+
+  it('stops at the cap, leaves the source to its owner, and nothing behind', async () => {
+    const { Readable } = await import('node:stream');
+    const chunk = Buffer.alloc(1024 * 1024, 7);
+    let sent = 0;
+    const source = new Readable({
+      read() { sent += 1; this.push(sent > 40 ? null : chunk); },
+    });
+    const result = await chat.receive(source, 'image/png');
+    assert.deepEqual(result, { ok: false, error: 'file_too_large' });
+    assert.ok(sent < 40, 'refused when it got there, not after reading the lot');
+    assert.equal(source.destroyed, false, 'the request still has an answer to carry');
+    assert.deepEqual(incoming(), []);
+    assert.equal(chat.usedBytes, 0);
+  });
+
+  it('gives up on a sender that went away', async () => {
+    const { PassThrough } = await import('node:stream');
+    const source = new PassThrough();
+    const pending = chat.receive(source, 'image/png');
+    source.write(Buffer.alloc(1000, 1));
+    setImmediate(() => source.destroy(new Error('aborted')));
+    assert.deepEqual(await pending, { ok: false, error: 'aborted' });
+    assert.deepEqual(incoming(), []);
+  });
+
+  it('keeps the quota total itself, matching the table', async () => {
+    const { Readable } = await import('node:stream');
+    const one = await chat.receive(Readable.from([Buffer.from('first file')]), 'text/plain');
+    const two = chat.store(Buffer.from('second, stored whole'), 'text/plain');
+    const again = await chat.receive(Readable.from([Buffer.from('first file')]), 'text/plain');
+    assert.equal(one.ok && two.ok && again.deduplicated, true);
+    const sum = db.prepare('SELECT SUM(bytes) AS n FROM uploads').get().n;
+    assert.equal(chat.usedBytes, sum);
+    assert.equal(sum, 'first file'.length + 'second, stored whole'.length);
+  });
+
+  it('counts what is still arriving against the room left', async () => {
+    const { PassThrough, Readable } = await import('node:stream');
+    // 64 MB of room, and an upload that doesn't say its size holds the 25 MB cap.
+    const [a, b] = [new PassThrough(), new PassThrough()];
+    const arriving = [chat.receive(a, 'image/png'), chat.receive(b, 'image/png')];
+    const third = await chat.receive(Readable.from([Buffer.from('no room yet')]), 'text/plain');
+    assert.deepEqual(third, { ok: false, error: 'server_full' });
+    a.end(Buffer.from('small after all'));
+    b.end(Buffer.from('this one too'));
+    assert.ok((await Promise.all(arriving)).every((r) => r.ok));
+    const fourth = await chat.receive(Readable.from([Buffer.from('room again')]), 'text/plain');
+    assert.equal(fourth.ok, true);
   });
 });
 
@@ -1094,5 +1245,118 @@ describe('media keys', () => {
     assert.equal(verifyMediaKey('s', key.replace('m1.16.', 'm1.17.'), now), null);
     assert.equal(verifyMediaKey('s', 'h1.1.1.rw.abc.def', now), null);
     assert.equal(verifyMediaKey('s', undefined, now), null);
+  });
+});
+
+describe('requests that used to take the server down or around a rule', () => {
+  it('turns a password that is not text into a 400, and stays up', async () => {
+    const res = await api('/api/accounts/register', {
+      method: 'POST', body: { nickname: 'numbers', password: 1234567 },
+    });
+    assert.equal(res.status, 400);
+    assert.equal(res.body.error, 'weak_password');
+    assert.equal((await api('/api/health')).status, 200);
+  });
+
+  it('answers a JSON 500 when an async handler rejects, and stays up', async () => {
+    // A nickname that cannot be made into text: no callable toString, and
+    // valueOf gives back the object. Login is async, so the TypeError is a
+    // rejected promise -- which Express 4 never saw, and Node ended the
+    // process on. If login ever refuses this with a 4xx instead, find another
+    // way to make a handler reject: what is under test is the 500.
+    const res = await api('/api/accounts/login', {
+      method: 'POST', body: { nickname: { toString: 1 }, password: 'hunter22' },
+    });
+    assert.equal(res.status, 500);
+    assert.deepEqual(res.body, { error: 'server_error' }, 'JSON, and nothing about the stack');
+    assert.equal(child.exitCode, null);
+    assert.equal((await api('/api/health')).status, 200);
+  });
+
+  it('exits when its port is taken, rather than run listening to nothing', async () => {
+    // Express 5 hands the listen error to the callback, which used to log
+    // "control server on ..." over it and carry on.
+    const elsewhere = mkdtempSync(resolve(tmpdir(), 'harmony-taken-'));
+    try {
+      const second = spawn(process.execPath, [serverEntry], {
+        env: {
+          ...process.env,
+          HARMONY_PORT: String(HARMONY_PORT),
+          HARMONY_HOST: '127.0.0.1',
+          HARMONY_DATA_DIR: elsewhere,
+          HARMONY_MEDIAMTX_API: `http://127.0.0.1:${FAKE_MTX_PORT}`,
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let out = '';
+      second.stdout.on('data', (b) => { out += b; });
+      second.stderr.on('data', () => {});
+      const code = await new Promise((done) => {
+        const timer = setTimeout(() => { second.kill('SIGKILL'); done('still running'); }, 10_000);
+        second.once('exit', (c) => { clearTimeout(timer); done(c); });
+      });
+      assert.equal(code, 1);
+      assert.ok(!out.includes('control server on'), 'it must not claim to be up');
+    } finally {
+      rmSync(elsewhere, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+  });
+
+  it('hangs up on a websocket upgrade whose URL will not parse, and stays up', async () => {
+    const net = await import('node:net');
+    await new Promise((done) => {
+      const socket = net.connect(HARMONY_PORT, '127.0.0.1', () => {
+        socket.write('GET http://[ HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n'
+          + 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n');
+      });
+      socket.on('close', done);
+      socket.on('error', () => {});
+      socket.resume();
+    });
+    assert.equal((await api('/api/health')).status, 200);
+  });
+
+  it('refuses to pin a message in a channel you may not read', async () => {
+    const channel = (await api('/api/channels', {
+      method: 'POST', body: { kind: 'text', name: 'soon-locked' }, token: ownerToken,
+    })).body.channel;
+    const posted = await api(`/api/channels/${channel.id}/messages`, {
+      method: 'POST', body: { body: 'before the lock' }, token: ownerToken,
+    });
+    await api(`/api/channels/${channel.id}`, { method: 'POST', body: { password: 'letmein' }, token: ownerToken });
+
+    const res = await api(`/api/messages/${posted.body.message.id}/pin`, {
+      method: 'POST', body: { pinned: true }, token: memberToken,
+    });
+    assert.equal(res.status, 404);
+    assert.equal(res.body.message, undefined, 'nothing of the message comes back');
+  });
+
+  it('can still post anywhere after deleting the channel with the newest messages', async () => {
+    const doomed = (await api('/api/channels', {
+      method: 'POST', body: { kind: 'text', name: 'doomed' }, token: ownerToken,
+    })).body.channel;
+    for (const body of ['one', 'two', 'three']) {
+      await api(`/api/channels/${doomed.id}/messages`, { method: 'POST', body: { body }, token: memberToken });
+    }
+    assert.equal((await api(`/api/channels/${doomed.id}/delete`, { method: 'POST', token: ownerToken })).status, 200);
+
+    const res = await api(`/api/channels/${textChannelId}/messages`, {
+      method: 'POST', body: { body: 'still works' }, token: memberToken,
+    });
+    assert.equal(res.status, 201, 'the new message reuses an id whose search row must be gone');
+    const found = await api(`/api/channels/${textChannelId}/search?q=three`, { token: memberToken });
+    assert.ok(!found.body.results.some((m) => m.body === 'three'), "the deleted channel's messages aren't found");
+  });
+
+  it('searches for a short query with _ or % in it literally', async () => {
+    await api(`/api/channels/${textChannelId}/messages`, {
+      method: 'POST', body: { body: 'snake_case' }, token: memberToken,
+    });
+    const res = await api(`/api/channels/${textChannelId}/search?q=e_`, { token: memberToken });
+    assert.equal(res.body.mode, 'like');
+    assert.ok(res.body.results.length > 0);
+    assert.ok(res.body.results.every((m) => m.body.includes('e_') || m.nickname.includes('e_')),
+      '_ matches an underscore, not any character');
   });
 });

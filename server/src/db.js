@@ -460,6 +460,18 @@ const MIGRATIONS = [
       ALTER TABLE dm_reads ADD COLUMN cleared_id INTEGER NOT NULL DEFAULT 0;
     `);
   },
+
+  /*
+   * v15 -- search rows left behind by deleted channels.
+   *
+   * Deleting a channel cascaded to its messages but not to their rows in
+   * messages_fts, which has no foreign key. Message ids are reused from the
+   * top, so the next message after deleting the channel with the newest ones
+   * collided with a leftover row, and no message could be posted anywhere.
+   */
+  (db) => {
+    db.exec('DELETE FROM messages_fts WHERE rowid NOT IN (SELECT id FROM messages)');
+  },
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;
@@ -526,7 +538,9 @@ Set HARMONY_DATA_DIR to put it somewhere else.
  * @returns {DatabaseSync}
  */
 export function openDatabase({ dataDir, file = 'harmony.db' }) {
-  const db = new DatabaseSync(join(dataDir, file));
+  // A backup taken through a second connection holds a lock for a moment; wait it out
+  // rather than fail the write with SQLITE_BUSY.
+  const db = new DatabaseSync(join(dataDir, file), { timeout: 5000 });
 
   // WAL lets the MediaMTX auth hook read while a registration is writing.
   // Without it every write blocks every read, and the auth hook is on the path

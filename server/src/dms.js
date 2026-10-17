@@ -97,9 +97,12 @@ export class DirectMessages {
             WHERE m.conversation_id = c.id AND m.id > IFNULL(r.cleared_id, 0))
         ORDER BY c.last_at DESC
       `),
+      // Above each conversation's cleared mark, as the list sees it: counting
+      // a cleared message would tell a background client there's news forever.
       latest: db.prepare(`
-        SELECT MAX(m.id) AS id FROM dm_messages m
-        JOIN dm_conversations c ON c.id = m.conversation_id
+        SELECT MAX(m.id) AS id FROM dm_conversations c
+        LEFT JOIN dm_reads r ON r.conversation_id = c.id AND r.user_id = :me
+        JOIN dm_messages m ON m.conversation_id = c.id AND m.id > IFNULL(r.cleared_id, 0)
         WHERE c.user_a = :me OR c.user_b = :me
       `),
 

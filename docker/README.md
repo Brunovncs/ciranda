@@ -88,6 +88,13 @@ in that window are refused rather than queued. If either process exits on its
 own the container exits non-zero, so it restarts rather than limping along
 serving half a service.
 
+The same goes for a server that is still running but stuck. Docker's health
+check only marks the container `(unhealthy)`; plain Docker and compose never
+restart it for that, so the entrypoint asks the same question itself every 30
+seconds and exits after three failures in a row, which `restart: unless-stopped`
+then acts on. `HARMONY_WATCHDOG_INTERVAL` (seconds, `0` turns it off) and
+`HARMONY_WATCHDOG_FAILURES` change that.
+
 ## Ports
 
 | Protocol | Port | Purpose |
@@ -169,9 +176,15 @@ docker run --rm -v harmony_harmony-data:/data -v "$PWD:/in" \
 docker compose up -d
 ```
 
-Taking the backup while the server is running is fine for a friends' server —
-SQLite is in WAL mode, so the worst case is losing the last few seconds of
-writes. `docker compose stop` first if you want it exact.
+`docker compose stop` first: copying the files of a running server can catch
+`harmony.db` and its `-wal` at different moments and give a database that won't
+open. For a backup without stopping, have SQLite write a consistent copy:
+
+```bash
+docker exec harmony node --no-warnings -e "
+  new (require('node:sqlite').DatabaseSync)('/var/lib/harmony/harmony.db', { timeout: 10000 })
+    .exec(\"VACUUM INTO '/var/lib/harmony/harmony-backup.db'\")"
+```
 
 **A bind mount instead of a named volume** keeps the *host's* ownership rather
 than the image's, so you have to chown it yourself:
@@ -205,4 +218,11 @@ docker buildx build --platform linux/amd64,linux/arm64 \
 
 `MEDIAMTX_VERSION` is a build arg, pinned to the release `mediamtx.yml` is
 validated against — MediaMTX removes configuration keys between versions, and an
-unknown key aborts startup rather than warning.
+unknown key aborts startup rather than warning. The download is checked against
+that release's SHA-256 for each architecture, kept in the Dockerfile, so moving
+to another version means updating those hashes too (from the release's
+`checksums.sha256`); the build stops on a mismatch.
+
+`NODE_VERSION` and `ALPINE_VERSION` are pinned to a tag and its digest, so the
+same commit always builds on the same base. Bumping them is deliberate: take the
+new tag's digest with `docker buildx imagetools inspect node:<tag>`.

@@ -110,6 +110,7 @@ function connect(token) {
 
   const client = {
     ws,
+    inbox,
     closed: new Promise((done) => ws.addEventListener('close', (e) => done(e))),
 
     /** Wait for the first message matching a predicate, past or future. */
@@ -436,6 +437,118 @@ describe('admin force-mute actually stops the publish', () => {
     });
     victim.ws.close();
     admin.ws.close();
+  });
+});
+
+describe('a socket is only as good as the session and the role behind it', () => {
+  const register = async (nickname) => (await api('/api/accounts/register', {
+    method: 'POST', body: { nickname, password: 'hunter22' },
+  })).body;
+  const login = async (nickname, password = 'hunter22') => (await api('/api/accounts/login', {
+    method: 'POST', body: { nickname, password },
+  })).body.token;
+
+  it('stops honouring admin powers once the admin is demoted', async () => {
+    const deputy = await register('deputy');
+    await api(`/api/accounts/${deputy.user.id}/role`, {
+      method: 'POST', body: { role: 'admin' }, token: ownerToken,
+    });
+    const admin = connect(deputy.token);
+    await admin.hello();
+    const victim = connect(memberToken);
+    const victimId = (await victim.hello()).user.id;
+    const joined = await victim.request({ type: 'voice:join', channelId: voiceChannelId });
+
+    const allowed = await admin.request({
+      type: 'admin:force-mute', channelId: voiceChannelId, mid: joined.mid, muted: false,
+    });
+    assert.equal(allowed.type, 'voice:ok', 'an admin may, to begin with');
+
+    const demoted = await api(`/api/accounts/${deputy.user.id}/role`, {
+      method: 'POST', body: { role: 'member' }, token: ownerToken,
+    });
+    assert.equal(demoted.status, 200);
+    // Same socket, same hello: the role it was opened with is not the role now.
+    const mute = await admin.request({
+      type: 'admin:force-mute', channelId: voiceChannelId, mid: joined.mid, muted: true,
+    });
+    assert.equal(mute.error, 'forbidden');
+    const move = await admin.request({ type: 'admin:move', userId: victimId, toChannelId: null });
+    assert.equal(move.error, 'forbidden');
+
+    await victim.request({ type: 'voice:leave', channelId: voiceChannelId });
+    victim.ws.close();
+    admin.ws.close();
+  });
+
+  it('hangs up the sockets of a session that signs out, and only those', { timeout: 10_000 }, async () => {
+    const leaver = await register('leaver');
+    const other = await login('leaver');
+    const a = connect(leaver.token);
+    const b = connect(other);
+    await a.hello();
+    await b.hello();
+
+    const out = await api('/api/accounts/logout', { method: 'POST', token: leaver.token });
+    assert.equal(out.status, 200);
+    const close = await a.closed;
+    assert.equal(close.code, 4401, 'what a refused hello closes with: signed out, do not retry');
+    assert.equal((await b.request({ type: 'ping' })).type, 'pong', 'another device of theirs carries on');
+    b.ws.close();
+  });
+
+  it('hangs up every other session on a password change, a stolen one included', { timeout: 10_000 }, async () => {
+    const changer = await register('changer');
+    const stolen = await login('changer');
+    const mine = connect(changer.token);
+    const theirs = connect(stolen);
+    await mine.hello();
+    await theirs.hello();
+
+    const changed = await api('/api/accounts/password', {
+      method: 'POST', body: { current: 'hunter22', password: 'hunter33' }, token: changer.token,
+    });
+    assert.equal(changed.status, 200);
+    assert.equal((await theirs.closed).code, 4401);
+    assert.equal((await mine.request({ type: 'ping' })).type, 'pong',
+      'the socket of the session that changed it carries on, under the new token');
+
+    const fresh = connect(changed.body.token);
+    assert.equal((await fresh.hello()).type, 'hello-ok');
+    const old = connect(changer.token);
+    assert.equal((await old.hello()).type, 'hello-failed');
+
+    // Signing out with the new token ends the socket that carried on, too.
+    await api('/api/accounts/logout', { method: 'POST', token: changed.body.token });
+    assert.equal((await mine.closed).code, 4401);
+    assert.equal((await fresh.closed).code, 4401);
+  });
+});
+
+describe('muting', () => {
+  it('lets somebody toggle freely, and a script only so fast', async () => {
+    const toggler = (await api('/api/accounts/register', {
+      method: 'POST', body: { nickname: 'toggler', password: 'hunter22' },
+    })).body;
+    const c = connect(toggler.token);
+    await c.hello();
+    await c.request({ type: 'voice:join', channelId: voiceChannelId });
+
+    const rosters = () => c.inbox.filter((m) => m.type === 'voice:roster' && m.channelId === voiceChannelId);
+    const before = rosters().length;
+    const replies = await Promise.all(Array.from({ length: 40 }, (_, i) => c.request({
+      type: 'voice:mute', channelId: voiceChannelId, muted: i % 2 === 0,
+    })));
+    assert.ok(replies.every((r) => r.type === 'voice:ok'), 'every toggle is kept');
+    // The last toggle (unmuted) reaches the room a moment later, in one roster
+    // for all the toggles the limit held back.
+    await new Promise((done) => { setTimeout(done, 1500); });
+    const sent = rosters().slice(before);
+    assert.ok(sent.length >= 20 && sent.length < 40, `a burst of rosters goes out, not forty: got ${sent.length}`);
+    assert.equal(sent.at(-1).roster.find((m) => m.nickname === 'toggler').muted, false);
+
+    await c.request({ type: 'voice:leave', channelId: voiceChannelId });
+    c.ws.close();
   });
 });
 

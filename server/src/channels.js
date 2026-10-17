@@ -234,6 +234,21 @@ export class Channels {
       setMicLocked: db.prepare('UPDATE channels SET mic_locked = ? WHERE id = ?'),
       setPosition: db.prepare('UPDATE channels SET position = ? WHERE id = ?'),
       remove: db.prepare('DELETE FROM channels WHERE id = ?'),
+      // What deleting a channel takes with it that no cascade reaches: its
+      // messages' search rows, and one upload reference per message with a file.
+      dropMessageFts: db.prepare(
+        'DELETE FROM messages_fts WHERE rowid IN (SELECT id FROM messages WHERE channel_id = ?)',
+      ),
+      releaseAttachments: db.prepare(`
+        UPDATE uploads SET refs = MAX(0, refs - (
+          SELECT COUNT(*) FROM messages m
+          WHERE m.channel_id = ? AND m.attachment_hash = uploads.hash
+        ))
+        WHERE hash IN (
+          SELECT attachment_hash FROM messages
+          WHERE channel_id = ? AND attachment_hash IS NOT NULL
+        )
+      `),
 
       grant: db.prepare(
         'INSERT INTO channel_grants (channel_id, user_id, granted_at) VALUES (?, ?, ?) '
@@ -258,6 +273,7 @@ export class Channels {
     if (kind !== 'voice' && kind !== 'text') return { ok: false, error: 'invalid_kind' };
     const clean = cleanChannelName(name);
     if (!clean) return { ok: false, error: 'invalid_name' };
+    if (password != null && typeof password !== 'string') return { ok: false, error: 'invalid_password' };
 
     const hash = password ? await hashPassword(password) : null;
     const position = this.#q.nextPosition.get().p;
@@ -271,6 +287,7 @@ export class Channels {
     // Before anything is written, so a refused lock does not leave a rename
     // half-applied behind it.
     if (micLocked !== undefined && channel.kind !== 'voice') return { ok: false, error: 'not_voice' };
+    if (password != null && typeof password !== 'string') return { ok: false, error: 'invalid_password' };
 
     if (name !== undefined) {
       const clean = cleanChannelName(name);
@@ -291,9 +308,19 @@ export class Channels {
     return { ok: true, channel: this.get(id) };
   }
 
+  /** Delete a channel and its messages, all in one transaction. */
   remove(id) {
     if (!this.get(id)) return { ok: false, error: 'no_such_channel' };
-    this.#q.remove.run(id);
+    this.#db.exec('BEGIN');
+    try {
+      this.#q.releaseAttachments.run(id, id);
+      this.#q.dropMessageFts.run(id);
+      this.#q.remove.run(id);
+      this.#db.exec('COMMIT');
+    } catch (err) {
+      this.#db.exec('ROLLBACK');
+      throw err;
+    }
     return { ok: true };
   }
 
@@ -537,6 +564,13 @@ export class VoiceRooms {
       }
     }
     return false;
+  }
+
+  /** Empty a channel's room, for a channel being deleted. Returns who was in it. */
+  closeRoom(channelId) {
+    const room = this.#rooms.get(channelId);
+    this.#rooms.delete(channelId);
+    return room ? [...room.entries()].map(([mid, m]) => ({ mid, userId: m.userId })) : [];
   }
 
   /** Drop a user from every channel. Called when their socket closes. */

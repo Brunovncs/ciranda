@@ -14,7 +14,7 @@
     "test": "node --test test/reservation.test.js test/auth.test.js test/accounts.test.js test/channels.test.js test/realtime.test.js test/chat.test.js test/soundpad.test.js test/profile.test.js test/owner.test.js test/signaling.test.js test/dm.test.js test/ink.test.js"
   },
   "dependencies": {
-    "express": "^4.21.2",
+    "express": "^5.2.1",
     "ws": "^8.22.0"
   },
   "license": "MIT"

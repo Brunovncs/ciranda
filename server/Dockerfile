@@ -18,8 +18,13 @@
 #
 # See ../docker/ for compose and run examples.
 
-ARG NODE_VERSION=24-alpine
-ARG ALPINE_VERSION=latest
+# Base images pinned to a release and to its digest (the multi-arch index, so
+# every platform resolves through it): a rebuild of the same commit gets the
+# same Node and the same Alpine, and a retagged image cannot slip in. Bumping
+# them is deliberate -- take the new tag's digest from Docker Hub, or
+#   docker buildx imagetools inspect node:<tag>
+ARG NODE_VERSION=24.22.0-alpine3.24@sha256:44fce696f38ba8c987c4db89954051000bbd05ffd8d8659ba15ed4a8602e937f
+ARG ALPINE_VERSION=3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
 
 # Pinned for the same reason install.sh pins it: MediaMTX removes configuration
 # keys between releases, and an unknown key aborts startup rather than warning.
@@ -37,16 +42,22 @@ ARG MEDIAMTX_VERSION
 ARG TARGETARCH
 ARG TARGETVARIANT
 RUN apk add --no-cache curl tar
+# Each archive's SHA-256, from the release's checksums.sha256, so what runs is
+# what MediaMTX published and not whatever the download returned. They belong to
+# MEDIAMTX_VERSION: change it without them and the build stops here. install.sh
+# pins the same ones.
 RUN set -eu; \
     case "${TARGETARCH}${TARGETVARIANT}" in \
-      amd64)   MTX_ARCH=linux_amd64  ;; \
-      arm64)   MTX_ARCH=linux_arm64  ;; \
-      armv7)   MTX_ARCH=linux_armv7  ;; \
-      armv6)   MTX_ARCH=linux_armv6  ;; \
+      amd64)   MTX_ARCH=linux_amd64  MTX_SHA256=e02e34c3337a35f20ac9e5aa31524566108964e6e37dbc46cf8292169f6c792b ;; \
+      arm64)   MTX_ARCH=linux_arm64  MTX_SHA256=a8113b5928ba1a934b81557b61b8a07954b76921a4b567d54c7f086f8b39d9a2 ;; \
+      armv7)   MTX_ARCH=linux_armv7  MTX_SHA256=b697706a572742665433a77e9403e94e874ae4a3b1144a574875904a332414bc ;; \
+      armv6)   MTX_ARCH=linux_armv6  MTX_SHA256=6884e1f26856a065e57a69f0423a55b79198a4b45b6deeed8661284d3cfb2914 ;; \
       *) echo "unsupported platform: ${TARGETARCH}${TARGETVARIANT}" >&2; exit 1 ;; \
     esac; \
     curl -fsSL -o /tmp/mediamtx.tar.gz \
       "https://github.com/bluenviron/mediamtx/releases/download/v${MEDIAMTX_VERSION}/mediamtx_v${MEDIAMTX_VERSION}_${MTX_ARCH}.tar.gz"; \
+    echo "${MTX_SHA256}  /tmp/mediamtx.tar.gz" | sha256sum -c - \
+      || { echo "mediamtx ${MEDIAMTX_VERSION} ${MTX_ARCH}: checksum mismatch; were the hashes updated with the version?" >&2; exit 1; }; \
     tar -xzf /tmp/mediamtx.tar.gz -C /tmp; \
     install -m 0755 /tmp/mediamtx /mediamtx
 
@@ -123,6 +134,8 @@ ENV HARMONY_HOST=0.0.0.0 \
 EXPOSE 8080/tcp 8889/tcp 8189/udp 8189/tcp
 
 # /api/health is outside the password gate precisely so it can be probed.
+# This only marks the container unhealthy -- nothing restarts it for that -- so
+# the entrypoint runs the same check and exits after the same three failures.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
   CMD wget -qO- "http://127.0.0.1:${HARMONY_PORT}/api/health" | grep -q '"mediamtx":"up"' || exit 1
 

@@ -96,6 +96,24 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 curl -fsSL "$URL" -o "$TMP/$TARBALL"
+# Each archive's SHA-256 from the release's checksums.sha256, so what gets
+# installed as root is what MediaMTX published. They belong to 1.21.0: a
+# MEDIAMTX_VERSION override must bring its own, as MEDIAMTX_SHA256.
+case "${MEDIAMTX_VERSION}/${MTX_ARCH}" in
+  1.21.0/linux_amd64) MTX_SHA256=e02e34c3337a35f20ac9e5aa31524566108964e6e37dbc46cf8292169f6c792b ;;
+  1.21.0/linux_arm64) MTX_SHA256=a8113b5928ba1a934b81557b61b8a07954b76921a4b567d54c7f086f8b39d9a2 ;;
+  1.21.0/linux_armv7) MTX_SHA256=b697706a572742665433a77e9403e94e874ae4a3b1144a574875904a332414bc ;;
+  1.21.0/linux_armv6) MTX_SHA256=6884e1f26856a065e57a69f0423a55b79198a4b45b6deeed8661284d3cfb2914 ;;
+  *) MTX_SHA256="${MEDIAMTX_SHA256:-}" ;;
+esac
+if [[ -z $MTX_SHA256 ]]; then
+  echo "No checksum for MediaMTX ${MEDIAMTX_VERSION} ${MTX_ARCH}: set MEDIAMTX_SHA256 from its release's checksums.sha256" >&2
+  exit 1
+fi
+if ! echo "${MTX_SHA256}  $TMP/$TARBALL" | sha256sum -c --quiet -; then
+  echo "MediaMTX download does not match its checksum; not installing it." >&2
+  exit 1
+fi
 tar -xzf "$TMP/$TARBALL" -C "$TMP"
 install -m 0755 "$TMP/mediamtx" /usr/local/bin/mediamtx
 echo "    $(/usr/local/bin/mediamtx --version 2>&1 | head -n1)"

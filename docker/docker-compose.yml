@@ -70,6 +70,8 @@ services:
 
     # The image ships a health check that asks the control server whether it can
     # see MediaMTX, so an unhealthy container means the two have lost each other.
+    # Compose only shows it; the restart comes from the entrypoint, which asks
+    # the same thing and exits after three failures in a row.
     healthcheck:
       interval: 30s
       timeout: 5s

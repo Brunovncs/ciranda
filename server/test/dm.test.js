@@ -176,7 +176,8 @@ async function send(who, peer, conversationId, extra = {}) {
 }
 
 before(async () => {
-  dataDir = mkdtempSync(resolve(tmpdir(), 'harmony-dm-'));
+  // A dot-folder, as ~/.ciranda is: Express 5 refuses to send a file from one unless told to.
+  dataDir = mkdtempSync(resolve(tmpdir(), '.harmony-dm-'));
   await startFakeMediaMtx();
   await startHarmony();
   for (const nick of ['boss', 'alice', 'bob', 'eve', 'carol']) {
@@ -621,6 +622,9 @@ describe('deleting a conversation for yourself', () => {
     assert.deepEqual(await history('bob'), []);
     assert.deepEqual(await history('eve'), early);
     assert.equal((await listed('eve')).last.id, early.at(-1));
+    // Or a background client would take what it can't see for news, and stay awake for it.
+    assert.ok((await api('/api/inbox', { token: tokens.bob })).body.latest < early.at(-1));
+    assert.equal((await api('/api/inbox', { token: tokens.eve })).body.latest, early.at(-1));
     await Promise.all([b.close(), e.close()]);
   });
 

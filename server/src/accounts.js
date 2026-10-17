@@ -29,6 +29,8 @@ const scrypt = promisify(scryptCb);
  * with.
  */
 const SCRYPT = { N: 16384, r: 8, p: 1, keylen: 32 };
+/** How stale a session's last_seen may get before a request refreshes it. */
+const SESSION_TOUCH_MS = 60 * 60 * 1000;
 
 const NICKNAME_RE = /^[a-z0-9][a-z0-9_-]{1,19}$/;
 
@@ -114,6 +116,9 @@ export async function verifyPassword(password, stored) {
  */
 const tokenHash = (token) => createHash('sha256').update(String(token)).digest('hex');
 
+/** What a session is known by once issued: the token_hash a resolved row carries. */
+export const sessionHash = tokenHash;
+
 export class Accounts {
   #db;
   #q;
@@ -140,7 +145,7 @@ export class Accounts {
         'INSERT INTO sessions (token_hash, user_id, created_at, last_seen) VALUES (?, ?, ?, ?)',
       ),
       findSession: db.prepare(
-        'SELECT u.*, s.token_hash FROM sessions s JOIN users u ON u.id = s.user_id '
+        'SELECT u.*, s.token_hash, s.last_seen AS session_seen FROM sessions s JOIN users u ON u.id = s.user_id '
         + 'WHERE s.token_hash = ?',
       ),
       touchSession: db.prepare('UPDATE sessions SET last_seen = ? WHERE token_hash = ?'),
@@ -226,7 +231,7 @@ export class Accounts {
   async register(nickname, password, { role = 'member' } = {}) {
     const name = normalizeNickname(nickname);
     if (!name) return { ok: false, error: 'invalid_nickname' };
-    if (password == null || String(password).length < 6) {
+    if (typeof password !== 'string' || password.length < 6) {
       return { ok: false, error: 'weak_password' };
     }
     if (this.find(name)) return { ok: false, error: 'nickname_taken' };
@@ -264,7 +269,7 @@ export class Accounts {
   }
 
   async changePassword(userId, password) {
-    if (password == null || String(password).length < 6) {
+    if (typeof password !== 'string' || password.length < 6) {
       return { ok: false, error: 'weak_password' };
     }
     const hash = await hashPassword(password);
@@ -288,7 +293,11 @@ export class Accounts {
     if (!token) return null;
     const row = this.#q.findSession.get(tokenHash(token));
     if (!row) return null;
-    this.#q.touchSession.run(Date.now(), row.token_hash);
+    // Sessions expire after a month idle, so the minute doesn't matter, and
+    // writing it on every request (a background client polls every 15 s)
+    // is a steady stream of writes to the Pi's SD card for nothing.
+    const now = Date.now();
+    if (now - row.session_seen > SESSION_TOUCH_MS) this.#q.touchSession.run(now, row.token_hash);
     return row;
   }
 

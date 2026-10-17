@@ -10,11 +10,14 @@
 import express from 'express';
 import { config, iceServers, signalingBase, whepUrl, whipUrl } from './config.js';
 import { LoginLimiter, secretsMatch } from './auth.js';
+import { Throttle } from './throttle.js';
 import { MediaMtxMonitor } from './mediamtx-api.js';
 import { Rooms, normalizeUsername, normalizePath } from './rooms.js';
 import { ensureDataDir, openDatabase, meta } from './db.js';
 import { ServerSettings } from './server-settings.js';
-import { Accounts, claimOwner, ensureOwnerToken, publicUser } from './accounts.js';
+import {
+  Accounts, claimOwner, ensureOwnerToken, normalizeNickname, publicUser, sessionHash,
+} from './accounts.js';
 import {
   Channels,
   VoiceRooms,
@@ -398,7 +401,10 @@ app.post('/api/accounts/register', async (req, res) => {
 });
 
 app.post('/api/accounts/login', async (req, res) => {
-  const nickname = String(req.body?.nickname ?? '').trim().toLowerCase();
+  // The account's own name is the key, as `verify` finds it: keyed on the text
+  // as typed, "b ob" and "bo b" would each get fresh tries at bob. Names that
+  // can't be an account share one key, so they can't grow the limiter either.
+  const nickname = normalizeNickname(req.body?.nickname) ?? '';
   const gate = loginLimiter.check(nickname);
   if (!gate.allowed) {
     res.set('Retry-After', String(gate.retryAfterSec));
@@ -444,7 +450,12 @@ app.post('/api/accounts/login', async (req, res) => {
 });
 
 app.post('/api/accounts/logout', (req, res) => {
-  if (req.sessionToken) accounts.endSession(req.sessionToken);
+  if (req.sessionToken) {
+    accounts.endSession(req.sessionToken);
+    // Its sockets too: they authenticated once, at hello, and would go on
+    // receiving private messages for a token that no longer exists.
+    realtime?.closeSession(sessionHash(req.sessionToken));
+  }
   res.json({ ok: true });
 });
 
@@ -462,7 +473,13 @@ app.post('/api/accounts/password', requireLogin, async (req, res) => {
     return res.status(400).json({ error: result.error, message: 'Use at least 6 characters.' });
   }
   // changePassword drops every session for this account, including this one.
-  return res.json({ ok: true, token: accounts.startSession(req.user.id) });
+  // Every socket goes with them -- a stolen session's above all -- except the
+  // ones this session opened, which carry on under the session issued here.
+  const token = accounts.startSession(req.user.id);
+  realtime?.closeOtherSessions(req.user.id, {
+    keep: sessionHash(req.sessionToken), renamed: sessionHash(token),
+  });
+  return res.json({ ok: true, token });
 });
 
 /**
@@ -476,7 +493,10 @@ app.post('/api/accounts/password', requireLogin, async (req, res) => {
  * The reference juggling is the part that matters. An avatar nobody references
  * is an orphan the moment the next upload needs room, so the new file is
  * retained BEFORE the old one is released -- re-setting the same picture must
- * not momentarily drop it to zero.
+ * not momentarily drop it to zero. And the old one is ALWAYS released, the
+ * same picture included: that took a second reference a moment ago, so the
+ * count comes out at one, where skipping it gained one per re-set and the file
+ * could never be evicted.
  */
 app.post('/api/accounts/avatar', requireLogin, (req, res) => {
   const hash = req.body?.hash == null ? null : String(req.body.hash);
@@ -505,8 +525,11 @@ app.post('/api/accounts/avatar', requireLogin, (req, res) => {
   }
 
   const result = accounts.setAvatar(req.user.id, hash);
-  if (!result.ok) return res.status(404).json({ error: result.error });
-  if (result.previous && result.previous !== hash) chat.release(result.previous);
+  if (!result.ok) {
+    if (hash !== null) chat.release(hash);
+    return res.status(404).json({ error: result.error });
+  }
+  if (result.previous) chat.release(result.previous);
 
   const user = publicUser(result.user);
   // Everyone draws everyone else's picture, so everyone needs to know.
@@ -746,8 +769,16 @@ function sendServerIcon(res, hash, notFound, cache = 'public, max-age=31536000, 
   res.set('X-Content-Type-Options', 'nosniff');
   res.set('Content-Security-Policy', "default-src 'none'; sandbox");
   res.set('Cache-Control', cache);
-  return res.sendFile(info.path);
+  return res.sendFile(info.path, STORED_FILE);
 }
+
+/*
+ * res.sendFile's options for a stored file. The path is built from a checked
+ * hash, never from the request, so a dot anywhere in it is the data
+ * directory's -- ~/.ciranda, say. Express 5 refuses ("ignore": a 404) a path
+ * with a dot-folder anywhere in it unless told otherwise.
+ */
+const STORED_FILE = { dotfiles: 'allow' };
 
 /**
  * How much of the upload quota is used. The upload replies carry this too,
@@ -1019,8 +1050,15 @@ app.post('/api/channels/:id/delete', requireAdmin, (req, res) => {
   const id = Number.parseInt(req.params.id, 10);
   const result = channels.remove(id);
   if (!result.ok) return res.status(404).json({ error: result.error });
-  // Anyone sitting in it has nowhere to be any more.
-  for (const { channelId } of voice.leaveAll(-1)) void channelId;
+  // Anyone sitting in it has nowhere to be any more. Left in the room, they'd
+  // keep getting media tokens for it, and a new channel can be given the same
+  // id: they'd be in that one, password or not.
+  for (const { mid, userId } of voice.closeRoom(id)) {
+    realtime?.toUser(userId, { type: 'voice:moved', channelId: null, by: req.user.nickname });
+    monitor.kickPath(channelPath(id, mid, 'voice')).catch(() => {});
+  }
+  // An empty roster, so nobody is still shown in a channel that's gone.
+  realtime?.broadcastRoster(id);
   realtime?.broadcastChannels();
   return res.json({ ok: true });
 });
@@ -1124,6 +1162,11 @@ app.post('/api/channels/:id/messages', requireLogin, (req, res) => {
 
 app.post('/api/messages/:id/pin', requireLogin, (req, res) => {
   const id = Number.parseInt(req.params.id, 10);
+  // Pinning hands back the whole message: only for those who may read it.
+  const existing = chat.get(id);
+  if (!existing || !readableChannel(req, existing.channel_id)) {
+    return res.status(404).json({ error: 'no_such_message' });
+  }
   const result = chat.setPinned(id, req.body?.pinned !== false);
   if (!result.ok) return res.status(404).json({ error: result.error });
   const message = oneForClient(result.message);
@@ -1289,48 +1332,94 @@ app.get('/api/channels/:id/search', requireLogin, (req, res) => {
 });
 
 /**
- * Upload a file.
- *
- * express.raw rather than the global express.json: that parser is
- * content-type gated, so an image/png body passes straight through it
- * untouched and arrives here unparsed. Verified -- the 16 kb JSON limit does
- * NOT apply to this route and does not need reordering.
+ * Uploads per person: a burst for somebody adding a set of emoji or a few
+ * screenshots, then one every five seconds. Each can be 25 MB written to an
+ * SD card, and the quota only stops the disk filling, not the churn.
  */
-app.post(
-  '/api/uploads',
-  requireLogin,
-  express.raw({ type: allowedTypes(), limit: MAX_UPLOAD_BYTES }),
-  (req, res) => {
-    if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
-      return res.status(400).json({
-        error: 'empty_file',
-        message: `Send the file as a raw body with one of: ${allowedTypes().join(', ')}`,
-      });
-    }
+const uploadThrottle = new Throttle({ burst: 20, perSecond: 0.2 });
 
-    const result = chat.store(req.body, req.get('content-type')?.split(';')[0]?.trim());
-    if (!result.ok) {
-      const messages = {
-        type_not_allowed: `Allowed types: ${allowedTypes().join(', ')}`,
-        file_too_large: `Files are limited to ${Math.round(MAX_UPLOAD_BYTES / 1024 / 1024)} MB.`,
-        server_full: 'The server has run out of space for uploads.',
-      };
-      return res.status(result.error === 'server_full' ? 507 : 400).json({
-        error: result.error,
-        message: messages[result.error] ?? 'Upload refused.',
-      });
-    }
+/**
+ * Upload a file: the raw bytes as the body, its type as Content-Type.
+ *
+ * Read as a stream into a file rather than through express.raw, which held
+ * the whole body in memory and left hashing and writing it to a synchronous
+ * call -- 25 MB of both with every other request waiting. See Chat.receive.
+ * The global JSON parser is content-type gated, so these bodies pass through
+ * it untouched.
+ *
+ * A type off the allowlist is refused unread as `empty_file`, which is what
+ * express.raw's type filter used to make of it.
+ */
+app.post('/api/uploads', requireLogin, async (req, res) => {
+  // A refusal before the body is all read hangs up after answering. Node
+  // would otherwise read the rest to throw it away, and a body sent in
+  // chunks has no length to stop at.
+  const unread = () => { if (!req.complete) res.set('Connection', 'close'); };
+  const refuse = (status, body) => {
+    unread();
+    return res.status(status).json(body);
+  };
+  const tooLarge = () => refuse(413, {
+    error: 'file_too_large',
+    message: `Files are limited to ${Math.round(MAX_UPLOAD_BYTES / 1024 / 1024)} MB.`,
+  });
 
-    return res.status(201).json({
-      hash: result.upload.hash,
-      contentType: result.upload.content_type,
-      bytes: result.upload.bytes,
-      deduplicated: result.deduplicated,
-      usedBytes: chat.usedBytes,
-      quotaBytes: chat.quotaBytes,
+  const gate = uploadThrottle.take(req.user.id);
+  if (!gate.allowed) {
+    res.set('Retry-After', String(gate.retryAfterSec));
+    return refuse(429, {
+      error: 'slow_down',
+      retryAfterSec: gate.retryAfterSec,
+      message: 'Too many uploads at once. Wait a moment and try again.',
     });
-  },
-);
+  }
+
+  const type = req.get('content-type')?.split(';')[0]?.trim().toLowerCase();
+  if (!mediaTypeOf(type)) {
+    return refuse(400, {
+      error: 'empty_file',
+      message: `Send the file as a raw body with one of: ${allowedTypes().join(', ')}`,
+    });
+  }
+  // Stored as it arrives, so a compressed body would be stored compressed.
+  // No client sends one.
+  if ((req.get('content-encoding') ?? 'identity').toLowerCase() !== 'identity') {
+    return refuse(415, { error: 'unsupported_encoding', message: 'Send the file uncompressed.' });
+  }
+  // Said up front by every client that knows the size, so it is refused
+  // before a byte is read.
+  if (Number(req.get('content-length')) > MAX_UPLOAD_BYTES) return tooLarge();
+
+  let result;
+  try {
+    result = await chat.receive(req, type);
+  } catch (err) {
+    unread();
+    throw err;
+  }
+  if (!result.ok) {
+    if (result.error === 'aborted') return undefined;
+    if (result.error === 'file_too_large') return tooLarge();
+    const messages = {
+      empty_file: `Send the file as a raw body with one of: ${allowedTypes().join(', ')}`,
+      type_not_allowed: `Allowed types: ${allowedTypes().join(', ')}`,
+      server_full: 'The server has run out of space for uploads.',
+    };
+    return res.status(result.error === 'server_full' ? 507 : 400).json({
+      error: result.error,
+      message: messages[result.error] ?? 'Upload refused.',
+    });
+  }
+
+  return res.status(201).json({
+    hash: result.upload.hash,
+    contentType: result.upload.content_type,
+    bytes: result.upload.bytes,
+    deduplicated: result.deduplicated,
+    usedBytes: chat.usedBytes,
+    quotaBytes: chat.quotaBytes,
+  });
+});
 
 /**
  * Serve a stored file.
@@ -1368,7 +1457,7 @@ function sendUpload(req, res, { scope = 'public' } = {}) {
   res.set('Content-Security-Policy', "default-src 'none'; sandbox");
   // Content-addressed, so it can never change: cache it forever.
   res.set('Cache-Control', `${scope}, max-age=31536000, immutable`);
-  return res.sendFile(info.path);
+  return res.sendFile(info.path, STORED_FILE);
 }
 
 // ---------------------------------------------------------------------------
@@ -1710,9 +1799,28 @@ const sessionSweeper = setInterval(
 );
 sessionSweeper.unref();
 
+// What a handler threw or rejected with: logged, and a plain 500 rather than
+// Express's HTML page with a stack trace in it. Express 5 brings an async
+// handler's rejection here too; on 4 it was an unhandled rejection, and Node
+// ends the process on one.
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+  // The body parser's own refusals (too large, not JSON) keep their status.
+  if (err?.status >= 400 && err.status < 500) return res.status(err.status).json({ error: err.type ?? 'bad_request' });
+  console.warn(`[http] ${req.method} ${req.path} failed: ${err?.stack ?? err}`);
+  return res.status(500).json({ error: 'server_error' });
+});
+
 let realtime = null;
 
-const server = app.listen(config.port, config.host, () => {
+const server = app.listen(config.port, config.host, (err) => {
+  // Express 5 hands a failure to listen (the port taken, say) to this
+  // callback instead of throwing it. Carrying on would leave a process that
+  // looks up and answers nothing.
+  if (err) {
+    console.error(`[harmony] cannot listen on ${config.host}:${config.port}: ${err.message}`);
+    process.exit(1);
+  }
   console.log(`[harmony] control server on http://${config.host}:${config.port}`);
   console.log(config.signaling.auto
     ? `[harmony] clients will be sent to the host they connect to, as ${config.signalingBase.replace('localhost', '<host>')}`

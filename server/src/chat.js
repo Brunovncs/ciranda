@@ -7,9 +7,14 @@
 // quota checked before anything is written. The reference host is a Pi with an
 // SD card.
 
-import { createHash } from 'node:crypto';
-import { mkdirSync, writeFileSync, renameSync, unlinkSync, statSync } from 'node:fs';
+import { createHash, randomBytes } from 'node:crypto';
+import {
+  createWriteStream, mkdirSync, writeFileSync, renameSync, rmSync, unlinkSync, statSync,
+} from 'node:fs';
+import { unlink } from 'node:fs/promises';
 import { join } from 'node:path';
+import { Transform } from 'node:stream';
+import { finished } from 'node:stream/promises';
 
 /**
  * What may be uploaded, and what it is called in search.
@@ -165,10 +170,18 @@ export function mentionsIn(body, idOf) {
   return { userIds, everyone };
 }
 
+/** A stored file's name as a request may carry it: a sha256 in hex, or nothing. */
+const isHash = (value) => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
+
 export class Chat {
   #db;
   #dir;
+  #incoming;
   #maxBytes;
+  /** SUM(bytes) over uploads, kept here: only this class adds or deletes a row. */
+  #used = 0;
+  /** Bytes reserved by uploads still arriving. */
+  #arriving = 0;
   #q;
 
   constructor(db, { dataDir, maxDiskBytes }) {
@@ -176,6 +189,12 @@ export class Chat {
     this.#dir = join(dataDir, 'uploads');
     this.#maxBytes = maxDiskBytes;
     mkdirSync(this.#dir, { recursive: true });
+    // Files still arriving. Inside uploads/ so moving one into place is a
+    // rename on the same filesystem; anything here at startup is an upload
+    // the last run never finished.
+    this.#incoming = join(this.#dir, 'incoming');
+    rmSync(this.#incoming, { recursive: true, force: true });
+    mkdirSync(this.#incoming, { recursive: true });
 
     this.#q = {
       insertMessage: db.prepare(
@@ -215,7 +234,7 @@ export class Chat {
       pinned: db.prepare(`
         SELECT m.*, u.nickname FROM messages m JOIN users u ON u.id = m.user_id
         WHERE m.channel_id = ? AND m.pinned = 1
-        ORDER BY m.id DESC
+        ORDER BY m.id DESC LIMIT 50
       `),
       setPinned: db.prepare('UPDATE messages SET pinned = ? WHERE id = ?'),
 
@@ -229,7 +248,8 @@ export class Chat {
       searchLike: db.prepare(`
         SELECT m.*, u.nickname FROM messages m JOIN users u ON u.id = m.user_id
         WHERE m.channel_id = ?
-          AND (m.body LIKE ? OR u.nickname LIKE ? OR IFNULL(m.media_type, '') LIKE ?)
+          AND (m.body LIKE ? ESCAPE '\\' OR u.nickname LIKE ? ESCAPE '\\'
+            OR IFNULL(m.media_type, '') LIKE ? ESCAPE '\\')
         ORDER BY m.id DESC LIMIT ?
       `),
 
@@ -249,15 +269,16 @@ export class Chat {
       addRef: db.prepare('UPDATE uploads SET refs = refs + 1 WHERE hash = ?'),
       dropRef: db.prepare('UPDATE uploads SET refs = MAX(0, refs - 1) WHERE hash = ?'),
       totalBytes: db.prepare('SELECT COALESCE(SUM(bytes), 0) AS n FROM uploads'),
-      orphans: db.prepare('SELECT hash FROM uploads WHERE refs <= 0 ORDER BY created_at LIMIT 200'),
+      orphans: db.prepare('SELECT hash, bytes FROM uploads WHERE refs <= 0 ORDER BY created_at LIMIT 200'),
       deleteUpload: db.prepare('DELETE FROM uploads WHERE hash = ?'),
     };
+    this.#used = this.#q.totalBytes.get().n;
   }
 
   // ----------------------------------------------------------------- files
 
   get usedBytes() {
-    return this.#q.totalBytes.get().n;
+    return this.#used;
   }
 
   get quotaBytes() {
@@ -287,9 +308,122 @@ export class Chat {
     if (buffer.length > (sealed ? MAX_SEALED_BYTES : MAX_UPLOAD_BYTES)) {
       return { ok: false, error: 'file_too_large' };
     }
-    const type = sealed ? SEALED_TYPE : String(contentType).toLowerCase();
 
     const hash = createHash('sha256').update(buffer).digest('hex');
+    const refused = this.#admit(hash, buffer.length, sealed);
+    if (refused) return refused;
+
+    // Write then rename, so a crash mid-write cannot leave a truncated file
+    // sitting at the name its hash promises.
+    const temp = join(this.#incoming, randomBytes(12).toString('hex'));
+    writeFileSync(temp, buffer);
+    return this.#keep(temp, hash, buffer.length, sealed ? SEALED_TYPE : contentType);
+  }
+
+  /**
+   * store(), for a file still arriving: `source` is a readable stream, the
+   * request itself. The bytes go to a file in uploads/incoming as they come
+   * and the hash is taken on the way past, so neither 25 MB in memory nor a
+   * synchronous write to the SD card holds up everybody else in the meantime.
+   *
+   * A file over the cap is refused the moment it gets there, not once it has
+   * all been read. `source` is never destroyed: whoever passed it still has
+   * an answer to give on the same connection.
+   *
+   * The quota is checked once the size is known, before the file is moved
+   * into place. Until then it costs at most the per-file cap on disk, and
+   * only while it arrives.
+   *
+   * @returns {Promise<{ok: true, upload: object, deduplicated: boolean}
+   *   | {ok: false, error: string}>} `aborted` when the sender went away.
+   */
+  async receive(source, contentType, { sealed = false } = {}) {
+    if (!sealed && !mediaTypeOf(contentType)) return { ok: false, error: 'type_not_allowed' };
+    const limit = sealed ? MAX_SEALED_BYTES : MAX_UPLOAD_BYTES;
+    // What's still arriving counts against the room left, at the size it says
+    // it is (or the cap): twenty uploads at once would otherwise fill the disk
+    // with files the quota never saw, and a full disk stops SQLite too.
+    const declared = Number(source.headers?.['content-length']);
+    const reserved = Number.isFinite(declared) && declared > 0 && declared <= limit ? declared : limit;
+    if (this.#used + this.#arriving + reserved > this.#maxBytes) {
+      this.#evictOrphans(reserved);
+      if (this.#used + this.#arriving + reserved > this.#maxBytes) return { ok: false, error: 'server_full' };
+    }
+    this.#arriving += reserved;
+    try {
+      return await this.#receive(source, contentType, sealed, limit);
+    } finally {
+      this.#arriving -= reserved;
+    }
+  }
+
+  async #receive(source, contentType, sealed, limit) {
+    const temp = join(this.#incoming, randomBytes(12).toString('hex'));
+    const digest = createHash('sha256');
+    let bytes = 0;
+    let refusal = null;
+
+    const meter = new Transform({
+      transform(chunk, _encoding, done) {
+        bytes += chunk.length;
+        if (bytes > limit) {
+          refusal = 'file_too_large';
+          return done(new Error(refusal));
+        }
+        digest.update(chunk);
+        return done(null, chunk);
+      },
+    });
+    const file = createWriteStream(temp);
+    meter.pipe(file);
+    meter.on('error', (err) => file.destroy(err));
+    // An ordinary pipe rather than stream.pipeline, which would destroy the
+    // request -- and the socket with it -- on the first refusal.
+    const gone = () => {
+      if (!source.readableEnded) {
+        refusal ??= 'aborted';
+        meter.destroy(new Error(refusal));
+      }
+    };
+    source.on('error', gone);
+    source.on('close', gone);
+    source.pipe(meter);
+
+    try {
+      await finished(file);
+    } catch (err) {
+      await unlink(temp).catch(() => {});
+      if (refusal) {
+        source.unpipe(meter);
+        return { ok: false, error: refusal };
+      }
+      throw err;
+    } finally {
+      source.off('error', gone);
+      source.off('close', gone);
+    }
+
+    if (bytes === 0) {
+      await unlink(temp).catch(() => {});
+      return { ok: false, error: 'empty_file' };
+    }
+    // From here to the row being written is synchronous on purpose, so two
+    // uploads finishing together cannot both be let into the last of the quota.
+    const hash = digest.digest('hex');
+    const refused = this.#admit(hash, bytes, sealed);
+    if (refused) {
+      await unlink(temp).catch(() => {});
+      return refused;
+    }
+    return this.#keep(temp, hash, bytes, sealed ? SEALED_TYPE : contentType);
+  }
+
+  /**
+   * Why a file with this hash and size is not stored afresh: it already is
+   * (which is a success), it is stored as the other kind, or there is no room.
+   * Null when it should be.
+   */
+  #admit(hash, bytes, sealed) {
     const existing = this.#q.upload.get(hash);
     // A hash already stored as the other kind is refused rather than shared:
     // a sealed row must never be readable through the public route, nor a
@@ -300,25 +434,24 @@ export class Chat {
     }
     if (existing) return { ok: true, upload: existing, deduplicated: true };
 
-    // Checked BEFORE writing, and it is not only about uploads: once the
-    // filesystem is full every SQLite write throws too, so an unbounded
+    // Checked BEFORE the file is kept, and it is not only about uploads: once
+    // the filesystem is full every SQLite write throws too, so an unbounded
     // uploads directory does not degrade the server, it stops it.
-    if (this.usedBytes + buffer.length > this.#maxBytes) {
-      this.#evictOrphans(buffer.length);
-      if (this.usedBytes + buffer.length > this.#maxBytes) {
-        return { ok: false, error: 'server_full' };
-      }
+    if (this.#used + bytes > this.#maxBytes) {
+      this.#evictOrphans(bytes);
+      if (this.#used + bytes > this.#maxBytes) return { ok: false, error: 'server_full' };
     }
+    return null;
+  }
 
+  /** Move a finished file from incoming/ to the name its hash promises, and record it. */
+  #keep(temp, hash, bytes, contentType) {
     const target = this.pathFor(hash);
     mkdirSync(join(target, '..'), { recursive: true });
-    // Write then rename, so a crash mid-write cannot leave a truncated file
-    // sitting at the name its hash promises.
-    const temp = `${target}.part`;
-    writeFileSync(temp, buffer);
     renameSync(temp, target);
-
-    this.#q.insertUpload.run(hash, type, buffer.length, Date.now());
+    if (this.#q.insertUpload.run(hash, String(contentType).toLowerCase(), bytes, Date.now()).changes) {
+      this.#used += bytes;
+    }
     return { ok: true, upload: this.#q.upload.get(hash), deduplicated: false };
   }
 
@@ -329,12 +462,12 @@ export class Chat {
 
   /** Delete unreferenced files until there is room, oldest first. */
   #evictOrphans(needed) {
-    for (const { hash } of this.#q.orphans.all()) {
+    for (const { hash, bytes } of this.#q.orphans.all()) {
       try {
         unlinkSync(this.pathFor(hash));
       } catch { /* already gone; drop the row anyway */ }
-      this.#q.deleteUpload.run(hash);
-      if (this.usedBytes + needed <= this.#maxBytes) return;
+      if (this.#q.deleteUpload.run(hash).changes) this.#used -= bytes;
+      if (this.#used + needed <= this.#maxBytes) return;
     }
   }
 
@@ -406,7 +539,7 @@ export class Chat {
 
     let mediaType = null;
     if (attachmentHash) {
-      const upload = this.#q.upload.get(attachmentHash);
+      const upload = isHash(attachmentHash) ? this.#q.upload.get(attachmentHash) : null;
       // A conversation's sealed file is not a channel's to show.
       if (!upload || upload.content_type === SEALED_TYPE) return { ok: false, error: 'no_such_upload' };
       mediaType = mediaTypeOf(upload.content_type);
@@ -619,7 +752,7 @@ export class Chat {
 
     let mediaType = null;
     if (hash) {
-      const upload = this.#q.upload.get(hash);
+      const upload = isHash(hash) ? this.#q.upload.get(hash) : null;
       if (!upload || upload.content_type === SEALED_TYPE) return { ok: false, error: 'no_such_upload' };
       mediaType = mediaTypeOf(upload.content_type);
     } else if (!message.body.trim()) {
@@ -680,7 +813,8 @@ export class Chat {
     if (!text) return { mode: 'none', results: [] };
 
     if (text.length < 3) {
-      const like = `%${text.replaceAll('%', '\\%').replaceAll('_', '\\_')}%`;
+      // SQLite's LIKE has no escape character unless the query names one.
+      const like = `%${text.replace(/[\\%_]/g, '\\$&')}%`;
       return {
         mode: 'like',
         results: this.#q.searchLike.all(channelId, like, like, like, Math.min(limit, PAGE_SIZE)),
@@ -780,7 +914,8 @@ export class Soundpad {
     const clean = String(name ?? '').trim().slice(0, 32);
     if (!clean) return { ok: false, error: 'invalid_name' };
 
-    const upload = this.#q.upload.get(fileHash);
+    // A missing hash cannot even be bound to the query: node:sqlite throws.
+    const upload = isHash(fileHash) ? this.#q.upload.get(fileHash) : null;
     if (!upload) return { ok: false, error: 'no_such_upload' };
     if (mediaTypeOf(upload.content_type) !== 'audio') {
       return { ok: false, error: 'not_audio' };
@@ -921,7 +1056,7 @@ export class Emojis {
     if (this.#q.byName.get(clean)) return { ok: false, error: 'name_taken' };
     if (this.#q.count.get().n >= MAX_EMOJIS) return { ok: false, error: 'too_many_emojis' };
 
-    const upload = this.#q.upload.get(fileHash);
+    const upload = isHash(fileHash) ? this.#q.upload.get(fileHash) : null;
     if (!upload) return { ok: false, error: 'no_such_upload' };
     if (mediaTypeOf(upload.content_type) !== 'image') return { ok: false, error: 'not_an_image' };
     // Against the stored row, not the request: the upload may be one
