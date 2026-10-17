@@ -1,8 +1,9 @@
 name: CI
 
 # Every push and pull request: the server's tests on Linux, where it is deployed, and the
-# client's on Windows, the one platform it builds for. Nothing is built for release or
-# published; that is release.yml, on a tag.
+# client's on Windows, the one platform it builds for. Nothing is published; that is
+# release.yml, on a tag. On main the client is also built for release, only to keep a
+# release-profile cache warm for the next tag (see release-cache below).
 on:
   push:
   pull_request:
@@ -23,9 +24,9 @@ jobs:
       run:
         working-directory: server
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       # 24, as install.sh installs: the database is node:sqlite, unflagged only from 22.13.
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 24
           cache: npm
@@ -41,9 +42,51 @@ jobs:
       run:
         working-directory: client
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      # Not saved from a tag: a cache saved under a tag can only ever be restored by that tag.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: client
-      - run: cargo test
+          # v1: caches saved before the libwebrtc download was pinned may hold an unverified copy,
+          # which the build would take as already extracted.
+          prefix-key: v1-rust
+          save-if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+      - run: cargo test --locked
+      # The program itself, started headless: the dependencies are the ones the tests just
+      # built, so this costs one more compile of the crate and a link.
+      - run: cargo build --locked
+      - name: Self-test
+        timeout-minutes: 5
+        run: ./target/debug/ciranda.exe --self-test
+
+  # A tag cannot restore a cache saved by another tag, and main's from the job above is for
+  # the dev profile, so every release used to build all its dependencies from nothing. Caches
+  # saved on the default branch can be restored from any ref, tags included, so main builds
+  # for release here under the key release.yml restores (shared-key: release). With the cache
+  # already current this is one compile of the crate; it is cold only when Cargo.lock or the
+  # toolchain moves. The tests are built in the same profile because release.yml runs them
+  # with --release, so one cache serves both.
+  release-cache:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: client
+          # v1: caches saved before the libwebrtc download was pinned may hold an unverified copy,
+          # which the build would take as already extracted.
+          prefix-key: v1-rust
+          shared-key: release
+      - run: cargo test --release --locked --no-run
+      - run: cargo build --release --locked

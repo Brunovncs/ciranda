@@ -10,8 +10,10 @@ on:
   push:
     tags: ["v*"]
 
+# Only the publishing job may write; the build runs third-party actions and every crate's
+# build script, so it gets a read-only token. Actions are pinned to commits for the same reason.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   version:
@@ -19,7 +21,7 @@ jobs:
     outputs:
       version: ${{ steps.check.outputs.version }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: Check the tag against client/Cargo.toml
         id: check
         run: |
@@ -36,15 +38,37 @@ jobs:
       run:
         working-directory: client
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      # Restores the release-profile cache ci.yml's release-cache job keeps on main; one saved
+      # under a tag could only ever be restored by that tag, so nothing is saved here.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: client
+          # v1: caches saved before the libwebrtc download was pinned may hold an unverified copy,
+          # which the build would take as already extracted.
+          prefix-key: v1-rust
+          shared-key: release
+          save-if: false
+      # In the release profile, so they share every dependency with the build below and the
+      # one cache. CI has already run them in the dev profile, debug assertions on.
       - name: Tests
-        run: cargo test
+        run: cargo test --release --locked
       - name: Build
-        run: cargo build --release
+        run: cargo build --release --locked
+      # The exe about to be published, started headless (see self_test in src/main.rs). It is a
+      # GUI program in release, which PowerShell neither waits for nor shows the output of when
+      # started directly; Start-Process waits, and the output goes through files.
+      - name: Self-test
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          $p = Start-Process target\release\ciranda.exe -ArgumentList '--self-test' -NoNewWindow -Wait -PassThru `
+            -RedirectStandardOutput self-test.out -RedirectStandardError self-test.err
+          Get-Content self-test.out, self-test.err
+          if ($p.ExitCode -ne 0) { throw "self-test failed with exit code $($p.ExitCode)" }
       - name: Package
         shell: pwsh
         run: |
@@ -62,7 +86,7 @@ jobs:
           # Not ending in -windows-x64.exe, which is how every updater since 4.0.0 finds the program.
           $setup = "ciranda-${{ needs.version.outputs.version }}-windows-x64-setup.exe"
           (Get-FileHash "..\dist\$setup" -Algorithm SHA256).Hash.ToLower() + "  $setup" | Out-File -Encoding ascii "..\dist\$setup.sha256"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: windows
           path: dist/*
@@ -70,9 +94,11 @@ jobs:
   publish:
     needs: [version, windows]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
           merge-multiple: true
