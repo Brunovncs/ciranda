@@ -1,8 +1,14 @@
 //! Whether a newer Ciranda is out, asked of GitHub's API, and putting it in place of the running
 //! copy. A release carries `ciranda-<version>-windows-x64.exe` and that file's SHA-256; the new
 //! program is downloaded next to the running one, checked, and swapped in: Windows lets a running
-//! program be renamed though not overwritten, so the running copy steps aside to `ciranda.exe.old`
-//! and the next start deletes it.
+//! program be renamed though not overwritten, so the running copy steps aside to `ciranda.exe.old`.
+//!
+//! That copy is the way back if the new version is broken, so it stays until the new one has
+//! proved itself (see `Start`): a version that keeps dying as it starts is put back by its own
+//! next start, which is the only code that runs by then. The proof is a file beside the program,
+//! `ciranda.exe.trial`, counting the starts of the new version that ended without it: each start
+//! adds one, and running a minute or quitting properly sets it back. Two starts in a row that
+//! did neither are taken for a build that crashes, and the third puts `.old` back.
 
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
@@ -159,7 +165,8 @@ pub async fn download(r: &Release, to: &Path, mut progress: impl FnMut(f32)) -> 
     result
 }
 
-/// Puts `new` where `exe` is, keeping the running copy as `.old` until the next start.
+/// Puts `new` where `exe` is, keeping the running copy as `.old` until the new version has
+/// proved itself. Its trial starts over: the next start is its first.
 pub fn swap(exe: &Path, new: &Path) -> Result<(), String> {
     let old = beside(exe, "old");
     let _ = std::fs::remove_file(&old);
@@ -168,6 +175,7 @@ pub fn swap(exe: &Path, new: &Path) -> Result<(), String> {
         let _ = std::fs::rename(&old, exe);
         return Err(format!("{}: {e}", exe.display()));
     }
+    let _ = std::fs::remove_file(beside(exe, "trial"));
     Ok(())
 }
 
@@ -183,21 +191,118 @@ pub fn relaunch(exe: &Path) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// Deletes what an update left beside the program; true when the copy it replaced was there,
-/// which means this start is the first after an update. The old copy may take a moment to exit.
-pub fn clean_up(exe: &Path) -> bool {
+/// Starts of a new version in a row that may end without it running `HEALTHY_AFTER` or quitting
+/// properly; the one after puts the previous version back. Two, so one crash of a working build
+/// (or the power going) never undoes an update.
+const FAILED_STARTS: u32 = 2;
+/// How long a new version runs, its window up, before it is trusted and its previous copy goes.
+/// A build that dies as it starts does so well within it.
+pub const HEALTHY_AFTER: Duration = Duration::from_secs(60);
+
+/// What this start makes of an update left beside the program.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Start {
+    /// No update on trial.
+    Plain,
+    /// The first start of a new version: its previous copy stays until it proves itself.
+    Updated,
+    /// A later start of a new version that has not proved itself yet.
+    Trial,
+    /// The new version started `FAILED_STARTS` times in a row and died each time: the previous
+    /// one goes back.
+    RollBack,
+}
+
+impl Start {
+    /// The new version still has to prove itself during this run.
+    pub fn on_trial(self) -> bool {
+        matches!(self, Start::Updated | Start::Trial)
+    }
+}
+
+/// The decision, from whether the previous copy is there and the trial file's count (none when
+/// there is no file).
+fn decide(old_exists: bool, failed: Option<u32>) -> Start {
+    match (old_exists, failed) {
+        (false, _) => Start::Plain,
+        (true, None) => Start::Updated,
+        (true, Some(n)) if n >= FAILED_STARTS => Start::RollBack,
+        (true, Some(_)) => Start::Trial,
+    }
+}
+
+/// Reads the trial and counts this start in it. Reading and writing a tiny file, it is meant
+/// for the very start, before anything that could crash; `start` runs it once per process.
+fn begin(exe: &Path) -> Start {
     let _ = std::fs::remove_file(beside(exe, "new"));
-    let old = beside(exe, "old");
-    for _ in 0..20 {
-        if !old.exists() {
-            return false;
+    let trial = beside(exe, "trial");
+    // An unreadable count is taken as a start that went fine rather than as a reason to undo.
+    let failed = std::fs::read_to_string(&trial).ok().map(|s| s.trim().parse::<u32>().unwrap_or(0));
+    let start = decide(beside(exe, "old").exists(), failed);
+    match start {
+        Start::Plain => {
+            let _ = std::fs::remove_file(&trial);
         }
-        if std::fs::remove_file(&old).is_ok() {
-            return true;
+        Start::Updated | Start::Trial => {
+            if let Err(e) = std::fs::write(&trial, (failed.unwrap_or(0) + 1).to_string()) {
+                log::warn!("the update's trial could not be counted: {e}");
+            }
+        }
+        Start::RollBack => {}
+    }
+    start
+}
+
+/// What this start makes of an update, decided the first time it is asked and the same after;
+/// so main can ask before anything else runs, and the updater again later.
+pub fn start(exe: &Path) -> Start {
+    static START: std::sync::OnceLock<Start> = std::sync::OnceLock::new();
+    *START.get_or_init(|| begin(exe))
+}
+
+/// Puts the previous version back where `exe` is. The broken one goes to `.new`, which every
+/// version deletes as it starts, the ones from before trials included.
+fn put_back(exe: &Path) -> Result<(), String> {
+    let (old, bad) = (beside(exe, "old"), beside(exe, "new"));
+    let _ = std::fs::remove_file(&bad);
+    std::fs::rename(exe, &bad).map_err(|e| format!("{}: {e}", exe.display()))?;
+    if let Err(e) = std::fs::rename(&old, exe) {
+        let _ = std::fs::rename(&bad, exe);
+        return Err(format!("{}: {e}", old.display()));
+    }
+    let _ = std::fs::remove_file(beside(exe, "trial"));
+    Ok(())
+}
+
+/// Puts the previous version back and starts it; the caller exits right after.
+pub fn roll_back(exe: &Path) -> Result<(), String> {
+    put_back(exe)?;
+    relaunch(exe)
+}
+
+/// The new version quit properly before proving itself: whatever ends its starts, it is not a
+/// crash, so the count starts over. Nothing to do when an update since has begun a new trial.
+pub fn survived(exe: &Path) {
+    let trial = beside(exe, "trial");
+    if trial.exists() {
+        let _ = std::fs::write(&trial, "0");
+    }
+}
+
+/// The new version has run long enough to be trusted: deletes the previous copy and the trial.
+/// Should the copy stay (a scanner holding it, say), the trial stays too, at nought, so the next
+/// start tries again without taking itself for the first after an update.
+pub fn settle(exe: &Path) {
+    let (old, trial) = (beside(exe, "old"), beside(exe, "trial"));
+    for _ in 0..20 {
+        if !old.exists() || std::fs::remove_file(&old).is_ok() {
+            let _ = std::fs::remove_file(&trial);
+            return;
         }
         std::thread::sleep(Duration::from_millis(500));
     }
-    false
+    log::warn!("{} could not be deleted", old.display());
+    survived(exe);
 }
 
 #[cfg(test)]
@@ -241,19 +346,87 @@ mod tests {
         assert_eq!(without.page, RELEASES_PAGE);
     }
 
-    #[test]
-    fn swaps_and_cleans_up() {
-        let dir = std::env::temp_dir().join(format!("ciranda-update-{}", std::process::id()));
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ciranda-update-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let exe = dir.join("ciranda.exe");
+        dir.join("ciranda.exe")
+    }
+
+    fn read(path: &Path) -> String {
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    #[test]
+    fn the_trial_decides() {
+        assert_eq!(decide(false, None), Start::Plain);
+        // A trial file left without the previous copy is no update at all.
+        assert_eq!(decide(false, Some(5)), Start::Plain);
+        assert_eq!(decide(true, None), Start::Updated);
+        assert_eq!(decide(true, Some(0)), Start::Trial);
+        assert_eq!(decide(true, Some(1)), Start::Trial);
+        assert_eq!(decide(true, Some(FAILED_STARTS)), Start::RollBack);
+        assert!(Start::Updated.on_trial() && Start::Trial.on_trial());
+        assert!(!Start::Plain.on_trial() && !Start::RollBack.on_trial());
+    }
+
+    #[test]
+    fn a_healthy_update_lets_go_of_the_old_copy() {
+        let exe = scratch("healthy");
         std::fs::write(&exe, "old").unwrap();
         let new = beside(&exe, "new");
         std::fs::write(&new, "new").unwrap();
         swap(&exe, &new).unwrap();
-        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "new");
-        assert!(clean_up(&exe));
-        assert!(!beside(&exe, "old").exists());
-        assert!(!clean_up(&exe));
-        let _ = std::fs::remove_dir_all(dir);
+        assert_eq!(read(&exe), "new");
+        assert_eq!(read(&beside(&exe, "old")), "old");
+        assert_eq!(begin(&exe), Start::Updated);
+        assert_eq!(read(&beside(&exe, "trial")), "1");
+        // Quitting properly is no crash: the count starts over, and the next start is no first.
+        survived(&exe);
+        assert_eq!(begin(&exe), Start::Trial);
+        settle(&exe);
+        assert!(!beside(&exe, "old").exists() && !beside(&exe, "trial").exists());
+        assert_eq!(begin(&exe), Start::Plain);
+        // Nothing to set back once settled.
+        survived(&exe);
+        assert!(!beside(&exe, "trial").exists());
+        let _ = std::fs::remove_dir_all(exe.parent().unwrap());
+    }
+
+    #[test]
+    fn a_version_that_keeps_crashing_is_rolled_back() {
+        let exe = scratch("crash");
+        std::fs::write(&exe, "old").unwrap();
+        let new = beside(&exe, "new");
+        std::fs::write(&new, "broken").unwrap();
+        swap(&exe, &new).unwrap();
+        // Each start dies before it proves itself.
+        assert_eq!(begin(&exe), Start::Updated);
+        assert_eq!(begin(&exe), Start::Trial);
+        assert_eq!(begin(&exe), Start::RollBack);
+        put_back(&exe).unwrap();
+        assert_eq!(read(&exe), "old");
+        assert_eq!(read(&beside(&exe, "new")), "broken");
+        assert!(!beside(&exe, "old").exists() && !beside(&exe, "trial").exists());
+        // The version put back starts as usual, and deletes the broken one.
+        assert_eq!(begin(&exe), Start::Plain);
+        assert!(!beside(&exe, "new").exists());
+        let _ = std::fs::remove_dir_all(exe.parent().unwrap());
+    }
+
+    #[test]
+    fn a_new_update_starts_a_new_trial() {
+        let exe = scratch("again");
+        std::fs::write(&exe, "a").unwrap();
+        std::fs::write(beside(&exe, "new"), "b").unwrap();
+        swap(&exe, &beside(&exe, "new")).unwrap();
+        assert_eq!(begin(&exe), Start::Updated);
+        assert_eq!(begin(&exe), Start::Trial);
+        // Updated again before the trial ended: the count is the next version's, from nought.
+        std::fs::write(beside(&exe, "new"), "c").unwrap();
+        swap(&exe, &beside(&exe, "new")).unwrap();
+        assert_eq!(read(&beside(&exe, "old")), "b");
+        assert_eq!(begin(&exe), Start::Updated);
+        let _ = std::fs::remove_dir_all(exe.parent().unwrap());
     }
 }

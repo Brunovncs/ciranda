@@ -91,13 +91,38 @@ impl Preview {
     }
 }
 
+/// Thumbnails by background; `None` inside while one of yours is still being read.
+type Thumbs = std::collections::HashMap<String, Option<Option<Arc<gpui::Image>>>>;
+
 thread_local! {
-    static THUMBS: std::cell::RefCell<std::collections::HashMap<String, Option<Arc<gpui::Image>>>> = Default::default();
+    static THUMBS: std::cell::RefCell<Thumbs> = Default::default();
 }
 
-fn cached_thumb(bg: &Background) -> Option<Arc<gpui::Image>> {
+/// The picker's still of a background. A built-in one is at hand; yours is read and shrunk in the
+/// background the first time it is shown, since a big photo would hold the window up, and the
+/// windows draw again once it is there. Until then, and if it can't be read, the tile shows an
+/// icon.
+fn cached_thumb<V: 'static>(bg: &Background, cx: &mut Context<V>) -> Option<Arc<gpui::Image>> {
     let key = serde_json::to_string(bg).unwrap_or_default();
-    THUMBS.with(|t| t.borrow_mut().entry(key).or_insert_with(|| camera::thumbnail(bg)).clone())
+    if let Some(known) = THUMBS.with(|t| t.borrow().get(&key).cloned()) {
+        return known.flatten();
+    }
+    if !matches!(bg, Background::Image { .. }) {
+        let thumb = camera::thumbnail(bg);
+        THUMBS.with(|t| t.borrow_mut().insert(key, Some(thumb.clone())));
+        return thumb;
+    }
+    THUMBS.with(|t| t.borrow_mut().insert(key.clone(), None));
+    let bg = bg.clone();
+    let read = cx.background_executor().spawn(async move { camera::thumbnail(&bg) });
+    cx.spawn(async move |_, cx| {
+        let thumb = read.await;
+        THUMBS.with(|t| t.borrow_mut().insert(key, Some(thumb)));
+        // Whichever view shows the picker (settings, the camera dialog) draws it again.
+        cx.update(|cx| cx.refresh_windows());
+    })
+    .detach();
+    None
 }
 
 fn builtin_title(name: &str, english: &'static str) -> &'static str {
@@ -124,13 +149,13 @@ pub fn backgrounds<V: 'static>(
         vec![(Background::None, tr!("None", "Nenhum").into(), None), (Background::Blur { strength }, tr!("Blur", "Desfoque").into(), None)];
     for (name, title, _) in camera::BUILTIN {
         let bg = Background::Builtin { name: name.into() };
-        let thumb = cached_thumb(&bg);
+        let thumb = cached_thumb(&bg, cx);
         options.push((bg, builtin_title(name, title).into(), thumb));
     }
-    for path in &prefs(cx).custom_backgrounds {
-        let bg = Background::Image { path: path.clone() };
-        let thumb = cached_thumb(&bg);
-        let name = std::path::Path::new(path).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+    for path in prefs(cx).custom_backgrounds.clone() {
+        let name = std::path::Path::new(&path).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        let bg = Background::Image { path };
+        let thumb = cached_thumb(&bg, cx);
         options.push((bg, name.into(), thumb));
     }
     let (w, h, glyph) = if compact { (72., 41., 17.) } else { (104., 58., 20.) };

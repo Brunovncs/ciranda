@@ -102,7 +102,14 @@ pub struct Api {
 
 impl Api {
     pub fn new() -> Api {
-        let http = reqwest::Client::builder().user_agent(concat!("Ciranda/", env!("CARGO_PKG_VERSION"))).build().expect("http client");
+        // No read timeout here: reqwest's runs from the request's start until the response, an
+        // upload included, so it would cut off any upload slower than it. Each request sets its
+        // own limit, and downloads give up on a stall instead (see `file`).
+        let http = reqwest::Client::builder()
+            .user_agent(concat!("Ciranda/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(Duration::from_secs(15))
+            .build()
+            .expect("http client");
         Api { http, creds: Default::default() }
     }
 
@@ -470,7 +477,8 @@ impl Api {
     /// Uploads an attachment already sealed on this computer.
     pub async fn upload_sealed(&self, id: ConversationId, bytes: Vec<u8>) -> Result<Upload> {
         let url = format!("{}/api/dms/{id}/uploads", self.base());
-        self.send(self.http.post(url).header("Content-Type", "application/octet-stream").body(bytes), Duration::from_secs(120)).await
+        let limit = transfer_timeout(bytes.len());
+        self.send(self.http.post(url).header("Content-Type", "application/octet-stream").body(bytes), limit).await
     }
 
     /// A sealed attachment, still sealed: it is opened by whoever holds its key.
@@ -482,7 +490,8 @@ impl Api {
 
     pub async fn upload(&self, bytes: Vec<u8>, content_type: &str) -> Result<Upload> {
         let url = format!("{}/api/uploads", self.base());
-        self.send(self.http.post(url).header("Content-Type", content_type).body(bytes), Duration::from_secs(60)).await
+        let limit = transfer_timeout(bytes.len());
+        self.send(self.http.post(url).header("Content-Type", content_type).body(bytes), limit).await
     }
 
     pub async fn download(&self, hash: &str) -> Result<(Vec<u8>, String)> {
@@ -501,8 +510,13 @@ impl Api {
     async fn file(&self, path: &str) -> Result<(Vec<u8>, String)> {
         let base = self.base();
         let url = format!("{base}{path}");
-        let res =
-            self.authed(self.http.get(url)).timeout(Duration::from_secs(30)).send().await.map_err(|_| ApiError::unreachable(&base))?;
+        // No limit on the whole: a 25 MB file from a Pi at home can take minutes. What ends one is
+        // the server not answering, or the file not moving, for `STALL`.
+        let unreachable = || ApiError::unreachable(&base);
+        let mut res = tokio::time::timeout(STALL, self.authed(self.http.get(url)).send())
+            .await
+            .map_err(|_| unreachable())?
+            .map_err(|_| unreachable())?;
         let status = res.status().as_u16();
         if !(200..300).contains(&status) {
             return Err(ApiError {
@@ -513,8 +527,11 @@ impl Api {
             });
         }
         let ct = res.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("application/octet-stream").to_string();
-        let bytes = res.bytes().await.map_err(|_| ApiError::unreachable(&base))?;
-        Ok((bytes.to_vec(), ct))
+        let mut bytes = Vec::with_capacity(res.content_length().unwrap_or(0).min(64 << 20) as usize);
+        while let Some(chunk) = tokio::time::timeout(STALL, res.chunk()).await.map_err(|_| unreachable())?.map_err(|_| unreachable())? {
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok((bytes, ct))
     }
 
     // Emoji and soundpad.
@@ -652,6 +669,15 @@ pub struct Sealed {
     pub text: String,
     pub sender_key: KeyId,
     pub recipient_key: KeyId,
+}
+
+/// How long a download may go without a byte before it's taken for stalled.
+const STALL: Duration = Duration::from_secs(30);
+
+/// How long an upload of `bytes` may take in all: a minute, or longer at 64 KB/s, so a big file
+/// over a slow uplink isn't cut off while it's still going.
+fn transfer_timeout(bytes: usize) -> Duration {
+    Duration::from_secs(60).max(Duration::from_secs((bytes / (64 * 1024)) as u64))
 }
 
 /// The server's message for a failure: ours, in the reader's language, for every code we know;

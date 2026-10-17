@@ -18,6 +18,8 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 const BACKOFF_MS: [u64; 6] = [500, 1000, 2000, 5000, 10_000, 15_000];
 const PING_EVERY: Duration = Duration::from_secs(15);
 const WATCHDOG: Duration = Duration::from_secs(35);
+/// How long a connection has to hold before the next drop is retried from the shortest wait again.
+const STAYED_UP: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -136,12 +138,16 @@ async fn run(url: String, api: Api, scope: Scope, mut commands: mpsc::UnboundedR
                 }
                 let hello = hello.to_string();
                 if sink.send(WsMessage::Text(hello.into())).await.is_err() {
+                    if !back_off(&mut attempt, &mut commands).await {
+                        return;
+                    }
                     continue;
                 }
                 let mut ping = interval(PING_EVERY);
                 ping.tick().await;
                 let mut last_in = Instant::now();
                 let mut up = false;
+                let mut up_at = Instant::now();
                 let outcome = loop {
                     tokio::select! {
                         frame = stream.next() => {
@@ -155,13 +161,18 @@ async fn run(url: String, api: Api, scope: Scope, mut commands: mpsc::UnboundedR
                                     if rid.as_deref() == Some(hello_rid.as_str()) {
                                         if kind == "hello-ok" {
                                             up = true;
-                                            attempt = 0;
+                                            up_at = Instant::now();
                                             let snap = serde_json::from_value::<Snapshot>(v)
                                                 .inspect_err(|e| log::warn!("hello-ok did not parse, keeping the old state: {e}"))
                                                 .ok();
                                             let _ = events.send(Event::Up(snap.map(Box::new))).await;
-                                        } else {
+                                        } else if kind == "hello-failed" {
                                             break Outcome::Rejected;
+                                        } else {
+                                            // The server failing on its side, not a refused sign-in:
+                                            // try again later rather than forget the token.
+                                            log::warn!("hello failed on the server: {v}");
+                                            break Outcome::Lost;
                                         }
                                         continue;
                                     }
@@ -240,25 +251,37 @@ async fn run(url: String, api: Api, scope: Scope, mut commands: mpsc::UnboundedR
                         if up {
                             let _ = events.send(Event::Down).await;
                         }
+                        // Only a connection that held counts as recovered: one the server
+                        // drops right after hello would otherwise be redialled at once forever.
+                        if up && up_at.elapsed() >= STAYED_UP {
+                            attempt = 0;
+                        }
                     }
                 }
             }
             Ok(Err(e)) => log::debug!("realtime connect failed: {e}"),
             Err(_) => log::debug!("realtime connect timed out"),
         }
-        let base = BACKOFF_MS[attempt.min(BACKOFF_MS.len() - 1)];
-        attempt += 1;
-        let jitter = base * (rand_percent() % 51) / 100;
-        let wait = sleep(Duration::from_millis(base + jitter));
-        tokio::pin!(wait);
-        // Keep answering requests while waiting, so callers don't hang until the next socket.
-        loop {
-            tokio::select! {
-                _ = &mut wait => break,
-                cmd = commands.recv() => match cmd {
-                    Some(Command::Request { reply, .. }) => { let _ = reply.send(Err(RequestError::offline())); }
-                    Some(Command::Stop) | None => return,
-                }
+        if !back_off(&mut attempt, &mut commands).await {
+            return;
+        }
+    }
+}
+
+/// Waits before the next connect, longer each attempt; false when told to stop meanwhile.
+async fn back_off(attempt: &mut usize, commands: &mut mpsc::UnboundedReceiver<Command>) -> bool {
+    let base = BACKOFF_MS[(*attempt).min(BACKOFF_MS.len() - 1)];
+    *attempt += 1;
+    let jitter = base * (rand_percent() % 51) / 100;
+    let wait = sleep(Duration::from_millis(base + jitter));
+    tokio::pin!(wait);
+    // Keep answering requests while waiting, so callers don't hang until the next socket.
+    loop {
+        tokio::select! {
+            _ = &mut wait => return true,
+            cmd = commands.recv() => match cmd {
+                Some(Command::Request { reply, .. }) => { let _ = reply.send(Err(RequestError::offline())); }
+                Some(Command::Stop) | None => return false,
             }
         }
     }
@@ -300,6 +323,35 @@ mod tests {
         .collect();
         assert_eq!(kinds, ["voice:leave", "voice:join"]);
         drop((leave, join));
+    }
+
+    /// A server failing while it signs you in is not your sign-in refused: the token is kept and
+    /// the connection tried again, where only `hello-failed` would end it.
+    #[test]
+    fn a_server_error_answering_hello_is_retried_not_taken_for_a_refusal() {
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let listener = rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        rt.spawn(async move {
+            for reply in ["error", "hello-ok"] {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+                let Some(Ok(WsMessage::Text(hello))) = ws.next().await else { return };
+                let rid = serde_json::from_str::<Value>(&hello).unwrap()["rid"].clone();
+                let answer = json!({ "type": reply, "rid": rid, "error": "server_error" }).to_string();
+                ws.send(WsMessage::Text(answer.into())).await.unwrap();
+                if reply == "hello-ok" {
+                    std::future::pending::<()>().await;
+                }
+            }
+        });
+        let api = Api::new();
+        api.set_server(&format!("http://127.0.0.1:{port}"), "");
+        api.set_token("t");
+        let (tx, rx) = async_channel::unbounded();
+        let _realtime = Realtime::start(rt.handle(), api, Scope::Full, tx);
+        let first = rt.block_on(async { timeout(Duration::from_secs(10), rx.recv()).await });
+        assert!(matches!(first, Ok(Ok(Event::Up(_)))), "{first:?}");
     }
 
     #[test]

@@ -538,11 +538,19 @@ fn preview_frame(src: &I420Buffer, id: u64, frames: &mut video::Scratch) -> Surf
     frames.of_i420(id, src).mirrored(true)
 }
 
-/// A still of a background, for the picker.
+/// A still of a background, for the picker. Yours is read from disk and shrunk to the size of a
+/// thumbnail, which takes a moment for a big photo, so ask for it off the UI thread; it would
+/// otherwise also sit in the GPU's memory at its full size.
 pub fn thumbnail(bg: &Background) -> Option<Arc<gpui::Image>> {
     let bytes = match bg {
         Background::Builtin { name } => BUILTIN.iter().find(|b| b.0 == name)?.2.to_vec(),
-        Background::Image { path } => std::fs::read(path).ok()?,
+        Background::Image { path } => {
+            let img = image::load_from_memory(&std::fs::read(path).ok()?).ok()?;
+            let small = img.resize_to_fill(256, 144, image::imageops::FilterType::Triangle).to_rgb8();
+            let mut out = Vec::new();
+            small.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Jpeg).ok()?;
+            out
+        }
         _ => return None,
     };
     let fmt = if bytes.starts_with(&[0x89, b'P']) { gpui::ImageFormat::Png } else { gpui::ImageFormat::Jpeg };
@@ -573,6 +581,18 @@ mod tests {
         for (name, _, _) in BUILTIN {
             assert!(picture(&Background::Builtin { name: name.into() }, 64, 36).is_some_and(|p| p.len() == 64 * 36 * 4), "{name}");
         }
+    }
+
+    #[test]
+    fn a_picture_of_yours_is_shrunk_for_its_thumbnail() {
+        let path = std::env::temp_dir().join(format!("ciranda-bg-{}.png", std::process::id()));
+        image::RgbImage::from_pixel(1920, 1080, image::Rgb([40, 90, 160])).save(&path).unwrap();
+        let thumb = thumbnail(&Background::Image { path: path.to_string_lossy().into() }).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(thumb.format, gpui::ImageFormat::Jpeg);
+        let small = image::load_from_memory(&thumb.bytes).unwrap();
+        assert_eq!((small.width(), small.height()), (256, 144));
+        assert!(thumbnail(&Background::Image { path: path.to_string_lossy().into() }).is_none());
     }
 
     fn mode(format: FrameFormat, w: u32, h: u32, fps: u32) -> CameraFormat {

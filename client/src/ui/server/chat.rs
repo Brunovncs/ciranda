@@ -29,6 +29,8 @@ use std::time::{Duration, Instant};
 
 const GROUP_WINDOW_MS: i64 = 5 * 60 * 1000;
 const MAX_UPLOAD: usize = 25 * 1024 * 1024;
+/// How many older pages a jump to a message not loaded yet will fetch looking for it.
+const JUMP_PAGES: usize = 40;
 
 struct Pending {
     bytes: Arc<Vec<u8>>,
@@ -43,6 +45,13 @@ enum Mode {
     Reply(Message),
     /// The box holds one of your messages, to change it.
     Edit(Message),
+}
+
+/// What was being written in a chat pane the window let go, for the pane made again later.
+pub struct Draft {
+    text: String,
+    reply: Option<Message>,
+    pending: Option<Pending>,
 }
 
 /// What a reply's quote shows of the message it answers.
@@ -66,6 +75,8 @@ pub struct ChatView {
     pub room: Room,
     list: ListState,
     shown: Vec<MessageId>,
+    /// The search `shown` came from, if any.
+    shown_query: Option<String>,
     composer: Entity<TextField>,
     search: Entity<TextField>,
     results: Option<(String, Vec<Message>)>,
@@ -81,6 +92,9 @@ pub struct ChatView {
     mention: Option<(String, usize)>,
     /// Parsed bodies by message, until it is edited; dropped when the server's emoji change.
     bodies: HashMap<MessageId, (Option<i64>, Rc<rich::Parsed>)>,
+    /// A quote's line by the message quoted, made once rather than every frame: whether it came
+    /// from the message itself (and as it was last edited), or from what the reply carried.
+    quotes: HashMap<MessageId, (bool, Option<i64>, String)>,
     bodies_emoji: usize,
     /// When an animated picture on screen next changes frame, and the wake set for it.
     frame_due: Option<Instant>,
@@ -141,6 +155,7 @@ impl ChatView {
             room,
             list,
             shown: Vec::new(),
+            shown_query: None,
             composer,
             search,
             results: None,
@@ -154,6 +169,7 @@ impl ChatView {
             flash: None,
             mention: None,
             bodies: HashMap::new(),
+            quotes: HashMap::new(),
             bodies_emoji: 0,
             frame_due: None,
             frame_timer: Task::ready(()),
@@ -198,29 +214,39 @@ impl ChatView {
         }
     }
 
-    /// Keeps the list in step with the messages, splicing so the scroll position holds.
+    /// Keeps the list in step with the messages, splicing only what changed so the scroll
+    /// position and the heights already measured hold. Only a search coming or going starts the
+    /// list over.
     fn sync(&mut self, cx: &mut Context<Self>) {
         let emoji = self.session.read(cx).emojis.len();
         if emoji != self.bodies_emoji {
             self.bodies.clear();
+            self.quotes.clear();
             self.bodies_emoji = emoji;
         }
-        let ids: Vec<MessageId> = self.messages(cx).iter().map(|m| m.id).collect();
-        if ids == self.shown {
+        let query = self.results.as_ref().map(|(q, _)| q.clone());
+        // Every session change comes through here: compared in place, with nothing collected,
+        // when nothing in this room moved.
+        if query == self.shown_query && self.messages(cx).iter().map(|m| m.id).eq(self.shown.iter().copied()) {
             cx.notify();
             return;
         }
+        let ids: Vec<MessageId> = self.messages(cx).iter().map(|m| m.id).collect();
         let keep: HashSet<MessageId> = ids.iter().copied().collect();
         self.bodies.retain(|id, _| keep.contains(id));
-        let old = &self.shown;
-        if !old.is_empty() && ids.len() > old.len() && ids.ends_with(old) {
-            self.list.splice(0..0, ids.len() - old.len());
-        } else if !old.is_empty() && ids.len() > old.len() && ids.starts_with(old) {
-            self.list.splice(old.len()..old.len(), ids.len() - old.len());
-        } else {
+        self.quotes.retain(|id, _| keep.contains(id));
+        let changes = id_changes(&self.shown, &ids);
+        let added: usize = changes.iter().map(|(_, n)| n).sum();
+        if query != self.shown_query || self.shown.is_empty() || added == ids.len() {
             self.list.reset(ids.len());
+        } else {
+            // Last first, so the places of the earlier ones still hold.
+            for (old, count) in changes.into_iter().rev() {
+                self.list.splice(old, count);
+            }
         }
         self.shown = ids;
+        self.shown_query = query;
         cx.notify();
     }
 
@@ -256,12 +282,12 @@ impl ChatView {
         self.composer.update(cx, |f, cx| f.clear(cx));
         cx.notify();
         if let Room::Dm(conversation) = self.room {
-            let file = pending.map(|p| crate::session::Outgoing { bytes: p.bytes, name: p.name, mime: p.content_type });
+            let file = pending.as_ref().map(|p| crate::session::Outgoing { bytes: p.bytes.clone(), name: p.name.clone(), mime: p.content_type.clone() });
             let reply = answering.as_ref().map(preview_of);
             let task = self.session.update(cx, |s, cx| s.send_dm(conversation, text.clone(), file, reply, cx));
             cx.spawn(async move |this, cx| {
                 let result = task.await;
-                let _ = this.update(cx, |this, cx| this.sent(result.err().map(|e| (e.message, text)), answering, cx));
+                let _ = this.update(cx, |this, cx| this.sent(result.err().map(|e| (e.message, text)), answering, pending, cx));
             })
             .detach();
             return;
@@ -271,13 +297,14 @@ impl ChatView {
             let s = self.session.read(cx);
             (s.api.clone(), s.cache.clone())
         };
+        let upload = pending.as_ref().map(|p| (p.bytes.clone(), p.content_type.clone(), p.name.clone()));
         cx.spawn(async move |this, cx| {
             let result = core::run(async move {
-                let attachment = match pending {
-                    Some(p) => {
-                        let up = api.upload(p.bytes.to_vec(), &p.content_type).await?;
-                        cache.insert(&p.bytes, &p.content_type);
-                        Some((up.hash, p.name))
+                let attachment = match upload {
+                    Some((bytes, content_type, name)) => {
+                        let up = api.upload(bytes.to_vec(), &content_type).await?;
+                        cache.insert(&bytes, &content_type);
+                        Some((up.hash, name))
                     }
                     None => None,
                 };
@@ -294,15 +321,15 @@ impl ChatView {
                     let text = if let serde_json::Value::String(text) = &e.body { text.clone() } else { String::new() };
                     (e.message, text)
                 });
-                this.sent(failed, answering, cx)
+                this.sent(failed, answering, pending, cx)
             });
         })
         .detach();
     }
 
-    /// A send finished. On failure the text goes back in the box, and what it answered, so
-    /// nothing typed is lost.
-    fn sent(&mut self, failed: Option<(String, String)>, answering: Option<Message>, cx: &mut Context<Self>) {
+    /// A send finished. On failure the text goes back in the box, with what it answered and the
+    /// file it carried, so nothing typed or attached is lost.
+    fn sent(&mut self, failed: Option<(String, String)>, answering: Option<Message>, pending: Option<Pending>, cx: &mut Context<Self>) {
         self.sending = false;
         self.uploading = false;
         if let Some((why, text)) = failed {
@@ -312,8 +339,39 @@ impl ChatView {
                     self.mode = answering.map(Mode::Reply);
                 }
             }
+            // Unless another file was attached meanwhile, which stays.
+            if self.pending.is_none() {
+                self.pending = pending;
+            }
             overlay::toast(why, cx);
         }
+        cx.notify();
+    }
+
+    /// A send is on its way: its answer needs this pane to come back to.
+    pub fn busy(&self) -> bool {
+        self.sending
+    }
+
+    /// What is being written here, taken out for the window to keep while this pane is let go.
+    pub fn take_draft(&mut self, cx: &mut Context<Self>) -> Option<Draft> {
+        let text = match &self.mode {
+            Some(Mode::Edit(_)) => self.draft.clone().unwrap_or_default(),
+            _ => self.composer.read(cx).text(),
+        };
+        let reply = match self.mode.take() {
+            Some(Mode::Reply(m)) => Some(m),
+            _ => None,
+        };
+        let pending = self.pending.take();
+        (!text.trim().is_empty() || reply.is_some() || pending.is_some()).then_some(Draft { text, reply, pending })
+    }
+
+    /// Puts back what `take_draft` took, in a pane made again for the same room.
+    pub fn restore_draft(&mut self, d: Draft, cx: &mut Context<Self>) {
+        self.composer.update(cx, |f, cx| f.set_text(&d.text, cx));
+        self.mode = d.reply.map(Mode::Reply);
+        self.pending = d.pending;
         cx.notify();
     }
 
@@ -411,18 +469,36 @@ impl ChatView {
 
     /// What a reply's quote shows: the message itself when it is loaded, so an edit shows up;
     /// otherwise what the reply carried with it.
-    fn quoted(&self, r: &ReplyTo, cx: &App) -> Quoted {
+    fn quoted(&mut self, r: &ReplyTo, cx: &App) -> Quoted {
         let s = self.session.read(cx);
-        let log = s.chats.get(&self.room);
-        if let Some(m) = log.and_then(|l| l.messages.iter().find(|m| m.id == r.id)) {
-            return Quoted { user: m.user_id, text: summary(&m.body, m.attachment_name.as_deref(), m.media_type, s), gone: false };
+        let messages = s.chats.get(&self.room).map(|l| l.messages.as_slice()).unwrap_or(&[]);
+        // In id order, so found by halving: this runs for every reply on screen, every frame.
+        if let Ok(at) = messages.binary_search_by_key(&r.id, |m| m.id) {
+            let m = &messages[at];
+            let text = match self.quotes.get(&r.id) {
+                Some((true, edited, text)) if *edited == m.edited_at => text.clone(),
+                _ => {
+                    let text = summary(&m.body, m.attachment_name.as_deref(), m.media_type, s);
+                    self.quotes.insert(r.id, (true, m.edited_at, text.clone()));
+                    text
+                }
+            };
+            return Quoted { user: m.user_id, text, gone: false };
         }
         // Inside what is loaded and not there: deleted since.
-        let within = log.and_then(|l| l.messages.first()).is_some_and(|first| first.id < r.id);
+        let within = messages.first().is_some_and(|first| first.id < r.id);
         if r.deleted || within {
             return Quoted { user: r.user_id, text: String::new(), gone: true };
         }
-        Quoted { user: r.user_id, text: summary(&r.body, r.attachment_name.as_deref(), None, s), gone: false }
+        let text = match self.quotes.get(&r.id) {
+            Some((false, _, text)) => text.clone(),
+            _ => {
+                let text = summary(&r.body, r.attachment_name.as_deref(), None, s);
+                self.quotes.insert(r.id, (false, None, text.clone()));
+                text
+            }
+        };
+        Quoted { user: r.user_id, text, gone: false }
     }
 
     fn attach(&mut self, kind: files::Kind, cx: &mut Context<Self>) {
@@ -440,10 +516,17 @@ impl ChatView {
             overlay::toast(tr!("Files can be up to 25 MB.", "Os arquivos podem ter até 25 MB."), cx);
             return;
         }
-        match std::fs::read(path) {
-            Ok(b) => self.set_pending(b, content_type_for(&name), name, cx),
-            Err(e) => overlay::toast(trf!("Could not read that file: {}", "Não foi possível ler esse arquivo: {}", e), cx),
-        }
+        // Up to 25 MB from a disk that may be slow or on the network: not on the UI thread.
+        let path = path.to_path_buf();
+        let read = cx.background_executor().spawn(async move { std::fs::read(path) });
+        cx.spawn(async move |this, cx| {
+            let read = read.await;
+            let _ = this.update(cx, |this, cx| match read {
+                Ok(b) => this.set_pending(b, content_type_for(&name), name, cx),
+                Err(e) => overlay::toast(trf!("Could not read that file: {}", "Não foi possível ler esse arquivo: {}", e), cx),
+            });
+        })
+        .detach();
     }
 
     /// A copied picture or file attached as if picked; false when the clipboard holds neither.
@@ -637,6 +720,8 @@ impl ChatView {
     fn run_search(&mut self, cx: &mut Context<Self>) {
         let q = self.search.read(cx).text().trim().to_string();
         if q.is_empty() {
+            // A search still on its way would bring results back into an empty box.
+            self.searching = Task::ready(());
             self.results = None;
             self.sync(cx);
             return;
@@ -659,12 +744,18 @@ impl ChatView {
 
     fn clear_search(&mut self, cx: &mut Context<Self>) {
         self.search.update(cx, |f, cx| f.clear(cx));
+        self.searching = Task::ready(());
         self.results = None;
         self.sync(cx);
     }
 
     /// Scrolls to a message and flashes it.
     fn jump_to(&mut self, id: MessageId, cx: &mut Context<Self>) {
+        self.jump_within(id, JUMP_PAGES, cx);
+    }
+
+    /// As `jump_to`, fetching at most `pages` older pages to find it.
+    fn jump_within(&mut self, id: MessageId, pages: usize, cx: &mut Context<Self>) {
         if self.results.is_some() {
             self.clear_search(cx);
         }
@@ -687,8 +778,9 @@ impl ChatView {
                 cx.background_executor().timer(Duration::from_millis(600)).await;
                 let _ = this.update(cx, |this, cx| {
                     let more = this.session.read(cx).chats.get(&ch).is_some_and(|l| l.more_before);
-                    if this.shown.contains(&id) || more {
-                        this.jump_to(id, cx);
+                    // Bounded: a page that keeps failing to load leaves `more_before` set.
+                    if this.shown.contains(&id) || (more && pages > 0) {
+                        this.jump_within(id, pages.saturating_sub(1), cx);
                     }
                 });
             })
@@ -925,9 +1017,10 @@ impl ChatView {
         let bytes = self.session.read(cx).attachment(&hash, how);
         cx.spawn(async move |_, cx| {
             let Ok(Ok(Some(path))) = target.await else { return };
+            let write = cx.background_executor().clone();
             let result = async move {
                 let bytes = bytes.await.map_err(|e| e.message)?;
-                std::fs::write(&path, bytes.as_slice()).map_err(|e| e.to_string())
+                write.spawn(async move { std::fs::write(&path, bytes.as_slice()).map_err(|e| e.to_string()) }).await
             }
             .await;
             cx.update(|cx| match result {
@@ -951,7 +1044,11 @@ impl ChatView {
             let Ok(Ok(Some(paths))) = paths.await else { return };
             let Some(path) = paths.into_iter().next() else { return };
             let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "file".into());
-            let Ok(bytes) = std::fs::read(&path) else { return };
+            if std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_UPLOAD as u64) {
+                cx.update(|cx| overlay::toast(tr!("Files can be up to 25 MB.", "Os arquivos podem ter até 25 MB."), cx));
+                return;
+            }
+            let Ok(bytes) = cx.background_executor().spawn(async move { std::fs::read(&path) }).await else { return };
             let ct = content_type_for(&name);
             cx.update(|cx| {
                 session.update(cx, |s, cx| {
@@ -1053,19 +1150,31 @@ impl ChatView {
         // Rank means nothing between two people.
         let role = m.user_id.and_then(|u| self.session.read(cx).users.get(&u)).map(|u| u.role).filter(|_| !private);
         let avatar_img = m.user_id.and_then(|u| self.session.update(cx, |s, cx| s.avatar(u, cx)));
+        let refused = m.private.as_ref().is_some_and(|p| p.out_of_place);
+        let unconfirmed = m.private.as_ref().is_some_and(|p| p.unconfirmed && !p.unreadable);
         let body_el = if unreadable {
             Some(
                 div()
                     .flex()
                     .items_center()
                     .gap(px(6.))
-                    .child(icon("lock", 13., t.text3))
+                    .child(icon(if refused { "shield-alert" } else { "lock" }, 13., if refused { t.caution } else { t.text3 }))
                     .child(caption(
-                        tr!(
-                            "This message was sealed to a key this computer doesn't have.",
-                            "Esta mensagem foi protegida com uma chave que este computador não tem."
-                        ),
-                        t.text3,
+                        // Refused is not the same as locked: it opened fine, but somewhere it was
+                        // never sent (an old message again, two swapped, an edit undone), which
+                        // only the server could have done.
+                        if refused {
+                            tr!(
+                                "Refused: this message isn't where it was sent. The server may have moved or repeated it.",
+                                "Recusada: esta mensagem não está onde foi enviada. O servidor pode tê-la movido ou repetido."
+                            )
+                        } else {
+                            tr!(
+                                "This message was sealed to a key this computer doesn't have.",
+                                "Esta mensagem foi protegida com uma chave que este computador não tem."
+                            )
+                        },
+                        if refused { t.caution } else { t.text3 },
                     ))
                     .into_any_element(),
             )
@@ -1196,6 +1305,7 @@ impl ChatView {
                                 .child(stamp.clone())
                                 .tooltip(tip(full.clone(), &t)),
                         )
+                        .when(unconfirmed, |d| d.child(unconfirmed_mark(m.id, &t)))
                         .when(m.pinned, |d| d.child(chip(tr!("Pinned", "Fixada"), t.accent)))
                         .children(edited_head),
                 )
@@ -1210,15 +1320,18 @@ impl ChatView {
             .flex()
             .gap(px(12.))
             .child(if grouped {
-                div().w(px(36.)).flex_none().flex().justify_end().pt(px(2.)).child(
+                div().w(px(36.)).flex_none().flex().justify_end().pt(px(2.)).child(if unconfirmed {
+                    unconfirmed_mark(m.id, &t).into_any_element()
+                } else {
                     div()
                         .font_family(MONO)
                         .text_size(px(10.))
                         .text_color(t.text3)
                         .invisible()
                         .group_hover(group_name.clone(), |s| s.visible())
-                        .child(hhmm),
-                )
+                        .child(hhmm)
+                        .into_any_element()
+                })
             } else {
                 div().flex_none().pt(px(2.)).child(avatar(&name, avatar_img, 36., None))
             })
@@ -2176,6 +2289,17 @@ fn notice(glyph: &'static str, text: String, color: gpui::Hsla, t: &Theme) -> gp
         .child(div().flex_1().min_w(px(0.)).child(caption(text, t.text)))
 }
 
+/// Beside a private message sealed with a key of theirs not accepted here: small, because a key
+/// change is usually a reinstall, and the notice above the conversation says the rest.
+fn unconfirmed_mark(id: MessageId, t: &Theme) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(("unconfirmed", id as u64))
+        .flex()
+        .items_center()
+        .child(icon("shield-alert", 12., t.caution))
+        .tooltip(tip(tr!("Sent with a key you haven't confirmed", "Enviada com uma chave que você não confirmou"), t))
+}
+
 /// A menu action that reaches the chat, if it is still open.
 fn act(
     this: &WeakEntity<ChatView>,
@@ -2199,6 +2323,34 @@ fn preview_of(m: &Message) -> ReplyTo {
         attachment_name: m.attachment_name.clone(),
         deleted: false,
     }
+}
+
+/// What changed between the ids shown and the ids now, both in id order: each run replaced, as
+/// where it was among the old ones and how many new ones take its place, first to last.
+fn id_changes(old: &[MessageId], new: &[MessageId]) -> Vec<(std::ops::Range<usize>, usize)> {
+    let (mut i, mut j) = (0, 0);
+    let mut out = Vec::new();
+    while i < old.len() || j < new.len() {
+        if i < old.len() && j < new.len() && old[i] == new[j] {
+            i += 1;
+            j += 1;
+            continue;
+        }
+        let (from, to) = (i, j);
+        loop {
+            match (old.get(i), new.get(j)) {
+                (Some(a), Some(b)) if a == b => break,
+                // Gone from the new ones, or a newcomer before the next old one.
+                (Some(a), Some(b)) if a < b => i += 1,
+                (Some(_), Some(_)) => j += 1,
+                (Some(_), None) => i += 1,
+                (None, Some(_)) => j += 1,
+                (None, None) => break,
+            }
+        }
+        out.push((from..i, j - to));
+    }
+    out
 }
 
 /// A message in one line, for a quote: its words, or what it carries when it has none.
@@ -2472,6 +2624,48 @@ mod tests {
         let img = image::load_from_memory_with_format(&png, image::ImageFormat::Png).unwrap().into_rgba8();
         assert_eq!(img.get_pixel(0, 0).0, [255, 0, 0, 255]);
         assert_eq!(img.get_pixel(1, 0).0, [0, 0, 255, 255]);
+    }
+
+    /// The list's splices, done on the ids themselves, last first as `sync` does them.
+    fn spliced(old: &[MessageId], new: &[MessageId]) -> Vec<MessageId> {
+        let changes = id_changes(old, new);
+        // Which new ids fill each change: what is kept between changes is the same in both.
+        let (mut i, mut j) = (0, 0);
+        let mut fills = Vec::new();
+        for (range, n) in &changes {
+            j += range.start - i;
+            i = range.end;
+            fills.push(new[j..j + n].to_vec());
+            j += n;
+        }
+        let mut out = old.to_vec();
+        for ((range, _), fill) in changes.into_iter().zip(fills).rev() {
+            out.splice(range, fill);
+        }
+        out
+    }
+
+    #[test]
+    fn only_what_changed_in_the_ids_is_spliced() {
+        let old: Vec<MessageId> = (1..=10).collect();
+        // A deletion in the middle: one item out, nothing else touched.
+        let new: Vec<MessageId> = (1..=10).filter(|i| *i != 5).collect();
+        assert_eq!(id_changes(&old, &new), vec![(4..5, 0)]);
+        // An older page in front, a new message at the end.
+        let mut new: Vec<MessageId> = vec![-2, -1, 0];
+        new.extend(1..=11);
+        assert_eq!(id_changes(&old, &new), vec![(0..0, 3), (10..10, 1)]);
+        // A catch-up: two deleted, one arrived between, the rest as they were.
+        let new = vec![1, 2, 4, 5, 6, 7, 8, 9, 10, 12];
+        assert_eq!(id_changes(&old, &new), vec![(2..3, 0), (10..10, 1)]);
+        let new = vec![1, 2, 3, 9, 10, 11];
+        assert_eq!(id_changes(&old, &new), vec![(3..8, 0), (10..10, 1)]);
+        assert!(id_changes(&old, &old).is_empty());
+        assert_eq!(id_changes(&[], &[1, 2]), vec![(0..0, 2)]);
+        assert_eq!(id_changes(&[1, 2], &[]), vec![(0..2, 0)]);
+        for new in [vec![], vec![0, 3, 7, 20], vec![2, 4, 6, 8, 10, 11, 12], (5..30).collect()] {
+            assert_eq!(spliced(&old, &new), new);
+        }
     }
 
     #[test]

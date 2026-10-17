@@ -117,11 +117,17 @@ Source: "{#Root}\THIRD_PARTY_NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
 ; A shortcut left out on reinstall goes, so the choices made now are the ones that hold.
 Type: files; Name: "{userprograms}\Ciranda.lnk"
 Type: files; Name: "{userdesktop}\Ciranda.lnk"
+; An update's trial is over once the program is installed by hand: the copy kept to go back to
+; would otherwise replace the version just installed, should it fail to start.
+Type: files; Name: "{app}\ciranda.exe.old"
+Type: files; Name: "{app}\ciranda.exe.new"
+Type: files; Name: "{app}\ciranda.exe.trial"
 
 [UninstallDelete]
 ; What an update leaves beside the program until the next start.
 Type: files; Name: "{app}\ciranda.exe.old"
 Type: files; Name: "{app}\ciranda.exe.new"
+Type: files; Name: "{app}\ciranda.exe.trial"
 
 [Icons]
 Name: "{userprograms}\Ciranda"; Filename: "{app}\ciranda.exe"; WorkingDir: "{app}"; Tasks: startmenuicon

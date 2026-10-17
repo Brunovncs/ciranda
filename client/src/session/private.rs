@@ -11,6 +11,7 @@ use gpui::{Context, Task};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// One private conversation as the sidebar shows it.
 #[derive(Clone, Debug)]
@@ -31,7 +32,8 @@ pub struct Outgoing {
 
 fn seal_failed(e: SealError) -> ApiError {
     let code = e.code();
-    ApiError { status: 0, code, message: crate::core::api::friendly(code, &Value::Null).unwrap_or_default(), body: Value::Null }
+    let message = e.message().map(str::to_string).or_else(|| crate::core::api::friendly(code, &Value::Null)).unwrap_or_default();
+    ApiError { status: 0, code, message, body: Value::Null }
 }
 
 fn gone() -> ApiError {
@@ -140,7 +142,19 @@ impl Session {
     pub(super) fn load_dms(&mut self, cx: &mut Context<Self>) {
         let api = self.api.clone();
         cx.spawn(async move |this, cx| {
-            let got = core::run(async move { api.dms().await }).await;
+            // Until a first list arrives nothing new can be told from what was there, so a failure
+            // then is tried again shortly instead of only on the next connect or inbox answer.
+            let mut wait = Duration::from_secs(2);
+            let got = loop {
+                let api = api.clone();
+                let got = core::run(async move { api.dms().await }).await;
+                let retry = matches!(&got, Err(e) if e.status != 404 && e.status != 401) && wait <= Duration::from_secs(16);
+                if !retry || this.update(cx, |s, _| s.dms_loaded).unwrap_or(true) {
+                    break got;
+                }
+                cx.background_executor().timer(wait).await;
+                wait *= 2;
+            };
             let _ = this.update(cx, |s, cx| {
                 let Ok(list) = got else { return };
                 s.vault.learn(list.keys);
@@ -258,15 +272,17 @@ impl Session {
     /// Recounts what is unread after a read mark moved elsewhere.
     fn recount(&mut self, conversation: ConversationId) {
         let me = self.me.id;
-        let log = self.chats.get(&Room::Dm(conversation)).filter(|l| l.loaded).map(|l| l.messages.clone());
         let Some(dm) = self.dms.get_mut(&conversation) else { return };
         let read = dm.info.last_read_id;
-        dm.info.unread = match log {
-            Some(messages) => messages
+        let counted = self.chats.get(&Room::Dm(conversation)).filter(|l| l.loaded && !l.stale).map(|l| {
+            l.messages
                 .iter()
                 .filter(|m| m.id > read && m.user_id != Some(me))
                 .filter(|m| !m.private.as_ref().and_then(|p| p.call.as_ref()).is_some_and(|c| c.outcome == "ended"))
-                .count() as u32,
+                .count() as u32
+        });
+        dm.info.unread = match counted {
+            Some(n) => n,
             None if dm.info.last.as_ref().is_none_or(|m| m.id <= read) => 0,
             None => dm.info.unread,
         };
@@ -330,7 +346,7 @@ impl Session {
                 attachment = Some((up.hash, file));
             }
             let hash = attachment.as_ref().map(|(h, _)| h.clone());
-            let payload = Payload { body, file: attachment.map(|(_, f)| f), reply };
+            let payload = Payload { body, file: attachment.map(|(_, f)| f), reply, ..Default::default() };
             let task = this
                 .update(cx, |s, cx| {
                     s.send_sealed(
@@ -351,8 +367,11 @@ impl Session {
     pub fn edit_dm(&mut self, message: &Message, body: String, cx: &mut Context<Self>) -> Task<Result<(), ApiError>> {
         let conversation = message.channel_id;
         let Some(peer) = self.peer_of(conversation) else { return Task::ready(Err(gone())) };
-        let payload = Payload { body, file: message.private.as_ref().and_then(|p| p.file.clone()), reply: message.reply.clone() };
         let id = message.id;
+        let private = message.private.clone().unwrap_or_default();
+        // The message's own id, one more edit, and which message it is: an edit the server put on
+        // another message, or an earlier one it put back, then doesn't open as this one.
+        let payload = Payload { body, file: private.file, reply: message.reply.clone(), mid: private.mid, rev: private.rev + 1, of: Some(id) };
         self.send_sealed(
             move |v| v.seal_message(conversation, peer, &payload),
             move |api, sealed| Box::pin(async move { api.edit_dm(id, &sealed).await.map(|_| ()) }),
@@ -364,16 +383,15 @@ impl Session {
     /// current one last. One that doesn't open here is left out.
     pub fn dm_versions(&mut self, message: &Message, cx: &mut Context<Self>) -> Task<Result<Vec<Version>, ApiError>> {
         let conversation = message.channel_id;
-        let (Some(peer), Some(author)) = (self.peer_of(conversation), message.user_id) else { return Task::ready(Err(gone())) };
+        let (Some(peer), Some(_)) = (self.peer_of(conversation), message.user_id) else { return Task::ready(Err(gone())) };
         let (api, id) = (self.api.clone(), message.id);
         let current = Version { body: message.body.clone(), at: message.edited_at.unwrap_or(message.created_at) };
+        let message = message.clone();
         cx.spawn(async move |this, cx| {
             let sealed = core::run(async move { api.dm_versions(id).await }).await?;
             this.update(cx, |s, _| {
-                let mut out: Vec<Version> = sealed
-                    .iter()
-                    .filter_map(|v| Some(Version { body: s.vault.open_version(conversation, peer, author, v)?, at: v.at }))
-                    .collect();
+                let mut out: Vec<Version> =
+                    sealed.iter().filter_map(|v| Some(Version { body: s.vault.open_version(&message, peer, v)?, at: v.at })).collect();
                 out.push(current);
                 out
             })
@@ -497,10 +515,19 @@ impl Session {
                 if unknown.is_empty() {
                     self.dm_arrived(m, info, cx);
                 } else {
-                    // Sealed to a key not seen yet: fetch it, then open the message.
+                    // Sealed to a key not seen yet: fetch it, then open the message. A failed fetch
+                    // is tried again a couple of times, or the message would stay unreadable here.
                     let api = self.api.clone();
                     cx.spawn(async move |this, cx| {
-                        let keys = core::run(async move { api.lookup_keys(&unknown).await }).await.unwrap_or_default();
+                        let mut keys = Vec::new();
+                        for wait in [0, 1, 3] {
+                            cx.background_executor().timer(Duration::from_secs(wait)).await;
+                            let (api, unknown) = (api.clone(), unknown.clone());
+                            if let Ok(got) = core::run(async move { api.lookup_keys(&unknown).await }).await {
+                                keys = got;
+                                break;
+                            }
+                        }
                         let _ = this.update(cx, |s, cx| {
                             s.vault.learn(keys);
                             s.dm_arrived(m, info, cx);
@@ -598,16 +625,19 @@ impl Session {
         let away = self.viewing != Some(room);
         self.active_at = std::time::Instant::now();
         let mut dm = self.dms.remove(&id).unwrap_or(Dm { peer, preview: String::new(), preview_mine: false, info: info.clone() });
-        dm.info.last_at = info.last_at;
-        dm.info.last = Some(m.clone());
+        dm.info.last_at = dm.info.last_at.max(info.last_at);
+        self.vault.pin(peer);
+        // A message that waited for its key can arrive after a newer one: it is not the last.
+        if dm.info.last.as_ref().is_none_or(|l| l.id <= m.id) {
+            dm.info.last = Some(m.clone());
+            self.preview(&mut dm, &m);
+        }
         // A call both of you were on is not news to either; a missed one is.
         let answered = m.meta.as_ref().is_some_and(|c| c.outcome == "ended");
         if !mine && away && !answered {
             dm.info.unread += 1;
         }
-        self.preview(&mut dm, &m);
         self.dms.insert(id, dm);
-        self.vault.pin(peer);
         let opened = self.vault.open_message(&m, peer);
         if let Some(log) = self.chats.get_mut(&room) {
             log.push(LogOp::Added(opened.clone()));
@@ -625,6 +655,8 @@ pub fn preview_of(m: &Message, sender: &str, mine: bool) -> String {
     let p = m.private.clone().unwrap_or_default();
     let text = if let Some(call) = &p.call {
         crate::dm::call_line(call, sender, mine)
+    } else if p.out_of_place {
+        tr!("Message refused: it isn't where it was sent", "Mensagem recusada: ela não está onde foi enviada").into()
     } else if p.unreadable {
         tr!("Message protected with a key this computer doesn't have", "Mensagem protegida com uma chave que este computador não tem").into()
     } else if m.body.trim().is_empty() {

@@ -877,8 +877,8 @@ impl Soundpad {
                 }),
             ));
         }
-        if admin {
-            let pos = order.iter().position(|x| *x == id).unwrap_or(0);
+        // A clip someone else deleted while its menu was open has no place to move from.
+        if admin && let Some(pos) = order.iter().position(|x| *x == id) {
             let moved = |delta: isize| {
                 let mut o = order.clone();
                 let to = (pos as isize + delta).clamp(0, o.len() as isize - 1) as usize;
@@ -1056,11 +1056,14 @@ pub(super) fn add_clip(session: Entity<Session>, window: &mut Window, cx: &mut A
         let Some(path) = paths.into_iter().next() else { return };
         let name = path.file_stem().map(|s| s.to_string_lossy().chars().take(32).collect::<String>()).unwrap_or_default();
         let file = path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-        let Ok(bytes) = std::fs::read(&path) else { return };
-        if bytes.len() > 2 * 1024 * 1024 {
+        // Measured before it's read, and read off the UI thread: a long video picked by mistake
+        // would otherwise be read whole just to be refused.
+        if std::fs::metadata(&path).is_ok_and(|m| m.len() > 2 * 1024 * 1024) {
             cx.update(|cx| overlay::toast(tr!("Sounds can be up to 2 MB.", "Os sons podem ter até 2 MB."), cx));
             return;
         }
+        let read = path.clone();
+        let Ok(bytes) = cx.background_executor().spawn(async move { std::fs::read(read) }).await else { return };
         let ct = super::chat::content_type_for(&file);
         let _ = window_handle.update(cx, |_, window, cx| {
             overlay::Ask::open(

@@ -4,36 +4,100 @@
 use super::ServerView;
 use super::sidebar::{Menu, MenuEntry};
 use crate::core::types::*;
-use crate::theme::{Theme, px, radius};
+use crate::session::Session;
+use crate::theme::{Theme, current, px, radius};
 use crate::ui::overlay::{self, Ask, Field};
 use crate::widgets::*;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, AppContext, Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
-    StatefulInteractiveElement, Styled, Window, div,
+    AnyElement, App, AppContext, Context, Entity, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
+    StatefulInteractiveElement, Styled, WeakEntity, Window, div, uniform_list,
 };
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::rc::Rc;
+
+/// Every line of the member list is this tall, headings included: the list draws only the lines
+/// in view, which takes them all the same height. A row is 36 px with 1 px under it.
+const LINE: f32 = 37.;
+
+/// What decides who is listed, in what order and where: everyone's id, names and whether they
+/// are online. Summed rather than chained, as the maps iterate in no set order. Hashing every
+/// name is far cheaper than what it spares, copying and sorting everybody, and the session
+/// notifies for every message.
+pub(super) fn people_key(s: &Session) -> u64 {
+    let mut key = s.users.len() as u64;
+    for u in s.users.values() {
+        let mut h = DefaultHasher::new();
+        (u.id, u.name(), &u.nickname, s.online.contains(&u.id)).hash(&mut h);
+        key = key.wrapping_add(h.finish());
+    }
+    key
+}
+
+#[derive(Clone, Copy)]
+enum Line {
+    Heading { online: bool, count: usize },
+    Member { id: UserId, online: bool },
+}
+
+/// The member list's lines, made again only when `people_key` changes.
+struct Roster {
+    session: WeakEntity<Session>,
+    key: u64,
+    lines: Rc<Vec<Line>>,
+    online: usize,
+    total: usize,
+}
+
+thread_local! {
+    /// By session: the list is drawn for the server view, which keeps nothing of it.
+    static ROSTERS: RefCell<Vec<Roster>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Online first, then offline, each by name, under a heading with how many.
+fn roster(session: &Entity<Session>, cx: &App) -> (Rc<Vec<Line>>, usize, usize) {
+    let s = session.read(cx);
+    let key = people_key(s);
+    let id = session.entity_id();
+    ROSTERS.with(|r| {
+        let mut r = r.borrow_mut();
+        if let Some(known) = r.iter().find(|k| k.session.entity_id() == id && k.key == key) {
+            return (known.lines.clone(), known.online, known.total);
+        }
+        r.retain(|k| k.session.entity_id() != id && k.session.upgrade().is_some());
+        let mut users: Vec<(String, UserId)> = s.users.values().map(|u| (u.name().to_lowercase(), u.id)).collect();
+        users.sort();
+        let (online, offline): (Vec<UserId>, Vec<UserId>) = users.into_iter().map(|(_, id)| id).partition(|id| s.online.contains(id));
+        let mut lines = vec![Line::Heading { online: true, count: online.len() }];
+        lines.extend(online.iter().map(|&id| Line::Member { id, online: true }));
+        if !offline.is_empty() {
+            lines.push(Line::Heading { online: false, count: offline.len() });
+            lines.extend(offline.iter().map(|&id| Line::Member { id, online: false }));
+        }
+        let known = Roster { session: session.downgrade(), key, lines: Rc::new(lines), online: online.len(), total: online.len() + offline.len() };
+        let out = (known.lines.clone(), known.online, known.total);
+        r.push(known);
+        out
+    })
+}
 
 impl ServerView {
-    pub fn render_members(&mut self, t: &Theme, window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
-        let s = self.session.read(cx);
-        let mut users: Vec<User> = s.users.values().cloned().collect();
-        users.sort_by_cached_key(|a| a.name().to_lowercase());
-        let in_voice: HashSet<UserId> = s.rosters.values().flatten().map(|m| m.user_id).collect();
-        let (online, offline): (Vec<User>, Vec<User>) = users.into_iter().partition(|u| s.online.contains(&u.id));
-        let total = online.len() + offline.len();
-        let mut list = div().id("members").flex().flex_col().gap(px(1.)).px(px(8.)).pb(px(10.)).flex_1().min_h(px(0.)).overflow_y_scroll();
-        list = list.child(div().px(px(6.)).pt(px(4.)).pb(px(4.)).child(label(trf!("Online · {}", "Online · {}", online.len()), t)));
-        for u in &online {
-            list = list.child(self.member_row(u, true, in_voice.contains(&u.id), t, window, cx));
-        }
-        if !offline.is_empty() {
-            list = list.child(div().px(px(6.)).pt(px(14.)).pb(px(4.)).child(label(trf!("Offline · {}", "Offline · {}", offline.len()), t)));
-            for u in &offline {
-                list = list.child(self.member_row(u, false, false, t, window, cx));
-            }
-        }
-        let online_count = online.len();
+    pub fn render_members(&mut self, t: &Theme, _: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
+        let (lines, online_count, total) = roster(&self.session, cx);
+        // Only the lines in view are made, so only their pictures are asked for.
+        let list = uniform_list(
+            "members",
+            lines.len(),
+            cx.processor(move |this, range: std::ops::Range<usize>, window, cx| {
+                let t = current();
+                range.map(|ix| this.member_line(lines[ix], &t, window, cx)).collect::<Vec<_>>()
+            }),
+        )
+        .flex_1()
+        .min_h(px(0.))
+        .px(px(8.))
+        .pb(px(10.));
         div()
             .flex()
             .flex_col()
@@ -49,6 +113,28 @@ impl ServerView {
                     .child(mono(format!("{online_count}/{total}"), t.text3)),
             )
             .child(list)
+    }
+
+    fn member_line(&mut self, line: Line, t: &Theme, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let content = match line {
+            Line::Heading { online, count } => div()
+                .size_full()
+                .flex()
+                .items_end()
+                .px(px(6.))
+                .pb(px(4.))
+                .child(label(if online { trf!("Online · {}", "Online · {}", count) } else { trf!("Offline · {}", "Offline · {}", count) }, t))
+                .into_any_element(),
+            Line::Member { id, online } => {
+                let s = self.session.read(cx);
+                let in_voice = online && s.rosters.values().flatten().any(|m| m.user_id == id);
+                match s.users.get(&id).cloned() {
+                    Some(u) => self.member_row(&u, online, in_voice, t, window, cx),
+                    None => div().into_any_element(),
+                }
+            }
+        };
+        div().w_full().h(px(LINE)).pb(px(1.)).child(content).into_any_element()
     }
 
     fn member_row(&mut self, u: &User, online: bool, in_voice: bool, t: &Theme, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {

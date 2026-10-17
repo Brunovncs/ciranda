@@ -112,12 +112,18 @@ impl Voice {
 
     /// Changes resolution or frame rate while sharing.
     pub fn update_screen(&mut self, choice: ScreenChoice, cx: &mut Context<Self>) {
-        if let Some(share) = &self.shares.screen {
-            let params = choice.params();
-            share.capture.switch(choice.clone());
-            if let Some(l) = &share.out.link {
-                l.set_video_params(params);
-            }
+        let Some(share) = self.shares.screen.as_mut() else { return };
+        let params = choice.params();
+        if share.capture.switch(choice) {
+            // Sound turned on for a share that started without: its connection has no track
+            // for it. Published again now, with one, rather than waiting for the reconciler.
+            log::info!("the screen share has sound now; publishing it again");
+            share.out.hang_up();
+            share.out.backoff.reset();
+            share.capture.follow_encoder(None);
+            self.publish(TileKind::Screen, cx);
+        } else if let Some(l) = &share.out.link {
+            l.set_video_params(params);
         }
         cx.notify();
     }
@@ -165,6 +171,15 @@ impl Voice {
                 self.publish(kind, cx);
             }
         }
+        self.follow_screen_encoder();
+    }
+
+    /// The screen's frames follow the encoder of the connection it goes out on now; none
+    /// (and so no NV12) while it has none.
+    fn follow_screen_encoder(&self) {
+        if let Some(s) = &self.shares.screen {
+            s.capture.follow_encoder(s.out.link.as_ref().map(|l| l.hardware_encoder.clone()));
+        }
     }
 
     /// After the slot changed: the old paths are hung up (an orphan there would refuse whoever
@@ -177,6 +192,7 @@ impl Voice {
                 out.backoff.reset();
             }
         }
+        self.follow_screen_encoder();
         let tiles: Vec<Entity<Tile>> =
             [self.shares.camera.as_ref().map(|s| s.tile.clone()), self.shares.screen.as_ref().map(|s| s.tile.clone())]
                 .into_iter()
@@ -247,6 +263,7 @@ impl Voice {
                         out.mid = mid;
                         out.went_live = true;
                         out.backoff.reset();
+                        v.follow_screen_encoder();
                         v.announce(cx);
                         cx.notify();
                     }

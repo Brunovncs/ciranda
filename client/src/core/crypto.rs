@@ -224,7 +224,21 @@ impl PairKey {
     }
 }
 
+/// The random nonce of something sealed. Fresh for every sealing, so the same one under two
+/// message ids is one sealed text sent twice: the client tells a replay by it even for messages
+/// sealed before they carried an id of their own.
+pub fn nonce_of(sealed: &str) -> Option<[u8; NONCE]> {
+    let bytes = unb64(sealed)?;
+    (bytes.len() >= 1 + NONCE + TAG && bytes[0] == VERSION).then(|| bytes[1..1 + NONCE].try_into().expect("NONCE bytes"))
+}
+
 /// What a sealed thing is and where it belongs, bound in as associated data.
+///
+/// Which message it is can't be: the server numbers a message only after it is sealed. So that
+/// goes inside, in the sealed text, which the AEAD authenticates exactly as it does these (see
+/// `dm::Payload`). A call's key is told from another call's by its nonce (`nonce_of`). Keeping
+/// these strings as they were is what lets a version from before that change still open
+/// everything sent after it.
 pub mod aad {
     pub fn message(conversation: i64, sender: i64) -> String {
         format!("harmony-dm-v1/message/{conversation}/{sender}")
@@ -319,7 +333,11 @@ mod tests {
     fn the_same_text_seals_differently_every_time() {
         let (alice, bob) = (Identity::generate(), Identity::generate());
         let k = pair_key(&alice, 1, &bob.public(), 2, 7).unwrap();
-        assert_ne!(k.seal("a", b"same"), k.seal("a", b"same"));
+        let (one, two) = (k.seal("a", b"same"), k.seal("a", b"same"));
+        assert_ne!(one, two);
+        assert_ne!(nonce_of(&one), nonce_of(&two));
+        assert_eq!(nonce_of(&one).unwrap().as_slice(), &unb64(&one).unwrap()[1..1 + NONCE]);
+        assert_eq!(nonce_of("not sealed"), None);
     }
 
     #[test]

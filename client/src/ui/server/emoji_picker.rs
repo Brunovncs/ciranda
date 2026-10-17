@@ -211,7 +211,10 @@ pub fn add_emoji(session: Entity<Session>, window: &mut Window, cx: &mut App) {
     cx.spawn(async move |cx| {
         let Ok(Ok(Some(paths))) = paths.await else { return };
         let Some(path) = paths.into_iter().next() else { return };
-        let png = (|| -> Result<Vec<u8>, String> {
+        // A photo straight off a phone takes a second to decode and resize: not on the UI thread.
+        let source = path.clone();
+        let png: Result<Vec<u8>, String> = cx.background_executor().spawn(async move {
+            let path = source;
             let img = image::open(&path).map_err(|_| {
                 tr!("That file is not a picture Ciranda can read.", "Ciranda não consegue ler esse arquivo como imagem.").to_string()
             })?;
@@ -224,7 +227,8 @@ pub fn add_emoji(session: Entity<Session>, window: &mut Window, cx: &mut App) {
             } else {
                 Ok(out)
             }
-        })();
+        })
+        .await;
         let stem: String = path
             .file_stem()
             .map(|s| s.to_string_lossy().to_lowercase())

@@ -332,6 +332,10 @@ enum Control {
     Switch(ScreenChoice),
 }
 
+/// The flag of the connection the share goes out on that says whether its encoder is the
+/// graphics card's; a lone `false` while there is none.
+type Encoder = Arc<Mutex<Arc<AtomicBool>>>;
+
 pub struct ScreenCapture {
     stop: Arc<AtomicBool>,
     pub source: NativeVideoSource,
@@ -340,6 +344,7 @@ pub struct ScreenCapture {
     control: mpsc::Sender<Control>,
     sound: Mutex<Option<Loopback>>,
     sound_source: Mutex<Option<libwebrtc::audio_source::native::NativeAudioSource>>,
+    encoder: Encoder,
 }
 
 impl ScreenCapture {
@@ -349,9 +354,10 @@ impl ScreenCapture {
         let source = NativeVideoSource::new(VideoResolution { width: w, height: h }, true);
         let preview = Arc::new(FrameSlot::default());
         let stop = Arc::new(AtomicBool::new(false));
+        let encoder = Encoder::default();
         let (tx, rx) = mpsc::channel();
-        let (src, prev, st, c) = (source.clone(), preview.clone(), stop.clone(), choice.clone());
-        std::thread::Builder::new().name("ciranda-screen".into()).spawn(move || run(c, rx, src, prev, st)).ok();
+        let (src, prev, st, c, enc) = (source.clone(), preview.clone(), stop.clone(), choice.clone(), encoder.clone());
+        std::thread::Builder::new().name("ciranda-screen".into()).spawn(move || run(c, rx, src, prev, st, enc)).ok();
         super::replay::sharing(true);
         let sound = loopback_for(&choice).map(Loopback::start);
         let sound_source = sound.as_ref().map(|l| l.source.clone());
@@ -363,6 +369,7 @@ impl ScreenCapture {
             control: tx,
             sound: Mutex::new(sound),
             sound_source: Mutex::new(sound_source),
+            encoder,
         }
     }
 
@@ -371,9 +378,43 @@ impl ScreenCapture {
         self.sound_source.lock().clone().map(|s| super::rtc::factory().create_audio_track("screen-sound", s))
     }
 
-    pub fn switch(&self, choice: ScreenChoice) {
-        *self.choice.lock() = choice.clone();
+    /// Frames are made for the encoder of the connection the share now goes out on (its
+    /// `Link::hardware_encoder`), or for none: NV12 only while that one is the graphics card's.
+    pub fn follow_encoder(&self, hardware: Option<Arc<AtomicBool>>) {
+        *self.encoder.lock() = hardware.unwrap_or_default();
+    }
+
+    /// Changes what is shared and how. True when the share's sound was off from the start and
+    /// is now on: the connection carries no sound track then, so it has to be published again
+    /// for anyone to hear it (MediaMTX can't renegotiate).
+    pub fn switch(&self, choice: ScreenChoice) -> bool {
+        let before = loopback_for(&std::mem::replace(&mut *self.choice.lock(), choice.clone()));
+        let after = loopback_for(&choice);
         let _ = self.control.send(Control::Switch(choice));
+        if after == before {
+            return false;
+        }
+        // The sound follows the choice: "No sound" has to mean none, and a window's sound is
+        // that window's application, not the one shared before. The track stays; only what
+        // feeds it changes.
+        let mut sound = self.sound.lock();
+        *sound = None;
+        let mut source = self.sound_source.lock();
+        match (source.clone(), after) {
+            (Some(s), _) => {
+                *sound = after.map(|mode| Loopback::feeding(mode, s));
+                false
+            }
+            // A share that started without sound: a source for it now, and a track on the
+            // connection it is published on next.
+            (None, Some(mode)) => {
+                let loopback = Loopback::start(mode);
+                *source = Some(loopback.source.clone());
+                *sound = Some(loopback);
+                true
+            }
+            (None, None) => false,
+        }
     }
 
     pub fn stop(&self) {
@@ -419,13 +460,30 @@ fn run(
     source: NativeVideoSource,
     preview: Arc<FrameSlot>,
     stop: Arc<AtomicBool>,
+    encoder: Encoder,
 ) {
+    let mut waiting = false;
+    let mut replay_scratch = Vec::new();
     'outer: while !stop.load(Ordering::Relaxed) {
         let Some(mut c) = capturer(choice.source.kind) else {
             log::warn!("screen capture is unavailable");
             return;
         };
-        let target = c.get_source_list().into_iter().find(|s| s.id() == choice.source.id);
+        let Some(target) = c.get_source_list().into_iter().find(|s| s.id() == choice.source.id) else {
+            // Closed, or unplugged, since it was picked. Capturing with no source would send the
+            // whole desktop, which nobody chose to show: nothing goes out until it's back or
+            // another is picked.
+            if !std::mem::replace(&mut waiting, true) {
+                log::warn!("the shared {:?} is gone; waiting for it or another", choice.source.kind);
+            }
+            std::thread::sleep(Duration::from_millis(500));
+            while let Ok(Control::Switch(next)) = control.try_recv() {
+                choice = next;
+            }
+            continue 'outer;
+        };
+        waiting = false;
+        let target = Some(target);
         let staging: Arc<Mutex<Staging>> = Default::default();
         let s = staging.clone();
         c.start_capture(target, move |frame| {
@@ -451,7 +509,7 @@ fn run(
                 let mut st = staging.lock();
                 st.resolution = Some(choice.resolution);
                 st.preview_id = preview.id;
-                st.nv12 = super::rtc::hardware_encoder_running();
+                st.nv12 = encoder.lock().load(Ordering::Relaxed);
                 // Your own preview at a few frames a second is enough, and none while nobody sees it.
                 if !video::window_hidden() && preview_at.elapsed() > Duration::from_millis(200) {
                     preview_at = Instant::now();
@@ -462,7 +520,7 @@ fn run(
             let mut st = staging.lock();
             if let Some(buffer) = st.frame.take() {
                 if super::replay::recording() {
-                    keep_for_replay(&buffer, choice.fps);
+                    keep_for_replay(&buffer, choice.fps, &mut replay_scratch);
                 }
                 let mut vf = VideoFrame::new(VideoRotation::VideoRotation0, buffer);
                 vf.timestamp_us = started.elapsed().as_micros() as i64;
@@ -480,56 +538,53 @@ fn run(
     }
 }
 
-/// A copy of the frame sent, as packed NV12 no taller than the replay keeps, for the replay.
-fn keep_for_replay(frame: &EncoderFrame, fps: u32) {
-    let max = super::replay::MAX_HEIGHT;
-    let (fw, fh) = { let b = frame.as_ref(); (b.width(), b.height()) };
-    let scaled;
-    let frame = if fh > max {
-        let w = ((fw as u64 * max as u64 / fh as u64) as u32) & !1;
-        let mut out = I420Buffer::new(w, max);
-        match frame {
-            EncoderFrame::I420(b) => yuv::scale(b, &mut out),
-            EncoderFrame::Nv12(b) => {
-                let mut full = I420Buffer::new(fw, fh);
-                let (sy, suv) = b.strides();
-                let (y, uv) = b.data();
-                let (dy, du, dv) = full.strides();
-                let (oy, ou, ov) = full.data_mut();
-                yuv_helper::nv12_to_i420(y, sy, uv, suv, oy, dy, ou, du, ov, dv, fw as i32, fh as i32);
-                yuv::scale(&full, &mut out);
-            }
-        }
-        scaled = EncoderFrame::I420(out);
-        &scaled
-    } else {
-        frame
+/// A copy of the frame sent, as packed NV12 no taller than the replay keeps, for the replay. The
+/// replay says first whether it wants this frame at all, and the scaling and converting are done
+/// straight into its buffer: no picture in between, even from above 1080p. `scratch` is kept by
+/// the caller for chroma on its way from I420.
+fn keep_for_replay(frame: &EncoderFrame, fps: u32, scratch: &mut Vec<u8>) {
+    let (fw, fh) = {
+        let b = frame.as_ref();
+        (b.width(), b.height())
     };
+    let (w, h) = replay_size(fw, fh);
+    let scaled = (w, h) != (fw, fh);
     match frame {
-        EncoderFrame::I420(b) => {
-            let (w, h) = (b.width(), b.height());
-            let (sy, su, sv) = b.strides();
-            let (y, u, v) = b.data();
-            super::replay::video(w, h, fps, |out| {
-                let (oy, ouv) = out.split_at_mut((w * h) as usize);
+        EncoderFrame::I420(b) => super::replay::video(w, h, fps, |out| {
+            let (oy, ouv) = out.split_at_mut((w * h) as usize);
+            if scaled {
+                yuv::scale_i420_to_nv12(b, oy, ouv, (w, h), scratch);
+            } else {
+                let (sy, su, sv) = b.strides();
+                let (y, u, v) = b.data();
                 yuv_helper::i420_to_nv12(y, sy, u, su, v, sv, oy, w, ouv, w, w as i32, h as i32);
-            });
-        }
-        EncoderFrame::Nv12(b) => {
-            let (w, h) = (b.width(), b.height());
+            }
+        }),
+        EncoderFrame::Nv12(b) => super::replay::video(w, h, fps, |out| {
             let (sy, suv) = b.strides();
             let (y, uv) = b.data();
-            super::replay::video(w, h, fps, |out| {
-                let (oy, ouv) = out.split_at_mut((w * h) as usize);
-                for r in 0..h as usize {
-                    oy[r * w as usize..][..w as usize].copy_from_slice(&y[r * sy as usize..][..w as usize]);
-                }
-                for r in 0..(h / 2) as usize {
-                    ouv[r * w as usize..][..w as usize].copy_from_slice(&uv[r * suv as usize..][..w as usize]);
-                }
-            });
-        }
+            let (oy, ouv) = out.split_at_mut((w * h) as usize);
+            if scaled {
+                yuv::scale_nv12(y, sy, uv, suv, (fw, fh), oy, ouv, (w, h));
+                return;
+            }
+            for r in 0..h as usize {
+                oy[r * w as usize..][..w as usize].copy_from_slice(&y[r * sy as usize..][..w as usize]);
+            }
+            for r in 0..(h / 2) as usize {
+                ouv[r * w as usize..][..w as usize].copy_from_slice(&uv[r * suv as usize..][..w as usize]);
+            }
+        }),
     }
+}
+
+/// What the replay keeps of a `w` × `h` frame (even-sided): no taller than it keeps, even sides.
+fn replay_size(w: u32, h: u32) -> (u32, u32) {
+    let max = super::replay::MAX_HEIGHT;
+    if h <= max {
+        return (w, h);
+    }
+    (((w as u64 * max as u64 / h as u64) as u32).max(2) & !1, max)
 }
 
 /// `w` and `h` scaled down to `max_w` wide at most, keeping the shape.

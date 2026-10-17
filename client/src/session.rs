@@ -57,7 +57,10 @@ pub enum Link {
     Asleep,
 }
 
-#[derive(Default)]
+/// How many rooms keep their history here: the one open and those opened just before it. Leaving
+/// one further back lets its history go; opening it again loads it anew.
+const KEEP_LOGS: usize = 6;
+
 pub struct ChatLog {
     pub messages: Vec<Message>,
     pub pinned: Vec<Message>,
@@ -70,6 +73,35 @@ pub struct ChatLog {
     /// Older messages exist before the first one shown.
     pub more_before: bool,
     pub error: Option<String>,
+    /// The socket dropped while this room was not open, so pushes may have been missed: the latest
+    /// page is fetched again when it is.
+    stale: bool,
+    /// Changes whenever the messages are replaced rather than added to, so an older page asked
+    /// for before then is not put in front of messages it does not join up with.
+    generation: u64,
+}
+
+impl Default for ChatLog {
+    fn default() -> ChatLog {
+        ChatLog {
+            messages: Vec::new(),
+            pinned: Vec::new(),
+            loaded: false,
+            fetching: false,
+            loading_older: false,
+            pending: Vec::new(),
+            more_before: false,
+            error: None,
+            stale: false,
+            generation: next_generation(),
+        }
+    }
+}
+
+/// Unique across logs, so a log dropped and made again never takes an old answer for its own.
+fn next_generation() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// A page of history as it arrived.
@@ -91,6 +123,10 @@ impl ChatLog {
     fn push(&mut self, op: LogOp) {
         if self.fetching {
             self.pending.push(op);
+        } else if self.stale && matches!(op, LogOp::Added(_)) {
+            // Missed messages may lie between the newest kept and this one. Added, it would make
+            // the latest page fetched on opening look continuous with what's kept, and the ones
+            // in between would never be fetched; the page brings it anyway.
         } else if self.loaded {
             self.apply(op);
         }
@@ -98,15 +134,15 @@ impl ChatLog {
 
     fn apply(&mut self, op: LogOp) {
         match op {
+            // The messages are in id order, so they are found by halving.
             LogOp::Added(m) => {
-                if !self.messages.iter().any(|x| x.id == m.id) {
-                    let at = self.messages.partition_point(|x| x.id < m.id);
+                if let Err(at) = self.find(m.id) {
                     self.messages.insert(at, m);
                 }
             }
             LogOp::Updated(m) => {
-                if let Some(x) = self.messages.iter_mut().find(|x| x.id == m.id) {
-                    *x = m.clone();
+                if let Ok(at) = self.find(m.id) {
+                    self.messages[at] = m.clone();
                 }
                 self.pinned.retain(|x| x.id != m.id);
                 if m.pinned {
@@ -115,7 +151,9 @@ impl ChatLog {
                 }
             }
             LogOp::Deleted(id) => {
-                self.messages.retain(|m| m.id != id);
+                if let Ok(at) = self.find(id) {
+                    self.messages.remove(at);
+                }
                 self.pinned.retain(|m| m.id != id);
             }
             LogOp::Reactions(id, r) => {
@@ -124,6 +162,11 @@ impl ChatLog {
                 }
             }
         }
+    }
+
+    /// Where a message is, or would go.
+    fn find(&self, id: MessageId) -> Result<usize, usize> {
+        self.messages.binary_search_by_key(&id, |m| m.id)
     }
 
     /// The latest page arrived: within its span it is the truth (edits, deletions, messages
@@ -136,6 +179,9 @@ impl ChatLog {
         if !self.loaded || !full || gap {
             self.more_before = full;
             self.messages = page.messages;
+            // An older page on its way belonged to the messages just let go.
+            self.generation = next_generation();
+            self.loading_older = false;
         } else if let Some(oldest) = oldest {
             self.messages.retain(|m| m.id < oldest);
             self.messages.extend(page.messages);
@@ -156,9 +202,39 @@ impl ChatLog {
             for op in pending {
                 self.apply(op);
             }
+            // What was missed is still missing: tried again the next time it is opened.
+            self.stale = true;
         } else {
             self.error = Some(message);
         }
+    }
+
+    /// An older page may be asked for now: before which message, and the generation the answer
+    /// must find to be put in.
+    fn begin_older(&mut self) -> Option<(MessageId, u64)> {
+        if self.fetching || self.loading_older || !self.more_before {
+            return None;
+        }
+        let first = self.messages.first()?.id;
+        self.loading_older = true;
+        Some((first, self.generation))
+    }
+
+    /// The older page asked for in `generation`. Dropped if the messages were replaced since (a
+    /// reconnect's catch-up found a gap): put in front of them it would leave a hole between.
+    fn older_landed(&mut self, generation: u64, page: Option<History>) -> bool {
+        if generation != self.generation {
+            return false;
+        }
+        self.loading_older = false;
+        let Some(page) = page else { return true };
+        self.more_before = page.messages.len() >= PAGE;
+        let first = self.messages.first().map_or(MessageId::MAX, |m| m.id);
+        let mut older = page.messages;
+        older.retain(|m| m.id < first);
+        older.append(&mut self.messages);
+        self.messages = older;
+        true
     }
 }
 
@@ -300,6 +376,8 @@ pub struct Session {
     pub emojis: Vec<CustomEmoji>,
     pub clips: Vec<Clip>,
     pub chats: HashMap<Room, ChatLog>,
+    /// The rooms opened last, the latest at the end: theirs are the histories kept (`KEEP_LOGS`).
+    recent: Vec<Room>,
     /// Messages naming you (or everyone) per channel since you last opened it. Counted here from
     /// the pushes and nowhere else: nothing is sent to the server, and it goes when the app closes.
     pub mentioned: HashMap<ChannelId, u32>,
@@ -316,6 +394,8 @@ pub struct Session {
     pub dms: HashMap<ConversationId, Dm>,
     /// The conversation list has come from the server at least once.
     pub dms_loaded: bool,
+    /// When an inbox answer last asked for the list again, while it hasn't come.
+    dms_asked: Option<Instant>,
     /// People you blocked.
     pub blocked: HashSet<UserId>,
     /// Private calls ringing for you, from you, or under way.
@@ -337,6 +417,10 @@ pub struct Session {
     retiring: Option<Realtime>,
     /// Stopped for good: nothing is asked or opened any more, whoever still holds it.
     stopped: bool,
+    /// The full socket has been up at least once, so the next time it comes up is a reconnect.
+    pub ever_up: bool,
+    /// Who this session is to the shared cache, which keeps every session's pictures apart.
+    keep_owner: u64,
     /// A new identity key is on its way to the server.
     creating_key: bool,
     _pump: Task<()>,
@@ -417,6 +501,7 @@ impl Session {
             vault,
             dms: HashMap::new(),
             dms_loaded: false,
+            dms_asked: None,
             blocked: HashSet::new(),
             calls: HashMap::new(),
             call_rosters: HashMap::new(),
@@ -435,6 +520,7 @@ impl Session {
             emojis: Vec::new(),
             clips: Vec::new(),
             chats: HashMap::new(),
+            recent: Vec::new(),
             mentioned: HashMap::new(),
             open_room: None,
             unread: HashSet::new(),
@@ -446,6 +532,11 @@ impl Session {
             polled_at: None,
             retiring: None,
             stopped: false,
+            ever_up: false,
+            keep_owner: {
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            },
             creating_key: false,
             _pump: Task::ready(()),
         }
@@ -463,10 +554,10 @@ impl Session {
                 }
             }
         });
-        if let Some(old) = self.realtime.replace(rt) {
-            if let Some(older) = self.retiring.replace(old) {
-                older.stop();
-            }
+        if let Some(old) = self.realtime.replace(rt)
+            && let Some(older) = self.retiring.replace(old)
+        {
+            older.stop();
         }
         self.link = Link::Reconnecting;
     }
@@ -476,6 +567,7 @@ impl Session {
         for rt in self.realtime.take().into_iter().chain(self.retiring.take()) {
             rt.stop();
         }
+        self.cache.drop_keep(self.keep_owner);
         self.cache.flush_all();
     }
 
@@ -545,6 +637,13 @@ impl Session {
     fn inbox_said(&mut self, got: Result<Inbox, ApiError>, cx: &mut Context<Self>) {
         match got {
             Ok(inbox) => {
+                // The server answers, but the conversation list never came: without it nothing new
+                // can be told apart from what was there, so it is asked for again.
+                // Not again while the last try is still retrying (about half a minute).
+                if !self.dms_loaded && self.dms_asked.is_none_or(|at| at.elapsed() > Duration::from_secs(60)) {
+                    self.dms_asked = Some(Instant::now());
+                    self.load_dms(cx);
+                }
                 let news = self.dms_loaded && inbox.latest > self.newest_dm();
                 if self.background && self.realtime.is_none() && (news || inbox.ringing || inbox.in_call) {
                     self.wake(cx);
@@ -626,12 +725,13 @@ impl Session {
                 self.catch_up(cx);
             }
             realtime::Event::Up(snap) => {
-                let was_down = self.link == Link::Reconnecting && !self.channels.is_empty();
+                let was_down = self.link == Link::Reconnecting && self.ever_up;
                 let calls_before = self.calls.clone();
                 if let Some(snap) = snap {
                     self.apply_snapshot(*snap);
                 }
                 self.link = Link::Up;
+                self.ever_up = true;
                 self.calls_reconciled(calls_before, cx);
                 if was_down {
                     cx.emit(SessionEvent::Reconnected);
@@ -963,6 +1063,10 @@ impl Session {
     /// The cache keeps, whatever its budget, what is drawn all the time: avatars, emoji, sounds,
     /// and every saved server's picture, so the rail still has them offline.
     fn update_keep_set(&self, cx: &App) {
+        // A reply landing after the stop would bring back what the stop let go.
+        if self.stopped {
+            return;
+        }
         let keep = self
             .users
             .values()
@@ -971,7 +1075,7 @@ impl Session {
             .chain(self.clips.iter().map(|c| c.hash.clone()))
             .chain(self.server_icon.clone())
             .chain(crate::prefs::prefs(cx).saved_servers.iter().filter(|s| !s.icon.is_empty()).map(|s| s.icon.clone()));
-        self.cache.set_keep(keep);
+        self.cache.set_keep(self.keep_owner, keep);
     }
 
     // Chat.
@@ -991,11 +1095,20 @@ impl Session {
                 self.mark_read(id, cx);
             }
         }
+        self.keep_recent(room);
         let log = self.chats.entry(room).or_default();
-        if !log.loaded && !log.fetching {
+        if (!log.loaded || log.stale) && !log.fetching {
             self.fetch_latest(room, cx);
         }
         cx.notify();
+    }
+
+    /// `room` was just opened: the histories of rooms opened longer ago than the last `KEEP_LOGS`
+    /// go, so what is kept does not grow with every room visited.
+    fn keep_recent(&mut self, room: Room) {
+        touch_recent(&mut self.recent, room, KEEP_LOGS);
+        let recent = &self.recent;
+        self.chats.retain(|r, _| recent.contains(r));
     }
 
     /// No chat is on screen any more: the stage took its place.
@@ -1005,13 +1118,20 @@ impl Session {
         }
     }
 
-    /// After a reconnect: whatever happened in the channels already shown while the socket was
-    /// down (and another go at the open one, if it never loaded).
+    /// After a reconnect: whatever happened in the open room while the socket was down (and
+    /// another go at it, if it never loaded). The other rooms kept are only marked, and caught up
+    /// when opened: asking for every one at once would make each reconnect cost them all.
     fn catch_up(&mut self, cx: &mut Context<Self>) {
-        let due: Vec<Room> =
-            self.chats.iter().filter(|(id, l)| !l.fetching && (l.loaded || self.open_room == Some(**id))).map(|(id, _)| *id).collect();
-        for id in due {
-            self.fetch_latest(id, cx);
+        let open = self.open_room;
+        for (room, log) in self.chats.iter_mut() {
+            if Some(*room) != open && log.loaded {
+                log.stale = true;
+            }
+        }
+        if let Some(room) = open
+            && self.chats.get(&room).is_some_and(|l| !l.fetching)
+        {
+            self.fetch_latest(room, cx);
         }
     }
 
@@ -1036,13 +1156,16 @@ impl Session {
     }
 
     fn fetch_latest(&mut self, room: Room, cx: &mut Context<Self>) {
-        self.chats.entry(room).or_default().fetching = true;
+        let log = self.chats.entry(room).or_default();
+        log.fetching = true;
+        log.stale = false;
         let page = self.page(room, None);
         cx.spawn(async move |this, cx| {
             let got = page.await;
             let _ = this.update(cx, |s, cx| {
                 let got = got.map(|p| s.opened(room, p));
-                let log = s.chats.entry(room).or_default();
+                // Let go meanwhile (too many rooms opened since): nothing to put it in.
+                let Some(log) = s.chats.get_mut(&room) else { return };
                 match got {
                     Ok(h) => log.land(h),
                     Err(e) => log.fetch_failed(e.message),
@@ -1060,27 +1183,17 @@ impl Session {
 
     /// One more page of history before the oldest message shown.
     pub fn load_older(&mut self, room: Room, cx: &mut Context<Self>) {
-        let Some(log) = self.chats.get_mut(&room) else { return };
-        if log.fetching || log.loading_older || !log.more_before {
-            return;
-        }
-        let Some(first) = log.messages.first().map(|m| m.id) else { return };
-        log.loading_older = true;
+        let Some((first, generation)) = self.chats.get_mut(&room).and_then(ChatLog::begin_older) else { return };
         let page = self.page(room, Some(first));
         cx.spawn(async move |this, cx| {
             let got = page.await;
             let _ = this.update(cx, |s, cx| {
                 let got = got.map(|p| s.opened(room, p));
-                let log = s.chats.entry(room).or_default();
-                log.loading_older = false;
-                if let Ok(h) = got {
-                    log.more_before = h.messages.len() >= PAGE;
-                    let mut older = h.messages;
-                    older.retain(|m| !log.messages.iter().any(|x| x.id == m.id));
-                    older.append(&mut log.messages);
-                    log.messages = older;
+                if let Some(log) = s.chats.get_mut(&room)
+                    && log.older_landed(generation, got.ok())
+                {
+                    cx.notify();
                 }
-                cx.notify();
             });
         })
         .detach();
@@ -1144,6 +1257,15 @@ async fn fetch_attachment(api: Api, cache: Cache, hash: String, how: Fetch) -> R
     }
 }
 
+/// Moves `item` to the end of `recent`, the latest, and hands back the oldest past `cap`, which
+/// are let go.
+fn touch_recent<T: PartialEq>(recent: &mut Vec<T>, item: T, cap: usize) -> Vec<T> {
+    recent.retain(|x| *x != item);
+    recent.push(item);
+    let over = recent.len().saturating_sub(cap.max(1));
+    recent.drain(..over).collect()
+}
+
 /// How long to wait before loading a picture again after `tries` failures: 2 s, doubling, to a
 /// minute.
 fn retry_after(tries: u32) -> Duration {
@@ -1205,7 +1327,7 @@ fn decode_frames(bytes: &[u8], content_type: &str, fit: (u32, u32)) -> anyhow::R
         let (n, d) = frame.delay().numer_denom_ms();
         // As browsers do: a GIF that asks for no delay at all (or 10 ms) plays at 10 per second.
         let ms = n.checked_div(d).unwrap_or(0);
-        end += if ms < 20 { 100 } else { ms };
+        end = end.saturating_add(if ms < 20 { 100 } else { ms });
         out.images.push(Arc::new(RenderImage::new(smallvec::smallvec![frame])));
         out.ends.push(end);
     }
@@ -1219,6 +1341,10 @@ fn decode_bgra(bytes: &[u8], content_type: &str, fit: (u32, u32)) -> anyhow::Res
     use image::{AnimationDecoder, Frame, ImageDecoder, RgbaImage};
     use std::io::Cursor;
     const MAX_FRAMES_BYTES: usize = 64 << 20;
+    // Each frame is its own image whatever its size: a GIF of a million 1×1 frames fits in an
+    // upload and costs little in pixels, so the count and a per-frame overhead are capped too.
+    const MAX_FRAMES: usize = 1000;
+    const FRAME_OVERHEAD: usize = 4 << 10;
     let format = image_format(content_type, bytes).ok_or_else(|| anyhow::anyhow!("not a picture"))?;
     let bgra = |mut img: RgbaImage| {
         for px in img.chunks_exact_mut(4) {
@@ -1237,9 +1363,9 @@ fn decode_bgra(bytes: &[u8], content_type: &str, fit: (u32, u32)) -> anyhow::Res
             let buf = frame.into_buffer();
             let (w, h) = fit_within(buf.width(), buf.height(), fit);
             let buf = if (w, h) == buf.dimensions() { buf } else { image::imageops::thumbnail(&buf, w, h) };
-            cost += buf.len();
+            cost += buf.len() + FRAME_OVERHEAD;
             frames.push(Frame::from_parts(bgra(buf), 0, 0, delay));
-            if cost >= MAX_FRAMES_BYTES {
+            if cost >= MAX_FRAMES_BYTES || frames.len() >= MAX_FRAMES {
                 break;
             }
         }
@@ -1328,6 +1454,100 @@ mod tests {
         log.push(LogOp::Deleted(1));
         log.fetch_failed("offline".into());
         assert!(log.messages.is_empty() && log.error.is_none() && !log.fetching);
+    }
+
+    #[test]
+    fn an_older_page_asked_for_before_a_catch_up_replaced_the_log_is_dropped() {
+        let mut log = ChatLog::default();
+        log.land(page(100..150));
+        let (first, asked_in) = log.begin_older().unwrap();
+        assert_eq!(first, 100);
+        assert!(log.begin_older().is_none());
+        // A reconnect: the catch-up finds a gap and starts over from the newest page.
+        log.fetching = true;
+        log.land(page(300..350));
+        assert!(!log.older_landed(asked_in, Some(page(50..100))));
+        assert_eq!(ids(&log), (300..350).collect::<Vec<_>>());
+        // Scrolling up again asks before the new first message, and that answer goes in.
+        let (first, asked_in) = log.begin_older().unwrap();
+        assert_eq!(first, 300);
+        assert!(log.older_landed(asked_in, Some(page(250..300))));
+        assert_eq!(ids(&log), (250..350).collect::<Vec<_>>());
+        assert!(log.more_before);
+    }
+
+    #[test]
+    fn a_catch_up_that_merges_keeps_an_older_page_on_its_way() {
+        let mut log = ChatLog::default();
+        log.land(page(100..150));
+        let (_, asked_in) = log.begin_older().unwrap();
+        log.fetching = true;
+        log.land(page(110..160));
+        assert!(log.older_landed(asked_in, Some(page([90, 95, 100]))));
+        let mut want = vec![90, 95];
+        want.extend(100..160);
+        assert_eq!(ids(&log), want);
+        assert!(!log.more_before);
+    }
+
+    #[test]
+    fn a_log_made_again_does_not_take_an_older_log_s_answer() {
+        let mut log = ChatLog::default();
+        log.land(page(100..150));
+        let (_, asked_in) = log.begin_older().unwrap();
+        let mut again = ChatLog::default();
+        again.land(page(100..150));
+        assert!(!again.older_landed(asked_in, Some(page(50..100))));
+    }
+
+    #[test]
+    fn a_failed_catch_up_leaves_the_log_to_fetch_again() {
+        let mut log = ChatLog::default();
+        log.land(page([1]));
+        log.fetching = true;
+        log.fetch_failed("offline".into());
+        assert!(log.stale);
+    }
+
+    /// A room not open over a reconnect may have missed any number of messages: a new one pushed
+    /// on top would make the latest page look continuous, and the ones between never come.
+    #[test]
+    fn a_stale_log_fetches_what_it_missed_instead_of_taking_new_messages() {
+        let mut log = ChatLog::default();
+        log.land(page(1..=500));
+        log.stale = true;
+        log.push(LogOp::Added(msg(1000, "")));
+        assert_eq!(log.messages.last().map(|m| m.id), Some(500));
+        log.stale = false;
+        log.fetching = true;
+        log.land(page(951..=1000));
+        assert_eq!(ids(&log), (951..=1000).collect::<Vec<_>>(), "a gap: the kept ones go, not a silent hole");
+    }
+
+    #[test]
+    fn recent_rooms_keep_their_order_and_the_oldest_go() {
+        let mut recent = Vec::new();
+        for r in 1..=3 {
+            assert!(touch_recent(&mut recent, r, 3).is_empty());
+        }
+        assert!(touch_recent(&mut recent, 1, 3).is_empty());
+        assert_eq!(recent, [2, 3, 1]);
+        assert_eq!(touch_recent(&mut recent, 4, 3), [2]);
+        assert_eq!(recent, [3, 1, 4]);
+    }
+
+    #[test]
+    fn pushes_find_their_message_by_id() {
+        let mut log = ChatLog::default();
+        log.land(page([1, 3, 5]));
+        log.apply(LogOp::Added(msg(4, "")));
+        log.apply(LogOp::Added(msg(3, "again")));
+        log.apply(LogOp::Updated(msg(5, "edited")));
+        log.apply(LogOp::Deleted(1));
+        log.apply(LogOp::Deleted(2));
+        assert_eq!(ids(&log), [3, 4, 5]);
+        assert_eq!(log.messages[0].body, "");
+        assert_eq!(log.messages[2].body, "edited");
     }
 
     #[test]

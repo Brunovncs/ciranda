@@ -24,7 +24,7 @@ use crate::session::{Link, Session, SessionEvent};
 use crate::theme::{GUTTER, Theme, current, px, radius};
 use crate::ui::overlay::{self, Ask, Field};
 use crate::widgets::*;
-use chat::{ChatEvent, ChatView};
+use chat::{ChatEvent, ChatView, Draft};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     AnimationExt, AnyElement, App, AppContext, Context, Entity, EntityId, FocusHandle, Focusable, InteractiveElement, IntoElement,
@@ -56,6 +56,26 @@ pub enum Then {
     Dial(ConversationId),
 }
 
+/// How many chat panes are kept: the one on screen and the few shown before it, so going back to
+/// them is instant. Each one listens to its session and checks its messages whenever that
+/// changes, so one kept for every room ever opened would make every change cost them all.
+const KEEP_CHATS: usize = 4;
+
+/// Which chat a pane shows: a room of this server, or a private conversation of a server kept in
+/// the background (by its session).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum ChatKey {
+    Here(Room),
+    Away(EntityId, ConversationId),
+}
+
+/// A chat pane kept, with what it is listened to with: both go when it is let go.
+struct OpenChat {
+    key: ChatKey,
+    view: Entity<ChatView>,
+    _sub: Subscription,
+}
+
 pub struct ServerView {
     pub session: Entity<Session>,
     root: WeakEntity<Root>,
@@ -66,11 +86,13 @@ pub struct ServerView {
     /// The conversation open last, to open again with the rail's button.
     last_dm: Option<Center>,
     pub folded: HashSet<i64>,
-    chats: HashMap<Room, Entity<ChatView>>,
-    /// Conversations open from servers in the background, by their session and conversation, with
-    /// what they are listened to with.
-    away_chats: HashMap<(EntityId, ConversationId), (Entity<ChatView>, Subscription)>,
+    /// The chat panes kept, the one shown last at the end (`KEEP_CHATS`).
+    chats: Vec<OpenChat>,
+    /// What was being written in panes let go, for when their room is opened again.
+    drafts: HashMap<ChatKey, Draft>,
     pub call: Option<Entity<Call>>,
+    /// What the call is listened to with, replaced with the next call's.
+    call_subs: Vec<Subscription>,
     /// The "is calling you" dialog, while it rings.
     ringing: Option<Entity<private::Incoming>>,
     pub focused_tile: Option<Entity<crate::media::video::Tile>>,
@@ -182,9 +204,10 @@ impl ServerView {
             dms_open: false,
             last_dm: None,
             folded,
-            chats: HashMap::new(),
-            away_chats: HashMap::new(),
+            chats: Vec::new(),
+            drafts: HashMap::new(),
             call: None,
+            call_subs: Vec::new(),
             focused_tile: None,
             theater: None,
             theater_moved: std::time::Instant::now(),
@@ -236,6 +259,7 @@ impl ServerView {
                 self.session.update(cx, |s, cx| s.open(room, cx));
             }
         }
+        self.drop_gone_chats(cx);
         let gone = match self.center {
             Center::Chat(Room::Channel(id)) => self.session.read(cx).channel(id).is_none(),
             Center::Chat(Room::Dm(id)) => self.session.read(cx).dms_loaded && !self.session.read(cx).dms.contains_key(&id),
@@ -364,6 +388,23 @@ impl ServerView {
             self.show_stage(cx);
             return;
         }
+        // The call's key would be sealed to their current key: one this computer hasn't accepted
+        // yet is what somebody in the middle would hand out, so the change is confirmed first,
+        // where the conversation shows it.
+        let s = self.session.read(cx);
+        if let Some(peer) = s.peer_of(conversation)
+            && s.vault.ready()
+            && s.vault.key_changed_for(peer)
+        {
+            overlay::toast(
+                tr!(
+                    "Their security key changed. Confirm it in the conversation before calling.",
+                    "A chave de segurança dessa pessoa mudou. Confirme na conversa antes de ligar."
+                ),
+                cx,
+            );
+            return;
+        }
         let (muted, deafened) = self.carried_mute(cx);
         self.hang_up(false, cx);
         match Call::dial(self.session.clone(), conversation, muted, deafened, cx) {
@@ -448,12 +489,12 @@ impl ServerView {
                 }
             }
         });
-        self._subs.push(sub);
-        cx.observe(&call, |this, _, cx| {
+        let observe = cx.observe(&call, |this, _, cx| {
             this.sync_screen_ink(cx);
             cx.notify();
-        })
-        .detach();
+        });
+        // The call before is over by now; what listened to it goes.
+        self.call_subs = vec![sub, observe];
         crate::ui::game_overlay::set_call(Some((call.clone(), self.session.clone())), cx);
         self.call = Some(call);
         crate::ui::updates::call_changed(true, cx);
@@ -605,28 +646,69 @@ impl ServerView {
     }
 
     fn chat_view(&mut self, room: Room, window: &mut Window, cx: &mut Context<Self>) -> Entity<ChatView> {
-        if let Some(chat) = self.chats.get(&room) {
-            return chat.clone();
-        }
         let session = self.session.clone();
-        let chat = cx.new(|cx| ChatView::new(session, room, window, cx));
-        let sub = cx.subscribe_in(&chat, window, |this, _, ev: &ChatEvent, window, cx| this.on_chat_event(ev, window, cx));
-        self._subs.push(sub);
-        self.chats.insert(room, chat.clone());
-        chat
+        self.chat_pane(ChatKey::Here(room), &session, room, window, cx)
     }
 
     fn away_chat(&mut self, session: &Entity<Session>, conversation: ConversationId, window: &mut Window, cx: &mut Context<Self>) -> Entity<ChatView> {
-        let at = (session.entity_id(), conversation);
         // Chats of sessions no longer kept go with them.
-        self.away_chats.retain(|(id, _), _| crate::elsewhere::away_session(*id, cx).is_some());
-        if let Some((chat, _)) = self.away_chats.get(&at) {
-            return chat.clone();
+        let kept = |key: &ChatKey| match key {
+            ChatKey::Away(id, _) => crate::elsewhere::away_session(*id, cx).is_some(),
+            ChatKey::Here(_) => true,
+        };
+        self.chats.retain(|c| kept(&c.key));
+        self.drafts.retain(|key, _| kept(key));
+        self.chat_pane(ChatKey::Away(session.entity_id(), conversation), session, Room::Dm(conversation), window, cx)
+    }
+
+    /// The pane for `key`, made if it is not kept (with what was being written in it before), and
+    /// marked as shown last. Called on every draw of the chat, so finding it is kept cheap.
+    fn chat_pane(&mut self, key: ChatKey, session: &Entity<Session>, room: Room, window: &mut Window, cx: &mut Context<Self>) -> Entity<ChatView> {
+        if let Some(at) = self.chats.iter().position(|c| c.key == key) {
+            if at + 1 != self.chats.len() {
+                let chat = self.chats.remove(at);
+                self.chats.push(chat);
+            }
+            return self.chats[self.chats.len() - 1].view.clone();
         }
-        let chat = cx.new(|cx| ChatView::new(session.clone(), Room::Dm(conversation), window, cx));
-        let sub = cx.subscribe_in(&chat, window, |this, _, ev: &ChatEvent, window, cx| this.on_chat_event(ev, window, cx));
-        self.away_chats.insert(at, (chat.clone(), sub));
-        chat
+        let view = cx.new(|cx| ChatView::new(session.clone(), room, window, cx));
+        if let Some(draft) = self.drafts.remove(&key) {
+            view.update(cx, |c, cx| c.restore_draft(draft, cx));
+        }
+        let sub = cx.subscribe_in(&view, window, |this, _, ev: &ChatEvent, window, cx| this.on_chat_event(ev, window, cx));
+        self.chats.push(OpenChat { key, view: view.clone(), _sub: sub });
+        self.trim_chats(cx);
+        view
+    }
+
+    /// Lets go of the panes shown longest ago past `KEEP_CHATS`, keeping what was being written in
+    /// them. One waiting on a send stays until a later trim: if the send fails, its words go back
+    /// in its box.
+    fn trim_chats(&mut self, cx: &mut Context<Self>) {
+        let mut at = 0;
+        while self.chats.len() > KEEP_CHATS && at + 1 < self.chats.len() {
+            if self.chats[at].view.read(cx).busy() {
+                at += 1;
+                continue;
+            }
+            let chat = self.chats.remove(at);
+            if let Some(draft) = chat.view.update(cx, |c, cx| c.take_draft(cx)) {
+                self.drafts.insert(chat.key, draft);
+            }
+        }
+    }
+
+    /// Panes of rooms that are gone (a channel deleted, a conversation deleted) go with them, and
+    /// so does what was being written there.
+    fn drop_gone_chats(&mut self, cx: &mut Context<Self>) {
+        let s = self.session.read(cx);
+        let gone = |key: &ChatKey| match key {
+            ChatKey::Here(Room::Channel(id)) => !s.channels.is_empty() && s.channel(*id).is_none(),
+            ChatKey::Here(Room::Dm(id)) => s.dms_loaded && !s.dms.contains_key(id),
+            ChatKey::Away(..) => false,
+        };
+        self.chats.retain(|c| !gone(&c.key));
+        self.drafts.retain(|key, _| !gone(key));
     }
 
     fn on_chat_event(&mut self, ev: &ChatEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -1004,8 +1086,8 @@ impl ServerView {
         let s = self.session.read(cx);
         let role = s.me.role;
         let up = s.link == Link::Up;
-        // Before the first snapshot the link is coming up, not coming back.
-        let first = s.channels.is_empty();
+        // Before the socket was ever up the link is coming up, not coming back.
+        let first = !s.ever_up;
         let show_members = prefs(cx).show_members;
         let (state, color) = match (up, first) {
             (true, _) => (tr!("Connected", "Conectado"), t.success),

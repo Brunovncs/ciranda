@@ -109,8 +109,10 @@ fn main() {
     let webrtc_include = webrtc_dir.join("include");
     let webrtc_lib = webrtc_dir.join("lib");
 
+    // A libwebrtc already extracted by an earlier build is used as it is, so nothing is
+    // downloaded again; only a fresh download goes through the check.
     if !webrtc_dir.exists() {
-        webrtc_sys_build::download_webrtc().unwrap();
+        download_verified_webrtc(&webrtc_dir);
     }
 
     builder.includes(&[
@@ -641,6 +643,103 @@ fn libcxx_min_clang_major(libcxx: &path::Path) -> u32 {
             Some(ver / 100)
         })
         .unwrap_or(FALLBACK)
+}
+
+/// libwebrtc is linked statically into the program Ciranda ships, so the archive it comes from
+/// must be the one that was reviewed. webrtc_sys_build::download_webrtc extracts whatever the
+/// URL returns, with no check, so the download is done here instead: fetched, compared with a
+/// pinned SHA-256, and only then extracted, the same way and to the same place. The hashes are
+/// GitHub's digests of the release assets, confirmed by downloading the x64 one. Moving
+/// webrtc-sys-build to another WEBRTC_TAG changes the URL, and the build stops here until the
+/// new archive's hash is added.
+const WEBRTC_SHA256: &[(&str, &str)] = &[
+    (
+        "https://github.com/livekit/rust-sdks/releases/download/webrtc-89d790b/webrtc-win-x64-release.zip",
+        "5c2349c960bae4f06f71c102f58552d0d09c912a142811acfcadfb7c883cbf58",
+    ),
+    (
+        "https://github.com/livekit/rust-sdks/releases/download/webrtc-89d790b/webrtc-win-arm64-release.zip",
+        "b07a3a23fc7f98a7335e0f2334767fa4f0ed1c505e120c9b28ce114fb6fe12f4",
+    ),
+];
+
+fn download_verified_webrtc(webrtc_dir: &Path) {
+    let url = webrtc_sys_build::download_url();
+    let Some(&(_, expected)) = WEBRTC_SHA256.iter().find(|(pinned, _)| *pinned == url) else {
+        panic!("no pinned SHA-256 for {url}: download it, check it, and add it to WEBRTC_SHA256 in build.rs");
+    };
+    let zip = PathBuf::from(env::var("OUT_DIR").unwrap()).join("webrtc.zip");
+    let mut curl = host_tool("curl");
+    curl.args(["-fsSL", "--retry", "3"]);
+    // Windows' curl checks certificate revocation through Schannel and gives up when it can't
+    // reach the list (a proxy that inspects TLS): best effort, as browsers do. The hash below is
+    // what vouches for the file anyway.
+    if cfg!(windows) {
+        curl.arg("--ssl-revoke-best-effort");
+    }
+    run(curl.arg("-o").arg(&zip).arg(&url), "download libwebrtc");
+
+    let actual = sha256(&zip);
+    if actual != expected {
+        let _ = std::fs::remove_file(&zip);
+        panic!("libwebrtc from {url} has SHA-256 {actual}, but {expected} is pinned: refusing to build with it");
+    }
+
+    // Extracted beside its final place and renamed into it, so a build that dies halfway
+    // leaves no directory that the next one would take for a complete libwebrtc.
+    let triple = webrtc_sys_build::webrtc_triple();
+    let tmp = webrtc_dir.parent().unwrap().join(format!(".{triple}.verified.tmp"));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    if cfg!(windows) {
+        // Windows' own tar (bsdtar) reads zip; Git's GNU tar, often first in PATH, does not.
+        run(host_tool("tar").arg("-xf").arg(&zip).arg("-C").arg(&tmp), "extract libwebrtc");
+    } else {
+        run(Command::new("unzip").arg("-q").arg(&zip).arg("-d").arg(&tmp), "extract libwebrtc");
+    }
+    if let Err(e) = std::fs::rename(tmp.join(&triple), webrtc_dir) {
+        if !webrtc_dir.exists() {
+            panic!("could not move libwebrtc into {}: {e}", webrtc_dir.display());
+        }
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+    let _ = std::fs::remove_file(&zip);
+}
+
+/// The host's own copy of a tool on Windows, from System32, rather than whichever one PATH
+/// happens to find first.
+fn host_tool(name: &str) -> Command {
+    if cfg!(windows) {
+        let root = env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        Command::new(Path::new(&root).join("System32").join(format!("{name}.exe")))
+    } else {
+        Command::new(name)
+    }
+}
+
+fn run(command: &mut Command, what: &str) {
+    match command.status() {
+        Ok(status) if status.success() => {}
+        Ok(status) => panic!("could not {what}: {command:?} exited with {status}"),
+        Err(e) => panic!("could not {what}: {command:?}: {e}"),
+    }
+}
+
+fn sha256(file: &Path) -> String {
+    let output = if cfg!(windows) {
+        host_tool("certutil").arg("-hashfile").arg(file).arg("SHA256").output()
+    } else {
+        Command::new("sha256sum").arg(file).output()
+    };
+    let output = output.unwrap_or_else(|e| panic!("could not hash {}: {e}", file.display()));
+    // certutil's other lines are in the system's language and older versions space the digits
+    // out; the hash is the line, or sha256sum's first word, made of 64 hex digits.
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .flat_map(|line| [line.replace(' ', ""), line.split_whitespace().next().unwrap_or("").to_string()])
+        .find(|s| s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()))
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_else(|| panic!("could not hash {}: {}", file.display(), String::from_utf8_lossy(&output.stderr)))
 }
 
 fn add_gio_headers(builder: &mut cc::Build) {

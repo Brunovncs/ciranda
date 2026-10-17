@@ -11,6 +11,8 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use libwebrtc::native::apm::AudioProcessingModule;
 use parking_lot::{Condvar, Mutex};
 use rtrb::{Consumer, Producer, RingBuffer};
+use rubato::Resampler as _;
+use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock, mpsc};
@@ -81,9 +83,13 @@ enum Feed {
     /// reconnect overlaps) and only the output callback takes `output`'s, so it never waits.
     /// `overflowed`: a push found the queue full.
     Stream { input: Mutex<Producer<f32>>, output: Mutex<Playout>, overflowed: AtomicBool },
-    /// Played as it comes (or added onto what is still to play), through the limiter if there
-    /// is one: the cues' bus.
-    Queue { buf: Mutex<VecDeque<f32>>, limiter: Option<Mutex<Limiter>> },
+    /// Played as it comes.
+    Queue { buf: Mutex<VecDeque<f32>> },
+    /// The cues' bus: each cue (mono, rendered once and shared) plays from when it arrives, on top
+    /// of any still playing, and the sum goes through one limiter. A cue is handed over whole,
+    /// as a pointer: `incoming` is only held for a push, and the output callback only tries it,
+    /// so neither side waits while the other walks samples. `playing` is the callback's own.
+    Bus { incoming: Mutex<Vec<Arc<[f32]>>>, playing: Mutex<Vec<(Arc<[f32]>, usize)>>, limiter: Mutex<Limiter> },
     /// A soundpad clip, played straight from its shared samples (and how far it got) instead of
     /// being copied.
     Clip(Arc<[i16]>, AtomicUsize),
@@ -102,35 +108,30 @@ impl Source {
                 let (input, output) = Playout::new(kind);
                 Feed::Stream { input: Mutex::new(input), output: Mutex::new(output), overflowed: AtomicBool::new(false) }
             }
-            _ => Feed::Queue { buf: Mutex::new(VecDeque::new()), limiter: None },
+            _ => Feed::Queue { buf: Mutex::new(VecDeque::new()) },
         };
         Arc::new(Source { kind, feed, gain: AtomicF32::new(gain), peak: AtomicF32::default(), one_shot })
     }
 
-    /// An effect that stays in the mix, through a limiter.
-    fn limited() -> Arc<Source> {
+    /// The cues' bus, which stays in the mix.
+    fn bus() -> Arc<Source> {
         Arc::new(Source {
             kind: SourceKind::Effect,
-            feed: Feed::Queue { buf: Mutex::new(VecDeque::new()), limiter: Some(Mutex::default()) },
+            feed: Feed::Bus {
+                incoming: Mutex::new(Vec::with_capacity(BUS_VOICES)),
+                playing: Mutex::new(Vec::with_capacity(BUS_VOICES)),
+                limiter: Mutex::default(),
+            },
             gain: AtomicF32::new(1.),
             peak: AtomicF32::default(),
             one_shot: false,
         })
     }
 
-    /// Mono samples added onto what is still to play, from now, instead of queued after it.
-    fn overlay(&self, samples: &[f32]) {
-        let Feed::Queue { buf, .. } = &self.feed else { return };
-        let mut buf = buf.lock();
-        let queued = buf.len() / 2;
-        for (i, &s) in samples.iter().enumerate() {
-            if i < queued {
-                buf[2 * i] += s;
-                buf[2 * i + 1] += s;
-            } else {
-                buf.push_back(s);
-                buf.push_back(s);
-            }
+    /// A cue (mono) to play on the bus from now, over whatever is still playing.
+    fn play_cue(&self, samples: Arc<[f32]>) {
+        if let Feed::Bus { incoming, .. } = &self.feed {
+            incoming.lock().push(samples);
         }
     }
 
@@ -173,19 +174,105 @@ impl Source {
                     chunk.fill_from_iter(stereo.flatten());
                 }
             }
-            Feed::Queue { buf, .. } => buf.lock().extend(stereo.flatten()),
-            Feed::Clip(..) => return,
+            Feed::Queue { buf } => buf.lock().extend(stereo.flatten()),
+            Feed::Clip(..) | Feed::Bus { .. } => return,
         }
         let frames = (samples.len() / channels).max(1);
         self.peak.max((sum / frames as f32).sqrt());
     }
 
+    /// Lets go of cues waiting to play, for speakers that aren't there to play them.
+    fn drop_cues(&self) {
+        if let Feed::Bus { incoming, playing, .. } = &self.feed {
+            incoming.lock().clear();
+            playing.lock().clear();
+        }
+    }
+
     fn is_empty(&self) -> bool {
         match &self.feed {
             Feed::Clip(samples, at) => at.load(Ordering::Relaxed) >= samples.len(),
-            Feed::Queue { buf, .. } => buf.lock().is_empty(),
+            Feed::Queue { buf } => buf.lock().is_empty(),
             Feed::Stream { output, .. } => output.lock().queue.is_empty(),
+            Feed::Bus { incoming, playing, .. } => incoming.lock().is_empty() && playing.lock().is_empty(),
         }
+    }
+
+    /// Adds this source's next `out.len() / 2` frames into `out`, at `gain`. On the output
+    /// callback; whatever it is done with goes to `retire` rather than being freed there.
+    fn mix_into(&self, out: &mut [f32], gain: f32, retire: &mut Producer<Retired>) {
+        match &self.feed {
+            Feed::Clip(samples, at) => {
+                let from = at.load(Ordering::Relaxed).min(samples.len());
+                let n = out.len().min(samples.len() - from);
+                for (o, &v) in out.iter_mut().zip(&samples[from..from + n]) {
+                    *o += v as f32 / 32768. * gain;
+                }
+                at.store(from + n, Ordering::Relaxed);
+            }
+            Feed::Stream { output, overflowed, .. } => output.lock().pull(out, gain, overflowed.swap(false, Ordering::Relaxed)),
+            Feed::Queue { buf } => {
+                let mut buf = buf.lock();
+                let n = out.len().min(buf.len());
+                for (o, v) in out.iter_mut().zip(buf.drain(..n)) {
+                    *o += v * gain;
+                }
+            }
+            Feed::Bus { incoming, playing, limiter } => {
+                let mut playing = playing.lock();
+                if let Some(mut new) = incoming.try_lock() {
+                    for cue in new.drain(..) {
+                        // Within the capacity set aside, so pushing never allocates here; a cue
+                        // past that many at once would not be heard anyway.
+                        if playing.len() < playing.capacity() {
+                            playing.push((cue, 0));
+                        } else {
+                            retire_on(retire, Retired::Cue(cue));
+                        }
+                    }
+                }
+                if playing.is_empty() {
+                    return;
+                }
+                let mut limiter = limiter.lock();
+                for (k, o) in out.chunks_exact_mut(2).enumerate() {
+                    let v = playing.iter().map(|(s, at)| s.get(at + k).copied().unwrap_or(0.)).sum::<f32>() * gain;
+                    let (l, r) = limiter.process(v, v);
+                    o[0] += l;
+                    o[1] += r;
+                }
+                let frames = out.len() / 2;
+                let mut i = 0;
+                while i < playing.len() {
+                    playing[i].1 += frames;
+                    if playing[i].1 >= playing[i].0.len() {
+                        let (cue, _) = playing.swap_remove(i);
+                        retire_on(retire, Retired::Cue(cue));
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Cues the bus can play at once.
+const BUS_VOICES: usize = 16;
+
+/// What the output callback is done with: freed by whoever collects it, not by the callback.
+/// Only ever held, to be dropped elsewhere.
+#[allow(dead_code)]
+enum Retired {
+    Source(Arc<Source>),
+    Cue(Arc<[f32]>),
+}
+
+fn retire_on(retire: &mut Producer<Retired>, r: Retired) {
+    // Full only if nothing has collected for a long while; then the callback frees it itself,
+    // which is what used to happen every time.
+    if let Err(rtrb::PushError::Full(r)) = retire.push(r) {
+        drop(r);
     }
 }
 
@@ -386,65 +473,116 @@ impl Playout {
 
 /// What the speakers play, and the mix the echo canceller listens to.
 pub struct Mixer {
-    sources: Mutex<Vec<Arc<Source>>>,
+    /// Sources added or taken out since the output callback last looked. The callback only ever
+    /// tries this lock: while someone holds it, the change waits for the next callback.
+    changes: Mutex<Vec<Change>>,
+    /// The output callback's own: the sources it plays. Nothing else takes this lock (tests
+    /// aside), so the callback never waits on it, nor holds up anyone adding a source while it
+    /// works through them.
+    playing: Mutex<Playing>,
+    /// What the callback is done with, freed here instead: dropping the last hold on a soundpad
+    /// clip or a stream's queue frees memory, which has no business against the speakers'
+    /// deadline. Emptied by `collect`.
+    retired: Mutex<Consumer<Retired>>,
     pub deafened: AtomicBool,
     /// The mix, mono, for the echo canceller's reference.
     far: Mutex<VecDeque<f32>>,
 }
 
+enum Change {
+    Add(Arc<Source>),
+    /// The source's address: holding no `Arc`, it leaves nothing to drop on the callback.
+    Remove(usize),
+}
+
+struct Playing {
+    sources: Vec<Arc<Source>>,
+    retire: Producer<Retired>,
+}
+
 impl Mixer {
     fn new() -> Arc<Mixer> {
-        Arc::new(Mixer { sources: Mutex::new(Vec::new()), deafened: AtomicBool::new(false), far: Mutex::new(VecDeque::new()) })
+        let (retire, retired) = RingBuffer::new(256);
+        Arc::new(Mixer {
+            changes: Mutex::new(Vec::new()),
+            // Room for more sources than a call has, so adding one doesn't allocate on the callback.
+            playing: Mutex::new(Playing { sources: Vec::with_capacity(64), retire }),
+            retired: Mutex::new(retired),
+            deafened: AtomicBool::new(false),
+            far: Mutex::new(VecDeque::new()),
+        })
     }
 
     pub fn add(&self, s: Arc<Source>) {
-        self.sources.lock().push(s);
+        self.changes.lock().push(Change::Add(s));
+        self.collect();
     }
 
     pub fn remove(&self, s: &Arc<Source>) {
-        self.sources.lock().retain(|x| !Arc::ptr_eq(x, s));
+        self.changes.lock().push(Change::Remove(Arc::as_ptr(s) as usize));
+        self.collect();
+    }
+
+    /// Frees what the output callback is done with.
+    fn collect(&self) {
+        let mut retired = self.retired.lock();
+        while let Ok(r) = retired.pop() {
+            drop(r);
+        }
+    }
+
+    /// With no speakers open nothing calls `mix`: the changes are applied here instead, off any
+    /// deadline, so a source taken out is freed now and not held until speakers come back. What
+    /// would only sound once (a cue, a soundpad clip) is let go too, rather than all of it
+    /// sounding at once when they do. Only while no output stream exists.
+    fn idle(&self) {
+        let mut playing = self.playing.lock();
+        let sources = &mut playing.sources;
+        for change in self.changes.lock().drain(..) {
+            match change {
+                Change::Add(s) => sources.push(s),
+                Change::Remove(id) => sources.retain(|s| Arc::as_ptr(s) as usize != id),
+            }
+        }
+        sources.retain(|s| !s.one_shot);
+        for s in sources.iter() {
+            s.drop_cues();
+        }
+        drop(playing);
+        self.collect();
     }
 
     /// Fills `out` (interleaved stereo, 48 kHz).
     fn mix(&self, out: &mut [f32]) {
         out.fill(0.);
         let deaf = self.deafened.load(Ordering::Relaxed);
-        let mut sources = self.sources.lock();
-        for s in sources.iter() {
-            let gain = if deaf && s.kind == SourceKind::Voice { 0. } else { s.gain.get() };
-            match &s.feed {
-                Feed::Clip(samples, at) => {
-                    let from = at.load(Ordering::Relaxed).min(samples.len());
-                    let n = out.len().min(samples.len() - from);
-                    for (o, &v) in out.iter_mut().zip(&samples[from..from + n]) {
-                        *o += v as f32 / 32768. * gain;
-                    }
-                    at.store(from + n, Ordering::Relaxed);
-                }
-                Feed::Stream { output, overflowed, .. } => output.lock().pull(out, gain, overflowed.swap(false, Ordering::Relaxed)),
-                Feed::Queue { buf, limiter: Some(limiter) } => {
-                    let mut buf = buf.lock();
-                    let n = out.len().min(buf.len());
-                    let mut limiter = limiter.lock();
-                    let mut queued = buf.drain(..n);
-                    for o in out[..n].chunks_exact_mut(2) {
-                        let (l, r) = (queued.next().unwrap_or(0.) * gain, queued.next().unwrap_or(0.) * gain);
-                        let (l, r) = limiter.process(l, r);
-                        o[0] += l;
-                        o[1] += r;
-                    }
-                }
-                Feed::Queue { buf, limiter: None } => {
-                    let mut buf = buf.lock();
-                    let n = out.len().min(buf.len());
-                    for (o, v) in out.iter_mut().zip(buf.drain(..n)) {
-                        *o += v * gain;
+        let mut playing = self.playing.lock();
+        let Playing { sources, retire } = &mut *playing;
+        if let Some(mut changes) = self.changes.try_lock() {
+            for change in changes.drain(..) {
+                match change {
+                    Change::Add(s) => sources.push(s),
+                    Change::Remove(id) => {
+                        if let Some(i) = sources.iter().position(|s| Arc::as_ptr(s) as usize == id) {
+                            retire_on(retire, Retired::Source(sources.remove(i)));
+                        }
                     }
                 }
             }
         }
-        sources.retain(|s| !(s.one_shot && s.is_empty()));
-        drop(sources);
+        for s in sources.iter() {
+            let gain = if deaf && s.kind == SourceKind::Voice { 0. } else { s.gain.get() };
+            s.mix_into(out, gain, retire);
+        }
+        let mut i = 0;
+        while i < sources.len() {
+            if sources[i].one_shot && sources[i].is_empty() {
+                retire_on(retire, Retired::Source(sources.remove(i)));
+            } else {
+                i += 1;
+            }
+        }
+        drop(playing);
         for o in out.iter_mut() {
             *o = soft_clip(*o);
         }
@@ -462,43 +600,83 @@ fn soft_clip(x: f32) -> f32 {
     if x.abs() <= 0.9 { x } else { x.signum() * (0.9 + 0.1 * ((x.abs() - 0.9) / 0.1).tanh()) }
 }
 
-/// A linear resampler for interleaved audio, keeping its place between calls.
+/// Input frames the resampler works on at a time: a little over a millisecond, so it adds next to
+/// no delay to the speakers or the microphone.
+const RESAMPLE_CHUNK: usize = 64;
+
+fn sinc(from: u32, to: u32, sinc_len: usize, chunk: usize, channels: usize) -> rubato::Async<f32> {
+    let params = rubato::SincInterpolationParameters::new(sinc_len, rubato::WindowFunction::BlackmanHarris2);
+    rubato::Async::new_sinc(to as f64 / from as f64, 1., &params, chunk, channels, rubato::FixedAsync::Input)
+        .expect("rates and chunk are positive")
+}
+
+/// Converts interleaved audio from one rate to another, keeping its place between calls. What lies
+/// above the lower rate's Nyquist frequency is filtered out first (a windowed sinc, rubato's):
+/// interpolating without that folded it back as noise, worst on a Bluetooth headset's hands-free
+/// 16 or 8 kHz. It works in chunks of `RESAMPLE_CHUNK` input frames, holding back what doesn't
+/// fill one, and after its first call allocates nothing, so it can run in a device's callback.
 pub struct Resampler {
-    from: u32,
-    to: u32,
     channels: usize,
-    pos: f64,
-    last: Vec<f32>,
+    /// None when both rates are the same: audio passes through as it is.
+    sinc: Option<Box<rubato::Async<f32>>>,
+    /// Input still short of a whole chunk.
+    pending: Vec<f32>,
+    /// One chunk's output.
+    chunk: Vec<f32>,
 }
 
 impl Resampler {
     pub fn new(from: u32, to: u32, channels: usize) -> Resampler {
-        Resampler { from, to, channels, pos: 0., last: vec![0.; channels] }
+        let channels = channels.max(1);
+        // 128 taps: flat to within a few percent of Nyquist, at a cost a callback doesn't notice.
+        let sinc = (from != to && from > 0 && to > 0).then(|| Box::new(sinc(from, to, 128, RESAMPLE_CHUNK, channels)));
+        let out = sinc.as_ref().map_or(0, |s| s.output_frames_max() * channels);
+        Resampler { channels, sinc, pending: Vec::with_capacity(RESAMPLE_CHUNK * channels), chunk: vec![0.; out] }
+    }
+
+    /// Input frames it takes to produce any output: worth handing over at least this many.
+    pub fn chunk(&self) -> usize {
+        if self.sinc.is_some() { RESAMPLE_CHUNK } else { 1 }
     }
 
     pub fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
         let ch = self.channels;
-        if self.from == self.to {
+        let Some(sinc) = self.sinc.as_mut() else {
             out.extend_from_slice(input);
             return;
-        }
-        let frames = input.len() / ch;
-        let step = self.from as f64 / self.to as f64;
-        let at = |i: isize, c: usize, last: &[f32]| if i < 0 { last[c] } else { input[i as usize * ch + c] };
-        while self.pos < frames as f64 {
-            let i = self.pos.floor() as isize;
-            let frac = (self.pos - i as f64) as f32;
-            for c in 0..ch {
-                let a = at(i - 1, c, &self.last);
-                let b = at(i, c, &self.last);
-                out.push(a + (b - a) * frac);
+        };
+        let whole = RESAMPLE_CHUNK * ch;
+        let mut input = &input[..input.len() / ch * ch];
+        while !input.is_empty() {
+            let take = (whole - self.pending.len()).min(input.len());
+            self.pending.extend_from_slice(&input[..take]);
+            input = &input[take..];
+            if self.pending.len() < whole {
+                break;
             }
-            self.pos += step;
+            let frames_out = self.chunk.len() / ch;
+            let made = match (InterleavedSlice::new(&self.pending[..], ch, RESAMPLE_CHUNK), InterleavedSlice::new_mut(&mut self.chunk[..], ch, frames_out)) {
+                (Ok(src), Ok(mut dst)) => sinc.process_into_buffer(&src, &mut dst, None).map_or(0, |(_, n)| n),
+                _ => 0,
+            };
+            out.extend_from_slice(&self.chunk[..made * ch]);
+            self.pending.clear();
         }
-        self.pos -= frames as f64;
-        if frames > 0 {
-            self.last.copy_from_slice(&input[(frames - 1) * ch..frames * ch]);
-        }
+    }
+}
+
+/// A whole clip (interleaved) at another rate, without the filter's delay in front or anything
+/// cut off at the end: for sounds decoded ahead of playing, not for a live stream.
+pub fn resample_clip(input: &[f32], from: u32, to: u32, channels: usize) -> Vec<f32> {
+    let channels = channels.max(1);
+    let frames = input.len() / channels;
+    if from == to || from == 0 || to == 0 || frames == 0 {
+        return input.to_vec();
+    }
+    let mut r = sinc(from, to, 256, 1024, channels);
+    match InterleavedSlice::new(input, channels, frames).map(|src| r.process_all(&src, frames, None)) {
+        Ok(Ok(out)) => out.take_data(),
+        _ => Vec::new(),
     }
 }
 
@@ -572,6 +750,8 @@ enum Command {
     Input(Option<String>),
     /// The capture's device went away, or it was Windows' default and the default changed.
     InputLost,
+    /// The same for the speakers.
+    OutputLost,
 }
 
 /// The microphone changed under a capture without anyone choosing it: unplugged, Windows' default
@@ -725,6 +905,7 @@ fn device_thread(
     let mut wanted: Option<String> = None;
     let mut seen = (0, Instant::now());
     let mut using = Using::default();
+    let mut speakers = Speakers { wanted: String::new(), on: None, tried: Instant::now() };
     // Closed before opening again: some devices take one capture at a time.
     let reopen = |input: &mut Option<cpal::Stream>, wanted: Option<&str>, using: &mut Using, asked: bool| {
         drop(input.take());
@@ -736,13 +917,20 @@ fn device_thread(
         (mic.frames.load(Ordering::Relaxed), Instant::now())
     };
     loop {
-        match rx.recv_timeout(Duration::from_secs(1)) {
+        let command = rx.recv_timeout(Duration::from_secs(1));
+        mixer.collect();
+        // No callback is running without an output stream: nothing would apply the mixer's changes.
+        if output.is_none() {
+            mixer.idle();
+        }
+        match command {
             Ok(Command::Output(id)) => {
-                output = None;
-                match open_output(&id, mixer.clone()) {
-                    Ok(s) => output = Some(s),
-                    Err(e) => log::warn!("speakers did not open: {e}"),
-                }
+                speakers.wanted = id;
+                speakers.open(&mut output, &mixer, &tx);
+            }
+            Ok(Command::OutputLost) => {
+                log::warn!("the speakers went away; opening them again");
+                speakers.open(&mut output, &mixer, &tx);
             }
             Ok(Command::Input(id)) => {
                 wanted = id;
@@ -754,6 +942,15 @@ fn device_thread(
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Speakers that would not open are tried again now and then; the chosen ones,
+                // when they come back after playing on Windows' default meanwhile.
+                let back = !speakers.wanted.is_empty()
+                    && output.is_some()
+                    && speakers.on.as_deref().is_some_and(|on| on != speakers.wanted)
+                    && present(&speakers.wanted);
+                if back || (output.is_none() && speakers.tried.elapsed() >= CAPTURE_RETRY) {
+                    speakers.open(&mut output, &mixer, &tx);
+                }
                 let Some(w) = wanted.as_deref() else { continue };
                 // On Windows' default because the chosen one was gone: back to it once it's in.
                 if !w.is_empty() && input.is_some() && using.device.as_ref().is_some_and(|d| d.id != w) && present(w) {
@@ -778,6 +975,31 @@ fn device_thread(
     drop((output, input));
 }
 
+/// The speakers asked for (empty for Windows' default), the ones playing, and when they were
+/// last opened.
+struct Speakers {
+    wanted: String,
+    on: Option<String>,
+    tried: Instant,
+}
+
+impl Speakers {
+    fn open(&mut self, output: &mut Option<cpal::Stream>, mixer: &Arc<Mixer>, lost: &mpsc::Sender<Command>) {
+        drop(output.take());
+        self.tried = Instant::now();
+        match open_output(&self.wanted, mixer.clone(), lost.clone()) {
+            Ok((stream, device)) => {
+                *output = Some(stream);
+                self.on = Some(device.id);
+            }
+            Err(e) => {
+                log::warn!("speakers did not open: {e}");
+                self.on = None;
+            }
+        }
+    }
+}
+
 /// Opens the capture for `id`, with the device it landed on; none for `None`, or for a
 /// microphone that will not open.
 fn open_capture(
@@ -800,8 +1022,9 @@ fn open_capture(
     }
 }
 
-fn open_output(id: &str, mixer: Arc<Mixer>) -> anyhow::Result<cpal::Stream> {
+fn open_output(id: &str, mixer: Arc<Mixer>, lost: mpsc::Sender<Command>) -> anyhow::Result<(cpal::Stream, DeviceInfo)> {
     let device = find(id, false).ok_or_else(|| anyhow::anyhow!("no output device"))?;
+    let playing = info(&device).ok_or_else(|| anyhow::anyhow!("the speakers have no name"))?;
     let config = device.default_output_config()?;
     let (rate, channels) = (config.sample_rate(), config.channels() as usize);
     let mut resampler = Resampler::new(RATE, rate, 2);
@@ -813,7 +1036,8 @@ fn open_output(id: &str, mixer: Arc<Mixer>) -> anyhow::Result<cpal::Stream> {
         let frames = out.len() / channels;
         // Mix in 48 kHz stereo blocks until the device's rate and size are covered.
         while ready.len() / 2 < frames {
-            let need = ((frames - ready.len() / 2) as f64 * RATE as f64 / rate as f64).ceil() as usize + 2;
+            // At least a chunk: the resampler gives nothing back for less.
+            let need = (((frames - ready.len() / 2) as f64 * RATE as f64 / rate as f64).ceil() as usize + 2).max(resampler.chunk());
             mixed.resize(need * 2, 0.);
             mixer.mix(&mut mixed);
             res.clear();
@@ -835,7 +1059,14 @@ fn open_output(id: &str, mixer: Arc<Mixer>) -> anyhow::Result<cpal::Stream> {
         }
     };
     let mut fill = fill;
-    let err = |e| log::warn!("speakers: {e}");
+    // Unplugged, or Windows' default moved: the stream stops for good, and nothing would be
+    // heard again until it's opened anew.
+    let err = move |e: cpal::Error| {
+        log::warn!("speakers: {e}");
+        if gone(&e) {
+            let _ = lost.send(Command::OutputLost);
+        }
+    };
     let stream = match config.sample_format() {
         cpal::SampleFormat::F32 => device.build_output_stream::<f32, _, _>(config.config(), move |o: &mut [f32], _| fill(o), err, None)?,
         cpal::SampleFormat::I16 => {
@@ -856,7 +1087,13 @@ fn open_output(id: &str, mixer: Arc<Mixer>) -> anyhow::Result<cpal::Stream> {
         other => anyhow::bail!("speakers want {other:?} samples"),
     };
     stream.play()?;
-    Ok(stream)
+    Ok((stream, playing))
+}
+
+/// Whether a stream's error means its device is gone (or was the default, and moved), so the
+/// stream will never deliver again.
+fn gone(e: &cpal::Error) -> bool {
+    matches!(e.kind(), cpal::ErrorKind::DeviceNotAvailable | cpal::ErrorKind::DeviceChanged | cpal::ErrorKind::StreamInvalidated)
 }
 
 fn open_input(
@@ -887,7 +1124,7 @@ fn open_input(
     };
     let err = move |e: cpal::Error| {
         log::warn!("microphone: {e}");
-        if matches!(e.kind(), cpal::ErrorKind::DeviceNotAvailable | cpal::ErrorKind::DeviceChanged | cpal::ErrorKind::StreamInvalidated) {
+        if gone(&e) {
             let _ = lost.send(Command::InputLost);
         }
     };
@@ -952,6 +1189,11 @@ fn dsp_thread(mixer: Arc<Mixer>, mic: Arc<Mic>, near: Arc<(Mutex<VecDeque<f32>>,
         if !heard {
             mic.open.store(false, Ordering::Relaxed);
             gate_gain = 0.;
+            // With no capture there's nothing to cancel the speakers from. Kept, the last half
+            // second of them would reach the echo canceller all at once when the microphone opens
+            // again, ahead of the first captured frame, and throw its delay estimate off.
+            mixer.far.lock().clear();
+            far_pending.clear();
             if let Some(sink) = mic.sink.lock().as_mut() {
                 pcm.fill(0);
                 sink(&pcm);
@@ -1132,16 +1374,35 @@ pub fn render(kind: Cue, volume: f32) -> Vec<f32> {
 /// Plays a cue at `volume` (0..2). Every cue goes through one limiter, so two landing together
 /// (someone joins as someone else starts streaming) cannot clip.
 pub fn cue(kind: Cue, volume: f32) {
-    let samples = render(kind, volume);
+    let samples = rendered(kind, volume);
     if !samples.is_empty() {
-        cue_bus().overlay(&samples);
+        cue_bus().play_cue(samples);
     }
+}
+
+/// A cue's samples at `volume`, rendered once: a ring repeats every couple of seconds, and each
+/// render is some 10^5 sines and powers on the interface's thread. Only the latest volume is
+/// kept, since it changes by a slider.
+fn rendered(kind: Cue, volume: f32) -> Arc<[f32]> {
+    /// The volume (its bits), and each cue rendered at it so far.
+    type Rendered = (u32, Vec<(Cue, Arc<[f32]>)>);
+    static CACHE: Mutex<Rendered> = Mutex::new((0, Vec::new()));
+    let mut cache = CACHE.lock();
+    if cache.0 != volume.to_bits() {
+        *cache = (volume.to_bits(), Vec::new());
+    }
+    if let Some((_, s)) = cache.1.iter().find(|(k, _)| *k == kind) {
+        return s.clone();
+    }
+    let s: Arc<[f32]> = render(kind, volume).into();
+    cache.1.push((kind, s.clone()));
+    s
 }
 
 fn cue_bus() -> &'static Arc<Source> {
     static BUS: OnceLock<Arc<Source>> = OnceLock::new();
     BUS.get_or_init(|| {
-        let bus = Source::limited();
+        let bus = Source::bus();
         audio().mixer.add(bus.clone());
         bus
     })
@@ -1149,9 +1410,16 @@ fn cue_bus() -> &'static Arc<Source> {
 
 /// A compressor hard enough to call a limiter: above -6 dBFS, 12:1. The attack is instant, so
 /// nothing gets past it; the release takes about 120 ms.
-#[derive(Default)]
 struct Limiter {
     envelope: f32,
+    /// The release's fall per sample, worked out once rather than per sample on the callback.
+    release: f32,
+}
+
+impl Default for Limiter {
+    fn default() -> Limiter {
+        Limiter { envelope: 0., release: (-1. / (0.12 * RATE as f32)).exp() }
+    }
 }
 
 const LIMIT_AT: f32 = 0.5;
@@ -1159,9 +1427,8 @@ const LIMIT_RATIO: f32 = 12.;
 
 impl Limiter {
     fn process(&mut self, l: f32, r: f32) -> (f32, f32) {
-        let release = (-1. / (0.12 * RATE as f32)).exp();
         let peak = l.abs().max(r.abs());
-        self.envelope = if peak > self.envelope { peak } else { self.envelope * release };
+        self.envelope = if peak > self.envelope { peak } else { self.envelope * self.release };
         if self.envelope <= LIMIT_AT {
             return (l, r);
         }
@@ -1197,8 +1464,8 @@ pub fn decode(bytes: Vec<u8>) -> anyhow::Result<Vec<f32>> {
     let track = format.default_track().ok_or_else(|| anyhow::anyhow!("no audio in the file"))?;
     let track_id = track.id;
     let mut decoder = symphonia::default::get_codecs().make(&track.codec_params, &DecoderOptions::default())?;
-    let mut out = Vec::new();
-    let mut resampler: Option<Resampler> = None;
+    let mut stereo = Vec::new();
+    let mut rate = None;
     while let Ok(packet) = format.next_packet() {
         if packet.track_id() != track_id {
             continue;
@@ -1206,13 +1473,16 @@ pub fn decode(bytes: Vec<u8>) -> anyhow::Result<Vec<f32>> {
         let Ok(decoded) = decoder.decode(&packet) else { continue };
         let spec = *decoded.spec();
         let ch = spec.channels.count();
+        if ch == 0 {
+            continue;
+        }
+        rate.get_or_insert(spec.rate);
         let mut buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
         buf.copy_interleaved_ref(decoded);
-        let stereo: Vec<f32> = buf.samples().chunks_exact(ch).flat_map(|f| if ch == 1 { [f[0], f[0]] } else { [f[0], f[1]] }).collect();
-        let r = resampler.get_or_insert_with(|| Resampler::new(spec.rate, RATE, 2));
-        r.process(&stereo, &mut out);
+        stereo.extend(buf.samples().chunks_exact(ch).flat_map(|f| if ch == 1 { [f[0], f[0]] } else { [f[0], f[1]] }));
     }
-    Ok(out)
+    // Whole, so the filter's delay is trimmed and its tail kept.
+    Ok(rate.map_or_else(Vec::new, |r| resample_clip(&stereo, r, RATE, 2)))
 }
 
 #[cfg(test)]
@@ -1249,8 +1519,69 @@ mod tests {
         for _ in 0..10 {
             r.process(&[0.5; 441], &mut out);
         }
-        assert!((out.len() as i64 - 4800).abs() <= 2, "{}", out.len());
-        assert!(out.iter().skip(2).all(|&s| (s - 0.5).abs() < 1e-6));
+        // Less what is held back short of a chunk.
+        let held = (RESAMPLE_CHUNK as f64 * 48_000. / 44_100.).ceil() as i64;
+        assert!((4800 - held - 2..=4802).contains(&(out.len() as i64)), "{}", out.len());
+        // Past the filter's delay, a constant stays that constant.
+        assert!(out.iter().skip(200).all(|&s| (s - 0.5).abs() < 1e-3), "{:?}", &out[200..210]);
+        let mut same = Resampler::new(48_000, 48_000, 2);
+        let mut out = Vec::new();
+        same.process(&[0.1, 0.2, 0.3, 0.4], &mut out);
+        assert_eq!(out, [0.1, 0.2, 0.3, 0.4], "the same rate passes through");
+    }
+
+    fn tone(freq: f32, rate: u32, frames: usize) -> Vec<f32> {
+        (0..frames).map(|i| 0.5 * (i as f32 * freq * std::f32::consts::TAU / rate as f32).sin()).collect()
+    }
+
+    fn rms(s: &[f32]) -> f32 {
+        (s.iter().map(|x| x * x).sum::<f32>() / s.len().max(1) as f32).sqrt()
+    }
+
+    /// 48 kHz to a hands-free headset's 16 kHz: a 12 kHz tone, above the 8 kHz the lower rate can
+    /// hold, has to go rather than fold back to 4 kHz; 1 kHz passes at its level. Fed in uneven
+    /// blocks, as a device callback hands them over.
+    #[test]
+    fn resampling_down_filters_out_what_the_lower_rate_cannot_hold() {
+        let through = |freq: f32| {
+            let mut r = Resampler::new(48_000, 16_000, 1);
+            let mut out = Vec::new();
+            for block in tone(freq, 48_000, 48_000).chunks(441) {
+                r.process(block, &mut out);
+            }
+            rms(&out[1600..])
+        };
+        let (high, low) = (through(12_000.), through(1_000.));
+        println!("16 kHz: 12 kHz comes out at {high:.6} rms, 1 kHz at {low:.4}");
+        assert!(high < 0.5 / 2f32.sqrt() * 1e-3, "12 kHz aliased at {high} rms (under -60 dB wanted)");
+        assert!((low / (0.5 / 2f32.sqrt()) - 1.).abs() < 0.02, "1 kHz came out at {low} rms");
+
+        // And up: 8 kHz to 48 kHz puts nothing near 12 kHz's image (16 - 4 kHz).
+        let mut r = Resampler::new(8_000, 48_000, 2);
+        let stereo: Vec<f32> = tone(3_000., 8_000, 8_000).into_iter().flat_map(|s| [s, s]).collect();
+        let mut out = Vec::new();
+        r.process(&stereo, &mut out);
+        assert!(out.len() / 2 >= 47_000);
+        // 3 kHz is a whole number of samples at 48 kHz, so it is fitted exactly over whole periods.
+        let left: Vec<f64> = out.chunks_exact(2).map(|f| f[0] as f64).skip(2000).take(40_000).collect();
+        let phase = |i: usize| i as f64 * 3_000. * std::f64::consts::TAU / 48_000.;
+        let (c, s) = left.iter().enumerate().fold((0., 0.), |(c, s), (i, &x)| (c + x * phase(i).cos(), s + x * phase(i).sin()));
+        let (a, b) = (2. * c / left.len() as f64, 2. * s / left.len() as f64);
+        let amp = (a * a + b * b).sqrt();
+        // What is left once the 3 kHz is taken out: the images at 5, 11, 13 kHz and on.
+        let rest: Vec<f32> = left.iter().enumerate().map(|(i, &x)| (x - a * phase(i).cos() - b * phase(i).sin()) as f32).collect();
+        let residue = rms(&rest);
+        println!("8 to 48 kHz: 3 kHz at {amp:.4}, everything else {residue:.6} rms");
+        assert!((amp - 0.5).abs() < 0.02 && residue < 0.5e-3, "{amp} {residue}");
+    }
+
+    #[test]
+    fn a_clip_is_resampled_whole() {
+        let clip = tone(440., 44_100, 44_100);
+        let out = resample_clip(&clip, 44_100, 48_000, 1);
+        assert!((out.len() as i64 - 48_000).abs() <= 1, "{}", out.len());
+        // No delay in front: it starts where the tone does, rising from zero.
+        assert!(out[0].abs() < 0.02 && out[10] > 0.1, "{:?}", &out[..12]);
     }
 
     #[test]
@@ -1285,7 +1616,29 @@ mod tests {
         voice.push(&[0.1; FRAME], 1);
         m.mix(&mut out);
         assert!(out.iter().all(|&x| x == 0.));
-        assert_eq!(m.sources.lock().len(), 1, "the drained effect is gone");
+        assert_eq!(m.playing.lock().sources.len(), 1, "the drained effect is gone");
+        assert_eq!(m.retired.lock().slots(), 1, "and left to be freed off the callback");
+        m.collect();
+        m.remove(&voice);
+        m.mix(&mut out);
+        assert!(m.playing.lock().sources.is_empty());
+        m.collect();
+        assert_eq!(Arc::strong_count(&voice), 1, "the mixer let go of it");
+    }
+
+    #[test]
+    fn sources_added_while_the_callback_is_busy_wait_for_the_next() {
+        let m = Mixer::new();
+        let fx = Source::new(SourceKind::Effect, 1., true);
+        fx.push(&[0.25; FRAME], 1);
+        let mut out = vec![0.; 2 * FRAME];
+        m.add(fx);
+        let held = m.changes.lock();
+        m.mix(&mut out);
+        assert!(out.iter().all(|&x| x == 0.), "the callback doesn't wait for the lock");
+        drop(held);
+        m.mix(&mut out);
+        assert!((out[0] - 0.25).abs() < 1e-6);
     }
 
     #[test]
@@ -1454,13 +1807,13 @@ mod tests {
         println!("overlap at 200%: raw peak {:.3}", peak(&raw));
         assert!(peak(&raw) > 1.);
         let m = Mixer::new();
-        let bus = Source::limited();
+        let bus = Source::bus();
         m.add(bus.clone());
-        bus.overlay(&a);
+        bus.play_cue(a.clone().into());
         let mut out = vec![0.; 2 * lag];
         m.mix(&mut out);
         let mut mixed: Vec<f32> = out.chunks_exact(2).map(|f| f[0]).collect();
-        bus.overlay(&b);
+        bus.play_cue(b.clone().into());
         let mut out = vec![0.; 2 * raw.len()];
         m.mix(&mut out);
         mixed.extend(out.chunks_exact(2).map(|f| f[0]));
@@ -1468,7 +1821,8 @@ mod tests {
         println!("overlap at 200%: through the limiter {limited:.3}");
         // Under the soft clip's knee too: the limiter did this, not the clip.
         assert!(limited < 0.9, "{limited}");
-        assert!(bus.is_empty() && m.sources.lock().len() == 1, "the bus stays for the next cue");
+        assert!(bus.is_empty() && m.playing.lock().sources.len() == 1, "the bus stays for the next cue");
+        assert!(Arc::ptr_eq(&rendered(Cue::Ring, 0.8), &rendered(Cue::Ring, 0.8)), "a repeated cue is rendered once");
         if let Some(dir) = &wavs {
             write_wav(&dir.join("overlap-raw.wav"), &raw);
             write_wav(&dir.join("overlap-limited.wav"), &mixed);

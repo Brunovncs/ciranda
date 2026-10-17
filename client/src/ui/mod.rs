@@ -126,7 +126,7 @@ impl Root {
             loop {
                 cx.background_executor().timer(RING_TICK).await;
                 tick += 1;
-                let sync = tick % SYNC_EVERY_TICKS == 0;
+                let sync = tick.is_multiple_of(SYNC_EVERY_TICKS);
                 let Ok(()) = handle.update(cx, |_, window, cx| {
                     let _ = this.update(cx, |root: &mut Root, cx| {
                         if root.away_ringing.is_some() {
@@ -181,7 +181,7 @@ impl Root {
     }
 
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if ev.keystroke.key == "escape" && self.overlay.close_top() {
+        if ev.keystroke.key == "escape" && self.overlay.close_top(cx) {
             cx.stop_propagation();
             cx.notify();
             return;

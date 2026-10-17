@@ -23,8 +23,18 @@ pub struct Toast {
 pub struct Dismiss;
 
 enum Layer {
-    Dialog(AnyView),
+    /// `dismiss` tells the dialog it was closed from outside (Escape, a click on the scrim), as
+    /// if it had closed itself, so what it stands for ends too: a call stops ringing.
+    Dialog { view: AnyView, dismiss: Rc<dyn Fn(&mut App)> },
     Menu { at: Point<Pixels>, anchor: gpui::Anchor, view: AnyView },
+}
+
+impl Layer {
+    fn view(&self) -> &AnyView {
+        match self {
+            Layer::Dialog { view, .. } | Layer::Menu { view, .. } => view,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -34,8 +44,16 @@ pub struct Overlay {
 
 impl Overlay {
     /// Closes the top layer; false when there was none.
-    pub fn close_top(&mut self) -> bool {
-        self.layers.pop().is_some()
+    pub fn close_top(&mut self, cx: &mut App) -> bool {
+        match self.layers.pop() {
+            None => false,
+            Some(Layer::Dialog { dismiss, .. }) => {
+                // Later: the dialog's own handlers may update the root, which is being updated now.
+                cx.defer(move |cx| dismiss(cx));
+                true
+            }
+            Some(Layer::Menu { .. }) => true,
+        }
     }
 
     pub fn has_menu(&self) -> bool {
@@ -61,18 +79,27 @@ pub fn toast(text: impl Into<SharedString>, cx: &mut App) {
 pub fn open_dialog<V: Render + EventEmitter<Dismiss> + Focusable>(view: Entity<V>, window: &mut Window, cx: &mut App) {
     view.focus_handle(cx).focus(window, cx);
     let any: AnyView = view.clone().into();
+    let weak = view.downgrade();
+    let dismiss: Rc<dyn Fn(&mut App)> = Rc::new(move |cx| {
+        if let Some(v) = weak.upgrade() {
+            v.update(cx, |_, cx| cx.emit(Dismiss));
+        }
+    });
     with_root(cx, move |root, cx| {
-        cx.subscribe(&view, |root: &mut Root, v, _: &Dismiss, cx| {
-            let id = v.entity_id();
-            root.overlay.layers.retain(|l| match l {
-                Layer::Dialog(d) | Layer::Menu { view: d, .. } => d.entity_id() != id,
-            });
-            cx.notify();
-        })
-        .detach();
-        root.overlay.layers.push(Layer::Dialog(any));
+        close_on_dismiss(&view, cx);
+        root.overlay.layers.push(Layer::Dialog { view: any, dismiss });
         cx.notify();
     });
+}
+
+/// Takes `view`'s layer away once it says `Dismiss`.
+fn close_on_dismiss<V: EventEmitter<Dismiss>>(view: &Entity<V>, cx: &mut Context<Root>) {
+    cx.subscribe(view, |root: &mut Root, v, _: &Dismiss, cx| {
+        let id = v.entity_id();
+        root.overlay.layers.retain(|l| l.view().entity_id() != id);
+        cx.notify();
+    })
+    .detach();
 }
 
 /// Shows a menu with its corner at `at`. It closes on a click anywhere else.
@@ -89,14 +116,7 @@ pub fn open_menu_above<V: Render + EventEmitter<Dismiss>>(view: Entity<V>, at: P
 fn show_menu<V: Render + EventEmitter<Dismiss>>(view: Entity<V>, at: Point<Pixels>, anchor: gpui::Anchor, cx: &mut App) {
     let any: AnyView = view.clone().into();
     with_root(cx, move |root, cx| {
-        cx.subscribe(&view, |root: &mut Root, v, _: &Dismiss, cx| {
-            let id = v.entity_id();
-            root.overlay.layers.retain(|l| match l {
-                Layer::Dialog(d) | Layer::Menu { view: d, .. } => d.entity_id() != id,
-            });
-            cx.notify();
-        })
-        .detach();
+        close_on_dismiss(&view, cx);
         root.overlay.layers.retain(|l| !matches!(l, Layer::Menu { .. }));
         root.overlay.layers.push(Layer::Menu { at, anchor, view: any });
         cx.notify();
@@ -109,7 +129,7 @@ impl Root {
         let top = self.overlay.layers.len();
         for (i, layer) in self.overlay.layers.iter().enumerate() {
             match layer {
-                Layer::Dialog(view) => out.push(
+                Layer::Dialog { view, .. } => out.push(
                     div()
                         .id(("scrim", i))
                         .absolute()
@@ -124,7 +144,7 @@ impl Root {
                             d.on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|root, _, _, cx| {
-                                    root.overlay.close_top();
+                                    root.overlay.close_top(cx);
                                     cx.notify();
                                 }),
                             )
@@ -326,10 +346,12 @@ impl Ask {
                             f
                         });
                         cx.subscribe_in(&field, window, |this: &mut Ask, _, ev: &TextFieldEvent, window, cx| {
+                            // Typing clears the last error; Enter may set a new one, which stays.
                             if let TextFieldEvent::Submit = ev {
                                 this.confirm(window, cx);
+                            } else if this.error.take().is_some() {
+                                cx.notify();
                             }
-                            this.error = None;
                         })
                         .detach();
                         AskField::Text { label, field, required: !secret }

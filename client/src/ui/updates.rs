@@ -1,5 +1,6 @@
 //! "Update" at the top of the window when GitHub has a newer release. A click downloads the new
-//! program, checks it and swaps it in, then Ciranda starts again on its own. In a voice call it
+//! program, checks it and swaps it in, then Ciranda starts again on its own (and puts the old
+//! version back if the new one keeps dying as it starts: see `core::update`). In a voice call it
 //! waits: the new version is put in place at once, and the restart happens when the call ends,
 //! or now if the person says so. A development build only opens the release's page, so it never
 //! replaces the program cargo built.
@@ -12,7 +13,7 @@ use crate::widgets::*;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, FontWeight, Global, Hsla, InteractiveElement, IntoElement, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, Task, Window, div, relative,
+    StatefulInteractiveElement, Styled, Subscription, Task, Window, div, relative,
 };
 use std::path::PathBuf;
 use std::time::Duration;
@@ -31,6 +32,10 @@ enum State {
     /// In place, waiting for the call to end before restarting.
     Ready(Release),
     Restarting(Release),
+    /// In place, but the new copy did not start, with why. Only a restart is left to do: a
+    /// download now would find this copy at `.old`, where it can't be replaced while it runs.
+    Installed(Release, String),
+    /// The download or the swap failed, and the program is as it was.
     Failed(Release, String),
 }
 
@@ -42,7 +47,10 @@ pub struct Updater {
     in_call: bool,
     /// The program as it was started; after a swap it holds the new version.
     exe: Option<PathBuf>,
+    /// This version came with an update and has yet to prove itself (see `update::Start`).
+    on_trial: bool,
     _poll: Task<()>,
+    _quit: Subscription,
 }
 
 struct Handle(Entity<Updater>);
@@ -69,23 +77,49 @@ fn changed(cx: &mut Context<Updater>) {
 impl Updater {
     fn new(cx: &mut Context<Self>) -> Updater {
         let exe = std::env::current_exe().ok();
-        if let Some(exe) = exe.clone() {
+        // Decided by main, before the window: a rollback that worked never gets here, and one
+        // that couldn't be done leaves this version on trial.
+        let start = match exe.as_deref().map(update::start).unwrap_or(update::Start::Plain) {
+            update::Start::RollBack => update::Start::Trial,
+            start => start,
+        };
+        if start == update::Start::Updated {
             cx.spawn(async move |_, cx| {
-                if cx.background_executor().spawn(async move { update::clean_up(&exe) }).await {
-                    cx.update(|cx| {
-                        overlay::toast(
-                            trf!(
-                                "Ciranda was updated to version {}.",
-                                "Ciranda agora está na versão {}.",
-                                env!("CARGO_PKG_VERSION")
-                            ),
-                            cx,
-                        )
-                    });
+                cx.update(|cx| {
+                    overlay::toast(
+                        trf!("Ciranda was updated to version {}.", "Ciranda agora está na versão {}.", env!("CARGO_PKG_VERSION")),
+                        cx,
+                    )
+                });
+            })
+            .detach();
+        }
+        if let (true, Some(exe)) = (start.on_trial(), exe.clone()) {
+            // The minute counts from the window being up: a task starts only once the start-up
+            // code that made this, and opens the window right after, has finished.
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(update::HEALTHY_AFTER).await;
+                // Updated again meanwhile, `.old` is this very program now, and the next
+                // version's trial has begun.
+                let swapped = this.update(cx, |u, _| {
+                    u.on_trial = false;
+                    matches!(u.state, State::Ready(_) | State::Restarting(_) | State::Installed(..))
+                });
+                if matches!(swapped, Ok(false)) {
+                    cx.background_executor().spawn(async move { update::settle(&exe) }).await;
                 }
             })
             .detach();
         }
+        // Quitting before the minute is up is no crash; see `update::survived`.
+        let quit = cx.on_app_quit(|u: &mut Updater, _| {
+            if u.on_trial
+                && let Some(exe) = &u.exe
+            {
+                update::survived(exe);
+            }
+            async {}
+        });
         let poll = cx.spawn(async move |this, cx| {
             let check = |u: &mut Updater, cx: &mut Context<Updater>| {
                 if prefs(cx).check_updates {
@@ -96,11 +130,20 @@ impl Updater {
                 cx.background_executor().timer(CHECK_EVERY).await;
             }
         });
-        Updater { state: State::Idle, checking: false, check_error: None, in_call: false, exe, _poll: poll }
+        Updater {
+            state: State::Idle,
+            checking: false,
+            check_error: None,
+            in_call: false,
+            exe,
+            on_trial: start.on_trial(),
+            _poll: poll,
+            _quit: quit,
+        }
     }
 
     fn check(&mut self, cx: &mut Context<Self>) {
-        if self.checking || matches!(self.state, State::Downloading(..) | State::Ready(_) | State::Restarting(_)) {
+        if self.checking || matches!(self.state, State::Downloading(..) | State::Ready(_) | State::Restarting(_) | State::Installed(..)) {
             return;
         }
         self.checking = true;
@@ -131,8 +174,8 @@ impl Updater {
     fn click(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.state.clone() {
             State::Available(r) | State::Failed(r, _) => self.update_now(r, cx),
-            State::Ready(r) if !self.in_call => self.restart(r, cx),
-            State::Ready(r) => {
+            State::Ready(r) | State::Installed(r, _) if !self.in_call => self.restart(r, cx),
+            State::Ready(r) | State::Installed(r, _) => {
                 let this = cx.entity();
                 Ask::confirm_action(
                     tr!("Restart Ciranda now?", "Reiniciar Ciranda agora?"),
@@ -146,7 +189,7 @@ impl Updater {
                     cx,
                     move |_, cx| {
                         this.update(cx, |u, cx| {
-                            if let State::Ready(r) = u.state.clone() {
+                            if let State::Ready(r) | State::Installed(r, _) = u.state.clone() {
                                 u.restart(r, cx);
                             }
                         })
@@ -219,7 +262,8 @@ impl Updater {
             let _ = this.update(cx, |u, cx| match started {
                 Ok(()) => cx.quit(),
                 Err(e) => {
-                    u.state = State::Failed(r, e);
+                    log::warn!("Ciranda {} did not start: {e}", r.version);
+                    u.state = State::Installed(r, e);
                     changed(cx);
                 }
             });
@@ -375,6 +419,24 @@ pub fn button(cx: &App) -> Option<AnyElement> {
             pill("update-restarting", "restart", tr!("Restarting…", "Reiniciando…"), t.accent, t.accent_soft, t.accent.opacity(0.35))
                 .into_any_element()
         }
+        State::Installed(r, e) => clickable(pill(
+            "update-installed",
+            "restart",
+            tr!("Restart to update", "Reiniciar para atualizar"),
+            t.critical,
+            t.tint(t.critical),
+            t.critical.opacity(0.4),
+        ))
+        .tooltip(tip(
+            trf!(
+                "Ciranda {} is installed but did not start: {}\n\nClick to try again, or close Ciranda and open it.",
+                "A versão {} de Ciranda foi instalada, mas não abriu: {}\n\nClique para tentar de novo, ou feche e abra Ciranda outra vez.",
+                r.version,
+                e
+            ),
+            &t,
+        ))
+        .into_any_element(),
         State::Failed(r, e) => clickable(pill(
             "update-failed",
             "warning",
@@ -397,7 +459,12 @@ pub fn settings_row(t: &Theme, cx: &mut App) -> AnyElement {
     let u = updater.read(cx);
     let checking = u.checking;
     let release = match &u.state {
-        State::Available(r) | State::Downloading(r, _) | State::Ready(r) | State::Restarting(r) | State::Failed(r, _) => Some(r.clone()),
+        State::Available(r)
+        | State::Downloading(r, _)
+        | State::Ready(r)
+        | State::Restarting(r)
+        | State::Installed(r, _)
+        | State::Failed(r, _) => Some(r.clone()),
         _ => None,
     };
     let (status, color) = match (&u.state, &u.check_error) {
@@ -408,6 +475,15 @@ pub fn settings_row(t: &Theme, cx: &mut App) -> AnyElement {
         (State::Failed(r, e), _) => {
             (trf!("Ciranda {} could not be installed: {}", "Não foi possível instalar Ciranda {}: {}", r.version, e), t.critical)
         }
+        (State::Installed(r, e), _) => (
+            trf!(
+                "Ciranda {} is installed but did not start: {}. Restart Ciranda to use it.",
+                "A versão {} de Ciranda foi instalada, mas não abriu: {}. Reinicie Ciranda para usar a versão nova.",
+                r.version,
+                e
+            ),
+            t.critical,
+        ),
         (_, _) => (
             release.as_ref().map(|r| trf!("Ciranda {} is out.", "Ciranda {} já está disponível.", r.version)).unwrap_or_default(),
             t.accent,

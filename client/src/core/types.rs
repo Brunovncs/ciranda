@@ -323,6 +323,19 @@ pub struct Private {
     pub call: Option<CallMeta>,
     /// It did not open here: sealed to a key this computer does not have.
     pub unreadable: bool,
+    /// It opened, but not where it was sealed to be: an old message sent again under a new id, two
+    /// messages' words swapped, or an edit put on another message. Only the server can do that, so
+    /// it is refused (and `unreadable` is set too).
+    pub out_of_place: bool,
+    /// Sealed with a key of the other person's that this computer has not accepted for them: what
+    /// a new key looks like after a reinstall, and also what somebody in the middle would. The
+    /// conversation says so above the messages until the change is accepted.
+    pub unconfirmed: bool,
+    /// The message's own random id, sealed inside it and the same across its edits. None for one
+    /// sent by a version from before it existed.
+    pub mid: Option<String>,
+    /// Its edit count as sealed: 0 as first sent.
+    pub rev: u32,
 }
 
 /// An attachment in a private conversation: the server has only its ciphertext.
@@ -367,8 +380,26 @@ pub struct OwnKey {
 pub struct KeysReply {
     #[serde(default, deserialize_with = "lenient")]
     pub keys: Vec<PublicKeyInfo>,
-    #[serde(default, deserialize_with = "lenient_opt")]
-    pub mine: Option<OwnKey>,
+    #[serde(default, deserialize_with = "own_key")]
+    pub mine: MineKey,
+}
+
+/// What the server said about your own key. Only a plain `null` means "none": a field that is
+/// missing or does not read (a restored database, a proxy, a newer server) says nothing, and
+/// taking it for "none" would throw away the key this computer has.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum MineKey {
+    #[default]
+    Unclear,
+    None,
+    Key(OwnKey),
+}
+
+fn own_key<'de, D: Deserializer<'de>>(d: D) -> Result<MineKey, D::Error> {
+    Ok(match Value::deserialize(d)? {
+        Value::Null => MineKey::None,
+        v => serde_json::from_value(v).map_or(MineKey::Unclear, MineKey::Key),
+    })
 }
 
 /// A private conversation's message as the server holds it: sealed.
@@ -889,6 +920,15 @@ mod tests {
         let t: VoiceTokens =
             serde_json::from_str(r#"{"conversationId":2,"token":"t","publish":{"voice":"a","cam":"b","screen":"c"},"whepBase":"w"}"#).unwrap();
         assert_eq!(t.channel_id, None);
+    }
+
+    #[test]
+    fn only_a_plain_null_says_you_have_no_key() {
+        let mine = |json: &str| serde_json::from_str::<KeysReply>(json).unwrap().mine;
+        assert_eq!(mine(r#"{"keys":[],"mine":null}"#), MineKey::None);
+        assert_eq!(mine(r#"{"keys":[]}"#), MineKey::Unclear);
+        assert_eq!(mine(r#"{"keys":[],"mine":{"id":"x"}}"#), MineKey::Unclear);
+        assert!(matches!(mine(r#"{"mine":{"id":3,"publicKey":"p","wrapped":"w"}}"#), MineKey::Key(k) if k.id == 3));
     }
 
     #[test]

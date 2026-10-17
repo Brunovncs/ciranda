@@ -95,14 +95,6 @@ fn encoder_backend() -> libwebrtc::rtp_sender::VideoEncoderBackend {
     [B::Nvenc, B::Hardware].into_iter().find(|b| available.contains(b)).unwrap_or(B::Auto)
 }
 
-static HARDWARE_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Whether the video encoder last seen running is the graphics card's, which takes NV12 frames
-/// without converting them (OpenH264 converts NV12 to I420 first).
-pub fn hardware_encoder_running() -> bool {
-    HARDWARE_RUNNING.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 /// Whether to log video frame rates and timings (`CIRANDA_VIDEO_STATS`).
 pub fn video_stats() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -184,6 +176,10 @@ pub struct Link {
     api: Api,
     /// A private call's frame cryptors, one per track: they live exactly as long as the connection.
     _cryptors: Vec<FrameCryptor>,
+    /// Whether this connection's video encoder, as last seen running, is the graphics card's,
+    /// which takes NV12 frames without converting them (OpenH264 converts NV12 to I420 first).
+    /// Its own, so a camera's encoder says nothing about the screen's, and it goes with the link.
+    pub hardware_encoder: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Link {
@@ -523,13 +519,18 @@ async fn negotiate(
     if std::env::var_os("CIRANDA_SDP_DEBUG").is_some() {
         log::info!("offer to {url}:\n{sdp}\nanswer:\n{answer}");
     }
-    let answer = SessionDescription::parse(&answer, SdpType::Answer).map_err(|e| fail(e.description))?;
-    if let Err(e) = pc.set_remote_description(answer).await {
+    // Either failure leaves a session the server holds open, and a slot it thinks is live
+    // refuses the next publish to it: closed here and given back.
+    let set = match SessionDescription::parse(&answer, SdpType::Answer) {
+        Ok(answer) => pc.set_remote_description(answer).await.map_err(|e| e.message),
+        Err(e) => Err(e.description),
+    };
+    if let Err(e) = set {
         pc.close();
         if let Some(r) = &resource {
             api.delete_resource(r).await;
         }
-        return Err(fail(e.message));
+        return Err(fail(e));
     }
     Ok(Link {
         pc,
@@ -538,6 +539,7 @@ async fn negotiate(
         down_since: Default::default(),
         api: api.clone(),
         _cryptors: cryptors,
+        hardware_encoder: Default::default(),
     })
 }
 
@@ -598,7 +600,7 @@ pub async fn publish(
     }
     let link = negotiate(api, pc, url, gathered, false, cryptors).await?;
     if video_params.is_some() {
-        watch_encoder(link.pc.clone());
+        watch_encoder(link.pc.clone(), link.hardware_encoder.clone());
     }
     // Encoder limits go on after the answer, once the sender has its encodings.
     for sender in link.pc.senders() {
@@ -624,16 +626,21 @@ pub async fn publish(
 }
 
 /// Logs the video encoder that actually runs once it is known, and again whenever it changes: the
-/// graphics card's giving way to the software one shows up here. Ends with the connection.
-fn watch_encoder(pc: PeerConnection) {
+/// graphics card's giving way to the software one shows up here, and in `hardware`. Ends with the
+/// connection, `hardware` false.
+fn watch_encoder(pc: PeerConnection, hardware: Arc<std::sync::atomic::AtomicBool>) {
     crate::core::runtime().spawn(async move {
         let mut last = String::new();
         loop {
             tokio::time::sleep(Duration::from_secs(2)).await;
             if matches!(pc.connection_state(), PeerConnectionState::Failed | PeerConnectionState::Closed) {
+                hardware.store(false, std::sync::atomic::Ordering::Relaxed);
                 return;
             }
-            let Ok(stats) = pc.get_stats().await else { return };
+            let Ok(stats) = pc.get_stats().await else {
+                hardware.store(false, std::sync::atomic::Ordering::Relaxed);
+                return;
+            };
             for s in stats {
                 if let RtcStats::OutboundRtp(o) = s
                     && o.stream.kind == "video"
@@ -649,7 +656,7 @@ fn watch_encoder(pc: PeerConnection) {
                         e.frame_height,
                         e.frames_per_second
                     );
-                    HARDWARE_RUNNING.store(e.power_efficient_encoder, std::sync::atomic::Ordering::Relaxed);
+                    hardware.store(e.power_efficient_encoder, std::sync::atomic::Ordering::Relaxed);
                     last = e.encoder_implementation.clone();
                 }
             }

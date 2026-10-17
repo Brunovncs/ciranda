@@ -55,6 +55,51 @@ fn first_bounds(cx: &gpui::App) -> WindowBounds {
     WindowBounds::Windowed(Bounds::centered(None, first_size(cx), cx))
 }
 
+/// `--self-test`: the release workflow runs the exe it is about to publish with this, so one that
+/// builds but cannot start fails there instead of on somebody's machine. It starts everything that
+/// needs no window, device, network or settings (libwebrtc, the background model, the private
+/// conversations' crypto, and GPUI with its fonts and icons), prints the version and exits 0.
+/// GPUI's shaders are only loaded with a window, so they are not covered.
+fn self_test() -> ! {
+    fn fail(what: &str, why: impl std::fmt::Display) -> ! {
+        eprintln!("self-test: {what}: {why}");
+        std::process::exit(1)
+    }
+    // Off the main thread, as in the running app: making libwebrtc's factory puts its thread in
+    // COM's multithreaded apartment (the Media Foundation encoder), and GPUI's OleInitialize
+    // then fails on it.
+    let checks = std::thread::spawn(|| {
+        use crate::core::crypto;
+        let (a, b) = (crypto::Identity::generate(), crypto::Identity::generate());
+        let sealed = crypto::pair_key(&a, 1, &b.public(), 2, 3).unwrap_or_else(|| fail("crypto", "no pair key")).seal("aad", b"hello");
+        match crypto::pair_key(&b, 2, &a.public(), 1, 3).and_then(|k| k.open("aad", &sealed)) {
+            Some(plain) if plain == b"hello" => {}
+            _ => fail("crypto", "a sealed message did not open on the other side"),
+        }
+        if let Err(e) = media::background::Segmenter::load() {
+            fail("background model", e);
+        }
+        media::rtc::factory();
+    });
+    if checks.join().is_err() {
+        fail("checks", "panicked");
+    }
+    gpui_platform::application().with_assets(icons::Assets).run(|cx: &mut gpui::App| {
+        if let Err(e) = cx.text_system().add_fonts(theme::fonts()) {
+            fail("fonts", e);
+        }
+        if !cx.text_system().all_font_names().iter().any(|f| f == "Figtree") {
+            fail("fonts", "Figtree is not among the loaded fonts");
+        }
+        if !matches!(cx.asset_source().load("icons/mic.svg"), Ok(Some(svg)) if svg.starts_with(b"<svg")) {
+            fail("icons", "icons/mic.svg did not load");
+        }
+        println!("ciranda {} self-test passed", env!("CARGO_PKG_VERSION"));
+        std::process::exit(0)
+    });
+    fail("gpui", "the application returned without running")
+}
+
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("ciranda=info,warn")).init();
     let smoke = std::env::args().any(|a| a == "--smoke");
@@ -62,6 +107,10 @@ fn main() {
     if std::env::args().any(|a| a == "--quit") {
         let gone = tray::quit_running(&core::settings::data_dir(), std::time::Duration::from_secs(15));
         std::process::exit(if gone { 0 } else { 1 });
+    }
+    // Before anything below, which writes to the registry and the data folder.
+    if std::env::args().any(|a| a == "--self-test") {
+        self_test();
     }
     core::install::note_version();
     let relaunched = core::update::relaunched();
@@ -72,12 +121,30 @@ fn main() {
         };
         core::settings::adopt_legacy_dir(&legacy);
     }
-    let store = core::settings::Store::load();
-    i18n::set(i18n::resolve(&store.values.language));
     let Some(instance) = tray::Instance::claim(&core::settings::data_dir(), relaunched) else {
         log::info!("Ciranda is already running: its window was asked to show");
         return;
     };
+    // An update on trial counts this start before anything that could crash it (reading the
+    // settings included), and one that kept dying as it started is undone here, short of the code
+    // that killed it. After the instance is claimed: a second start that only shows the window is
+    // no start of the new version.
+    if let Ok(exe) = std::env::current_exe()
+        && core::update::start(&exe) == core::update::Start::RollBack
+    {
+        log::warn!("this version died as it started, again: putting the previous one back");
+        match core::update::roll_back(&exe) {
+            Ok(()) => return,
+            // Kept from the rename (a scanner, a locked folder): giving up on it, this version
+            // starts after all rather than refusing to start every time from now on.
+            Err(e) => {
+                log::error!("the previous version could not be put back: {e}");
+                core::update::survived(&exe);
+            }
+        }
+    }
+    let store = core::settings::Store::load();
+    i18n::set(i18n::resolve(&store.values.language));
 
     // Closing the window never closes it (see `ui::tray`): it hides, or Ciranda quits with it
     // still open so a call is left properly. Quitting when it is gone covers the platforms

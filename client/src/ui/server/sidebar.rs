@@ -844,10 +844,12 @@ fn unread_count(n: u32) -> String {
     if n > 99 { "99+".into() } else { n.to_string() }
 }
 
+type OnKeyAction = std::rc::Rc<dyn Fn(&mut Window, &mut App)>;
+
 /// One button of a key card: what it says, and what it does.
 struct KeyAction {
     label: String,
-    on: std::rc::Rc<dyn Fn(&mut Window, &mut App)>,
+    on: OnKeyAction,
 }
 
 impl KeyAction {

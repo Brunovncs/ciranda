@@ -48,6 +48,9 @@ raw-window-handle = "0.6"
 reqwest = { version = "0.13", default-features = false, features = ["native-tls", "json", "charset", "http2"] }
 # The speakers' end of each stream's queue: the output callback never waits on a lock for it.
 rtrb = "0.3"
+# Band-limited (windowed sinc) resampling between 48 kHz and whatever rate a device runs at; the
+# FFT resampler is left out, so it brings no FFT library.
+rubato = { version = "5.0.1", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

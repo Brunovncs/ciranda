@@ -33,15 +33,19 @@ impl Loopback {
             CHANNELS,
             0,
         );
+        Loopback::feeding(mode, source)
+    }
+
+    /// Captures into a source that already exists, so a share whose sound changes keeps the
+    /// same track and needs no new negotiation.
+    pub fn feeding(mode: Mode, source: NativeAudioSource) -> Loopback {
         let stop = Arc::new(AtomicBool::new(false));
         let (s, st) = (source.clone(), stop.clone());
         std::thread::Builder::new()
             .name("ciranda-loopback".into())
             .spawn(move || {
                 #[cfg(windows)]
-                if let Err(e) = imp::run(mode, &s, &st) {
-                    log::warn!("system sound for the share is unavailable: {e}");
-                }
+                imp::run(mode, &s, &st);
                 let _ = (&s, &st, mode);
             })
             .ok();
@@ -58,6 +62,8 @@ impl Drop for Loopback {
 /// Sends 10 ms frames of interleaved stereo i16 to the source, buffering the remainder.
 struct Framer {
     pending: Vec<i16>,
+    /// Zeros for the packets Windows marks silent, kept rather than made for each.
+    silence: Vec<i16>,
 }
 
 impl Framer {
@@ -65,11 +71,25 @@ impl Framer {
         super::replay::audio(samples);
         self.pending.extend_from_slice(samples);
         let frame = (RATE / 100 * CHANNELS) as usize;
-        while self.pending.len() >= frame {
-            let chunk: Vec<i16> = self.pending.drain(..frame).collect();
-            let f = AudioFrame { data: chunk.into(), sample_rate: RATE, num_channels: CHANNELS, samples_per_channel: RATE / 100 };
+        let mut sent = 0;
+        while self.pending.len() - sent >= frame {
+            let f = AudioFrame {
+                data: (&self.pending[sent..sent + frame]).into(),
+                sample_rate: RATE,
+                num_channels: CHANNELS,
+                samples_per_channel: RATE / 100,
+            };
             let _ = futures::executor::block_on(source.capture_frame(&f));
+            sent += frame;
         }
+        self.pending.drain(..sent);
+    }
+
+    fn push_silence(&mut self, source: &NativeAudioSource, n: usize) {
+        let mut silence = std::mem::take(&mut self.silence);
+        silence.resize(n, 0);
+        self.push(source, &silence);
+        self.silence = silence;
     }
 }
 
@@ -77,7 +97,8 @@ impl Framer {
 mod imp {
     use super::*;
     use parking_lot::{Condvar, Mutex};
-    use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use std::time::{Duration, Instant};
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
     use windows::Win32::Media::Audio::*;
     use windows::Win32::System::Com::StructuredStorage::{PROPVARIANT, PROPVARIANT_0, PROPVARIANT_0_0, PROPVARIANT_0_0_0};
     use windows::Win32::System::Com::{BLOB, COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
@@ -97,51 +118,105 @@ mod imp {
         }
     }
 
-    pub fn run(mode: Mode, source: &NativeAudioSource, stop: &AtomicBool) -> anyhow::Result<()> {
+    /// Captures until `stop`. The loopback ends whenever Windows invalidates it (the output device
+    /// changed or went to sleep, the audio service restarted); it is started again, sooner after
+    /// one that ran a good while than after one that failed straight away, so the share does not
+    /// go silent for the rest of it.
+    pub fn run(mode: Mode, source: &NativeAudioSource, stop: &AtomicBool) {
+        const RETRY_MIN: Duration = Duration::from_millis(500);
+        const RETRY_MAX: Duration = Duration::from_secs(8);
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-            let result = capture(mode, source, stop);
-            CoUninitialize();
-            result
+        }
+        let mut framer = Framer { pending: Vec::new(), silence: Vec::new() };
+        let mut wait = RETRY_MIN;
+        let mut warned = false;
+        while !stop.load(Ordering::Relaxed) {
+            let started = Instant::now();
+            let result = unsafe { capture(mode, source, stop, &mut framer) };
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            if started.elapsed() > Duration::from_secs(10) {
+                wait = RETRY_MIN;
+            }
+            match result {
+                Err(e) if !std::mem::replace(&mut warned, true) => log::warn!("system sound for the share stopped ({e}); starting it again"),
+                Err(e) => log::debug!("system sound for the share: {e}"),
+                Ok(()) => {}
+            }
+            let until = Instant::now() + wait;
+            while Instant::now() < until && !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            wait = (wait * 2).min(RETRY_MAX);
+        }
+        unsafe { CoUninitialize() };
+    }
+
+    /// An event handle, closed however `capture` returns.
+    struct Event(HANDLE);
+
+    impl Drop for Event {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
         }
     }
 
-    unsafe fn capture(mode: Mode, source: &NativeAudioSource, stop: &AtomicBool) -> anyhow::Result<()> {
+    /// A started client, stopped however `capture` returns.
+    struct Started<'a>(&'a IAudioClient);
+
+    impl Drop for Started<'_> {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = self.0.Stop();
+            }
+        }
+    }
+
+    /// One run of the loopback: until `stop`, or an error.
+    unsafe fn capture(mode: Mode, source: &NativeAudioSource, stop: &AtomicBool, framer: &mut Framer) -> anyhow::Result<()> {
         let (pid, loopback_mode) = match mode {
             Mode::Excluding(pid) => (pid, PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE),
             Mode::Only(pid) => (pid, PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE),
         };
-        let mut params = AUDIOCLIENT_ACTIVATION_PARAMS {
+        // On the heap, and left there if Windows doesn't answer in time: whether the activation,
+        // still going, reads them after that isn't documented, and a stack frame long gone would
+        // hand it whatever was written there since. A few bytes leaked per timeout is the cost.
+        let mut params = Box::new(AUDIOCLIENT_ACTIVATION_PARAMS {
             ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
             Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
                 ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS { TargetProcessId: pid, ProcessLoopbackMode: loopback_mode },
             },
-        };
+        });
         // Never dropped: PROPVARIANT's drop is PropVariantClear, which hands a VT_BLOB's data to
-        // CoTaskMemFree, and this blob points at `params` on the stack. Freeing it corrupted the
-        // heap, and Ciranda crashed as the share's sound stopped.
-        let prop = std::mem::ManuallyDrop::new(PROPVARIANT {
+        // CoTaskMemFree, and this blob points at `params`, which isn't CoTaskMem's. Freeing it
+        // corrupted the heap, and Ciranda crashed as the share's sound stopped.
+        let prop = Box::new(std::mem::ManuallyDrop::new(PROPVARIANT {
             Anonymous: PROPVARIANT_0 {
                 Anonymous: std::mem::ManuallyDrop::new(PROPVARIANT_0_0 {
                     vt: VT_BLOB,
                     Anonymous: PROPVARIANT_0_0_0 {
                         blob: BLOB {
                             cbSize: std::mem::size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32,
-                            pBlobData: &mut params as *mut _ as *mut u8,
+                            pBlobData: &mut *params as *mut _ as *mut u8,
                         },
                     },
                     ..Default::default()
                 }),
             },
-        });
+        }));
         let signal = Arc::new((Mutex::new(false), Condvar::new()));
         let handler: IActivateAudioInterfaceCompletionHandler = Done(signal.clone()).into();
-        let op = unsafe { ActivateAudioInterfaceAsync(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, &IAudioClient::IID, Some(&*prop), &handler)? };
+        let op = unsafe { ActivateAudioInterfaceAsync(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, &IAudioClient::IID, Some(&**prop), &handler)? };
         {
             let (m, cv) = &*signal;
             let mut done = m.lock();
             while !*done {
                 if cv.wait_for(&mut done, std::time::Duration::from_secs(5)).timed_out() {
+                    std::mem::forget((params, prop));
                     anyhow::bail!("Windows did not start the loopback");
                 }
             }
@@ -170,13 +245,13 @@ mod imp {
                 None,
             )?;
         }
-        let event = unsafe { CreateEventW(None, false, false, None)? };
-        unsafe { client.SetEventHandle(event)? };
+        let event = Event(unsafe { CreateEventW(None, false, false, None)? });
+        unsafe { client.SetEventHandle(event.0)? };
         let capture: IAudioCaptureClient = unsafe { client.GetService()? };
         unsafe { client.Start()? };
-        let mut framer = Framer { pending: Vec::new() };
+        let _started = Started(&client);
         while !stop.load(Ordering::Relaxed) {
-            if unsafe { WaitForSingleObject(event, 200) } != WAIT_OBJECT_0 {
+            if unsafe { WaitForSingleObject(event.0, 200) } != WAIT_OBJECT_0 {
                 continue;
             }
             loop {
@@ -190,17 +265,13 @@ mod imp {
                 unsafe { capture.GetBuffer(&mut data, &mut frames, &mut flags, None, None)? };
                 let n = (frames * CHANNELS) as usize;
                 if flags & (AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0 || data.is_null() {
-                    framer.push(source, &vec![0i16; n]);
+                    framer.push_silence(source, n);
                 } else {
                     let samples = unsafe { std::slice::from_raw_parts(data as *const i16, n) };
                     framer.push(source, samples);
                 }
                 unsafe { capture.ReleaseBuffer(frames)? };
             }
-        }
-        unsafe {
-            let _ = client.Stop();
-            let _ = CloseHandle(event);
         }
         Ok(())
     }

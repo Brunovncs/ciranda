@@ -29,6 +29,42 @@ unsafe extern "C" {
         dst_height: i32,
         filtering: i32,
     ) -> i32;
+    fn ScalePlane(
+        src: *const u8,
+        src_stride: i32,
+        src_width: i32,
+        src_height: i32,
+        dst: *mut u8,
+        dst_stride: i32,
+        dst_width: i32,
+        dst_height: i32,
+        filtering: i32,
+    ) -> i32;
+    fn NV12Scale(
+        src_y: *const u8,
+        src_stride_y: i32,
+        src_uv: *const u8,
+        src_stride_uv: i32,
+        src_width: i32,
+        src_height: i32,
+        dst_y: *mut u8,
+        dst_stride_y: i32,
+        dst_uv: *mut u8,
+        dst_stride_uv: i32,
+        dst_width: i32,
+        dst_height: i32,
+        filtering: i32,
+    ) -> i32;
+    fn MergeUVPlane(
+        src_u: *const u8,
+        src_stride_u: i32,
+        src_v: *const u8,
+        src_stride_v: i32,
+        dst_uv: *mut u8,
+        dst_stride_uv: i32,
+        width: i32,
+        height: i32,
+    );
     fn ARGBScale(
         src_argb: *const u8,
         src_stride_argb: i32,
@@ -212,6 +248,64 @@ pub fn scale_bgra(src: &[u8], stride: u32, w: u32, h: u32, dst: &mut [u8], dw: u
         ARGBScale(src.as_ptr(), stride as i32, w as i32, h as i32, dst.as_mut_ptr(), (dw * 4) as i32, dw as i32, dh as i32, FILTER_BOX)
     };
     assert_eq!(r, 0, "ARGBScale");
+}
+
+/// The bytes `rows` rows of `row` bytes take at `stride`.
+fn span(stride: u32, row: u32, rows: u32) -> usize {
+    if rows == 0 { 0 } else { (stride * (rows - 1) + row) as usize }
+}
+
+/// An NV12 picture, `w` × `h` (even) with its own strides, scaled into packed NV12 planes of
+/// `dw` × `dh` (even): `dy` then `duv`, `dw` bytes a row each.
+#[allow(clippy::too_many_arguments)]
+pub fn scale_nv12(y: &[u8], sy: u32, uv: &[u8], suv: u32, (w, h): (u32, u32), dy: &mut [u8], duv: &mut [u8], (dw, dh): (u32, u32)) {
+    assert!(w % 2 == 0 && h % 2 == 0 && dw % 2 == 0 && dh % 2 == 0, "odd NV12 size");
+    assert!(sy >= w && suv >= w && y.len() >= span(sy, w, h) && uv.len() >= span(suv, w, h / 2), "short source");
+    assert!(dy.len() >= (dw * dh) as usize && duv.len() >= (dw * dh / 2) as usize, "short destination");
+    // SAFETY: both pictures are within their slices, as checked above.
+    let r = unsafe {
+        NV12Scale(
+            y.as_ptr(),
+            sy as i32,
+            uv.as_ptr(),
+            suv as i32,
+            w as i32,
+            h as i32,
+            dy.as_mut_ptr(),
+            dw as i32,
+            duv.as_mut_ptr(),
+            dw as i32,
+            dw as i32,
+            dh as i32,
+            FILTER_BOX,
+        )
+    };
+    assert_eq!(r, 0, "NV12Scale");
+}
+
+/// `src` (even-sided) scaled into packed NV12 planes of `dw` × `dh` (even), with no picture in
+/// between: each plane is scaled where it lands, chroma through `scratch` (a quarter of the
+/// picture, kept by the caller) to be interleaved.
+pub fn scale_i420_to_nv12(src: &I420Buffer, dy: &mut [u8], duv: &mut [u8], (dw, dh): (u32, u32), scratch: &mut Vec<u8>) {
+    let (w, h) = (src.width(), src.height());
+    assert!(w % 2 == 0 && h % 2 == 0 && dw % 2 == 0 && dh % 2 == 0, "odd size");
+    assert!(dy.len() >= (dw * dh) as usize && duv.len() >= (dw * dh / 2) as usize, "short destination");
+    let (cw, ch) = (dw / 2, dh / 2);
+    scratch.resize((2 * cw * ch) as usize, 0);
+    let (su_out, sv_out) = scratch.split_at_mut((cw * ch) as usize);
+    let (sy, su, sv) = src.strides();
+    let (py, pu, pv) = src.data();
+    let plane = |p: &[u8], stride: u32, (pw, ph): (u32, u32), d: &mut [u8], (qw, qh): (u32, u32)| {
+        // SAFETY: `src` is a whole buffer, so each of its planes holds `pw` × `ph`; `d` holds
+        // `qw` × `qh`, packed, as sized above.
+        let r = unsafe { ScalePlane(p.as_ptr(), stride as i32, pw as i32, ph as i32, d.as_mut_ptr(), qw as i32, qw as i32, qh as i32, FILTER_BOX) };
+        assert_eq!(r, 0, "ScalePlane");
+    };
+    plane(py, sy, (w, h), dy, (dw, dh));
+    plane(pu, su, (w / 2, h / 2), su_out, (cw, ch));
+    plane(pv, sv, (w / 2, h / 2), sv_out, (cw, ch));
+    // SAFETY: both chroma planes are `cw` × `ch` packed, and `duv` holds `ch` rows of `2 * cw`.
+    unsafe { MergeUVPlane(su_out.as_ptr(), cw as i32, sv_out.as_ptr(), cw as i32, duv.as_mut_ptr(), dw as i32, cw as i32, ch as i32) };
 }
 
 /// Uncompressed camera formats, as libyuv names them.
@@ -401,6 +495,29 @@ mod tests {
         convert(&yuy2, Packed::Yuy2, w, h, (2, 2, 4, 4), &mut dst).unwrap();
         assert!(dst.data().0.iter().all(|&p| p == 90));
         assert!(convert(&yuy2[..10], Packed::Yuy2, w, h, (0, 0, 4, 4), &mut dst).is_err(), "short frame");
+    }
+
+    #[test]
+    fn pictures_scale_into_packed_nv12() {
+        // 2560 x 1440 into 1920 x 1080, as the replay keeps a 1440p share: from I420 and from
+        // NV12 with padded rows, each plane where it belongs.
+        let (w, h, dw, dh) = (2560u32, 1440u32, 1920u32, 1080u32);
+        let mut dst = vec![0u8; (dw * dh * 3 / 2) as usize];
+        let packed = |dst: &[u8]| {
+            let (y, uv) = dst.split_at((dw * dh) as usize);
+            y.iter().all(|&p| p == 100) && uv.chunks_exact(2).all(|p| p == [90, 160])
+        };
+        let (dy, duv) = dst.split_at_mut((dw * dh) as usize);
+        scale_i420_to_nv12(&filled(w, h, 100, 90, 160), dy, duv, (dw, dh), &mut Vec::new());
+        assert!(packed(&dst));
+
+        dst.fill(0);
+        let stride = w + 64;
+        let y = vec![100u8; (stride * h) as usize];
+        let uv: Vec<u8> = (0..stride * h / 2).map(|i| if i % stride >= w { 0 } else if i % 2 == 0 { 90 } else { 160 }).collect();
+        let (dy, duv) = dst.split_at_mut((dw * dh) as usize);
+        scale_nv12(&y, stride, &uv, stride, (w, h), dy, duv, (dw, dh));
+        assert!(packed(&dst));
     }
 
     #[test]

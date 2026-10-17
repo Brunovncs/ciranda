@@ -538,16 +538,79 @@ pub fn pick_person(session: &Entity<Session>, window: &mut Window, cx: &mut App,
     let view = cx.new(|cx| {
         let search = cx.new(|cx| TextField::new(cx, false, 40).placeholder(tr!("Search people", "Buscar pessoas")));
         let sub = cx.observe(&search, |_: &mut People, _, cx| cx.notify());
-        People { session: session.clone(), search, picked: std::rc::Rc::new(picked), _sub: sub }
+        People {
+            session: session.clone(),
+            search,
+            picked: std::rc::Rc::new(picked),
+            everyone: None,
+            shown: (None, std::rc::Rc::new(Vec::new())),
+            _sub: sub,
+        }
     });
     overlay::open_dialog(view, window, cx);
+}
+
+/// Someone to pick, with what the search looks in.
+struct Person {
+    id: UserId,
+    /// Lowercase, as the search is.
+    name: String,
+    nickname: String,
+    online: bool,
 }
 
 struct People {
     session: Entity<Session>,
     search: Entity<TextField>,
     picked: OnPick,
+    /// Everybody but you, online first and then by name, for the `people_key` it was made for:
+    /// made again only when that changes, so typing filters without sorting anybody.
+    everyone: Option<(u64, Vec<Person>)>,
+    /// Who the search shows (and whether they are online), for the search it was made for.
+    shown: (Option<String>, std::rc::Rc<Vec<(UserId, bool)>>),
     _sub: Subscription,
+}
+
+/// A row of the list is 42 px with 1 px under it; the list draws only the rows in view, which
+/// takes them all the same height.
+const PERSON_LINE: f32 = 43.;
+
+impl People {
+    fn person_line(&mut self, id: UserId, online: bool, t: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(u) = self.session.read(cx).users.get(&id).cloned() else {
+            return div().h(px(PERSON_LINE)).into_any_element();
+        };
+        let img = self.session.update(cx, |s, cx| s.avatar(id, cx));
+        let hover = t.layer_hover;
+        let row = div()
+            .id(("person", u.id as u64))
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .h(px(42.))
+            .px(px(8.))
+            .rounded(px(radius::INNER + 1.))
+            .cursor_pointer()
+            .hover(move |s| s.bg(hover))
+            .child(div().relative().child(avatar(u.name(), img, 28., None)).when(online, |d| {
+                d.child(div().absolute().right(px(-2.)).bottom(px(-2.)).size(px(10.)).rounded_full().border_2().border_color(t.pane).bg(t.success))
+            }))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .child(div().truncate().text_size(px(13.5)).text_color(t.text).child(u.name().to_string()))
+                    .child(div().truncate().text_size(px(11.5)).text_color(t.text3).child(format!("@{}", u.nickname))),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| {
+                let picked = this.picked.clone();
+                cx.emit(Dismiss);
+                picked(id, window, cx);
+            }));
+        div().w_full().h(px(PERSON_LINE)).pb(px(1.)).child(row).into_any_element()
+    }
 }
 
 impl EventEmitter<Dismiss> for People {}
@@ -563,53 +626,45 @@ impl Render for People {
         let t = current();
         let q = self.search.read(cx).text().trim().to_lowercase();
         let s = self.session.read(cx);
-        let me = s.me.id;
-        let mut people: Vec<User> = s
-            .users
-            .values()
-            .filter(|u| u.id != me && (q.is_empty() || u.name().to_lowercase().contains(&q) || u.nickname.contains(&q)))
-            .cloned()
-            .collect();
-        people.sort_by_key(|u| (!s.online.contains(&u.id), u.name().to_lowercase()));
-        let online: Vec<bool> = people.iter().map(|u| s.online.contains(&u.id)).collect();
-        let mut list = div().id("people").flex().flex_col().gap(px(1.)).max_h(px(360.)).overflow_y_scroll().px(px(8.)).pb(px(8.));
-        if people.is_empty() {
-            list = list.child(div().p(px(14.)).child(caption(tr!("Nobody by that name.", "Ninguém com esse nome."), t.text3)));
+        let key = super::members::people_key(s);
+        if self.everyone.as_ref().is_none_or(|(k, _)| *k != key) {
+            let me = s.me.id;
+            let mut all: Vec<Person> = s
+                .users
+                .values()
+                .filter(|u| u.id != me)
+                .map(|u| Person { id: u.id, name: u.name().to_lowercase(), nickname: u.nickname.clone(), online: s.online.contains(&u.id) })
+                .collect();
+            all.sort_by(|a, b| (!a.online, &a.name, a.id).cmp(&(!b.online, &b.name, b.id)));
+            self.everyone = Some((key, all));
+            self.shown.0 = None;
         }
-        for (i, u) in people.into_iter().enumerate() {
-            let img = self.session.update(cx, |s, cx| s.avatar(u.id, cx));
-            let id = u.id;
-            let hover = t.layer_hover;
-            list = list.child(
-                div()
-                    .id(("person", u.id as u64))
-                    .flex()
-                    .items_center()
-                    .gap(px(10.))
-                    .h(px(42.))
-                    .px(px(8.))
-                    .rounded(px(radius::INNER + 1.))
-                    .cursor_pointer()
-                    .hover(move |s| s.bg(hover))
-                    .child(div().relative().child(avatar(u.name(), img, 28., None)).when(online[i], |d| {
-                        d.child(div().absolute().right(px(-2.)).bottom(px(-2.)).size(px(10.)).rounded_full().border_2().border_color(t.pane).bg(t.success))
-                    }))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .child(div().truncate().text_size(px(13.5)).text_color(t.text).child(u.name().to_string()))
-                            .child(div().truncate().text_size(px(11.5)).text_color(t.text3).child(format!("@{}", u.nickname))),
-                    )
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        let picked = this.picked.clone();
-                        cx.emit(Dismiss);
-                        picked(id, window, cx);
-                    })),
-            );
+        if self.shown.0.as_deref() != Some(q.as_str()) {
+            let all = self.everyone.as_ref().map(|(_, all)| all.as_slice()).unwrap_or_default();
+            let found = all.iter().filter(|p| q.is_empty() || p.name.contains(&q) || p.nickname.contains(&q)).map(|p| (p.id, p.online)).collect();
+            self.shown = (Some(q), std::rc::Rc::new(found));
         }
+        let shown = self.shown.1.clone();
+        let list = if shown.is_empty() {
+            div().px(px(8.)).pb(px(8.)).child(div().p(px(14.)).child(caption(tr!("Nobody by that name.", "Ninguém com esse nome."), t.text3))).into_any_element()
+        } else {
+            // Only the rows in view are made, so only their pictures are asked for. A list that
+            // makes only some of its rows has no height of its own to grow to: it's given the
+            // rows' height, up to the most the dialog shows.
+            let height = (shown.len() as f32 * PERSON_LINE).min(360.);
+            gpui::uniform_list(
+                "people",
+                shown.len(),
+                cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                    let t = current();
+                    range.map(|ix| this.person_line(shown[ix].0, shown[ix].1, &t, cx)).collect::<Vec<_>>()
+                }),
+            )
+            .h(px(height + 8.))
+            .px(px(8.))
+            .pb(px(8.))
+            .into_any_element()
+        };
         dialog_card(&t, 420.)
             .child(
                 div()

@@ -25,7 +25,9 @@ struct Entry {
 
 struct Inner {
     index: HashMap<String, Entry>,
-    keep: HashSet<String>,
+    /// What each session wants kept, by session: one cache serves every server signed in to, and
+    /// what any of them draws all the time stays.
+    keep: HashMap<u64, HashSet<String>>,
     /// A file came or went: the index goes to disk at the next flush.
     dirty: bool,
     /// Only recency changed, which is not worth a write every few seconds; it goes at exit.
@@ -95,7 +97,7 @@ impl Cache {
         };
         Cache {
             dir,
-            inner: Arc::new(Mutex::new(Inner { index, keep: HashSet::new(), dirty: false, touched: false, budget: budget(budget_mb) })),
+            inner: Arc::new(Mutex::new(Inner { index, keep: HashMap::new(), dirty: false, touched: false, budget: budget(budget_mb) })),
             flights: Default::default(),
             writing: Default::default(),
         }
@@ -105,9 +107,15 @@ impl Cache {
         self.dir.join(&hash[0..2]).join(&hash[2..4]).join(hash)
     }
 
-    /// Hashes that stay whatever the budget says: avatars, emoji, soundpad clips.
-    pub fn set_keep(&self, keep: impl IntoIterator<Item = String>) {
-        self.inner.lock().keep = keep.into_iter().collect();
+    /// Hashes that stay whatever the budget says (avatars, emoji, soundpad clips), as one session
+    /// (`owner`) sees them now. Every session's set stays alongside the others.
+    pub fn set_keep(&self, owner: u64, keep: impl IntoIterator<Item = String>) {
+        self.inner.lock().keep.insert(owner, keep.into_iter().collect());
+    }
+
+    /// A session stopped: what only it wanted kept may go now.
+    pub fn drop_keep(&self, owner: u64) {
+        self.inner.lock().keep.remove(&owner);
     }
 
     /// The cache every server shares, opened the first time it is asked for: a second one over the
@@ -208,7 +216,8 @@ impl Cache {
             if total <= inner.budget {
                 return;
             }
-            let mut by_age: Vec<(&String, &Entry)> = inner.index.iter().filter(|(h, _)| !inner.keep.contains(*h)).collect();
+            let kept = |h: &String| inner.keep.values().any(|k| k.contains(h));
+            let mut by_age: Vec<(&String, &Entry)> = inner.index.iter().filter(|(h, _)| !kept(h)).collect();
             by_age.sort_by_key(|(_, e)| e.used_at);
             let mut out = Vec::new();
             for (h, e) in by_age {
@@ -356,6 +365,29 @@ mod tests {
         assert!(inner.index.contains_key(&orphan) && !inner.index.contains_key(&kept) && inner.dirty);
         assert_eq!(inner.index[&orphan].bytes, 6);
         assert!(!part.exists());
+        drop(inner);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn what_any_session_keeps_stays_until_that_session_stops() {
+        let dir = temp_dir("keep");
+        let cache = Cache::load(dir.clone(), 64);
+        let a = cache.insert(b"aaaa", "image/png");
+        let b = cache.insert(b"bbbb", "image/png");
+        cache.set_keep(1, [a.clone()]);
+        cache.set_keep(2, [b.clone()]);
+        cache.inner.lock().budget = 8;
+        let c = cache.insert(b"cccc", "image/png");
+        {
+            let inner = cache.inner.lock();
+            assert!(inner.index.contains_key(&a) && inner.index.contains_key(&b) && !inner.index.contains_key(&c));
+        }
+        cache.drop_keep(1);
+        cache.inner.lock().budget = 4;
+        cache.evict();
+        let inner = cache.inner.lock();
+        assert!(!inner.index.contains_key(&a) && inner.index.contains_key(&b));
         drop(inner);
         let _ = std::fs::remove_dir_all(dir);
     }

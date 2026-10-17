@@ -799,13 +799,24 @@ impl Store {
 
 /// Writes beside the file and renames, so a crash mid-write never leaves half a file.
 pub fn write_file(path: &Path, text: &str) {
+    if let Err(e) = write_durably(path, text.as_bytes()) {
+        log::warn!("could not save {}: {e}", path.display());
+    }
+}
+
+/// Writes `bytes` beside `path`, flushed to the disk, then moves them over it. Without the
+/// flush, a power cut can keep the rename and lose the data: an empty file where the old one was.
+pub fn write_durably(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
     if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+        std::fs::create_dir_all(dir)?;
     }
     let tmp = path.with_extension("json.part");
-    if std::fs::write(&tmp, text).is_ok() {
-        let _ = std::fs::rename(&tmp, path);
-    }
+    let mut file = std::fs::File::create(&tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, path)
 }
 
 #[cfg(test)]
