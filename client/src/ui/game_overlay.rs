@@ -1,6 +1,7 @@
 //! The in-game overlay: who is in your call, lit while they talk, in a corner of the screen
 //! you're playing on, over the game. Off until turned on in Settings; a hotkey hides and shows
-//! it. Clicks go through it, it never takes the focus, and a screen share doesn't show it.
+//! it. Clicks go through it and it never takes the focus. Sharing the whole screen shows it,
+//! sharing the game's window doesn't (see `float` for why it isn't hidden from captures).
 //! Short notices ("Replay saved") show in it too, since a toast in the window would go unseen.
 
 use crate::media::call::Call;
@@ -77,7 +78,7 @@ fn apply(cx: &mut App) {
     match (want, s.window.is_some()) {
         (true, false) => {
             let Some((call, session)) = s.call.clone() else { return };
-            let handle = float::open(cx, |window, cx| cx.new(|cx| CallOverlay::new(call, session, window, cx)));
+            let handle = float::open(cx, float::Captures::Show, |window, cx| cx.new(|cx| CallOverlay::new(call, session, window, cx)));
             state(cx).window = handle;
         }
         (false, true) => {

@@ -507,7 +507,8 @@ pub fn show_on_screen(target: Option<(Share, Shared)>, cx: &mut App) {
         let _ = handle.update(cx, |_, window, _| window.remove_window());
     }
     let opened = target.and_then(|(share, shared)| {
-        float::open(cx, |window, cx| cx.new(|cx| ScreenInk::new(share, shared, window, cx))).map(|h| (share, shared, h))
+        float::open(cx, float::Captures::Skip, |window, cx| cx.new(|cx| ScreenInk::new(share, shared, window, cx)))
+            .map(|h| (share, shared, h))
     });
     cx.set_global(ScreenInkGlobal(opened));
 }

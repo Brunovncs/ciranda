@@ -1,6 +1,10 @@
 //! Windows that float over everything without taking a click or the focus: the in-game overlay
-//! and the drawings over a screen you share. Windows is asked to leave them out of screen
-//! captures, so a share shows neither, and nothing but Ciranda's own drawing is in them.
+//! and the drawings over a screen you share. Nothing but Ciranda's own drawing is in them.
+//!
+//! The drawings are left out of screen captures, or the share would send them back to those who
+//! drew them. The overlay stays in: a see-through, click-through window over a game that hides
+//! from captures is how an external cheat draws, and an anti-cheat has every reason to look hard
+//! at one. Sharing the game's window doesn't show it anyway, only sharing the whole screen does.
 //!
 //! Places are in the screen's physical pixels, as Windows gives monitors and windows. They hold
 //! over games in a window or borderless full screen; a game in exclusive full screen owns the
@@ -19,12 +23,23 @@ pub struct Rect {
     pub h: i32,
 }
 
+/// Whether screen captures show a floating window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Captures {
+    Show,
+    Skip,
+}
+
 /// Opens a floating window; `place` puts it where it belongs once open.
 ///
 /// Windows answers a style or a move of a window by calling into it at once, which GPUI can't
 /// take while that window is being updated: these calls are made outside any update, from the
 /// window's handle, or GPUI would never hear of its new size.
-pub fn open<V: Render + 'static>(cx: &mut App, build: impl FnOnce(&mut Window, &mut App) -> Entity<V>) -> Option<WindowHandle<V>> {
+pub fn open<V: Render + 'static>(
+    cx: &mut App,
+    captures: Captures,
+    build: impl FnOnce(&mut Window, &mut App) -> Entity<V>,
+) -> Option<WindowHandle<V>> {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds { origin: point(px(0.), px(0.)), size: size(px(1.), px(1.)) })),
         titlebar: None,
@@ -40,7 +55,7 @@ pub fn open<V: Render + 'static>(cx: &mut App, build: impl FnOnce(&mut Window, &
     match cx.open_window(options, build) {
         Ok(handle) => {
             if let Ok(Some(hwnd)) = handle.update(cx, |_, window, _| crate::ui::tray::hwnd(window)) {
-                imp::float(hwnd);
+                imp::float(hwnd, captures);
             }
             Some(handle)
         }
@@ -67,7 +82,7 @@ pub use imp::{foreground_monitor, screen_rect, window_rect};
 
 #[cfg(windows)]
 mod imp {
-    use super::Rect;
+    use super::{Captures, Rect};
     use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, RECT};
     use windows::Win32::Graphics::Dwm::{
         DWMNCRP_DISABLED, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_NCRENDERING_POLICY, DWMWA_WINDOW_CORNER_PREFERENCE,
@@ -87,8 +102,9 @@ mod imp {
         Rect { x: r.left, y: r.top, w: r.right - r.left, h: r.bottom - r.top }
     }
 
-    /// Clicks go through it to what is under, it never takes the focus, and captures skip it.
-    pub fn float(hwnd: isize) {
+    /// Clicks go through it to what is under, it never takes the focus, and captures skip it if
+    /// asked to.
+    pub fn float(hwnd: isize, captures: Captures) {
         let h = HWND(hwnd as _);
         // SAFETY: a window of this process, alive while its GPUI window is.
         unsafe {
@@ -108,7 +124,7 @@ mod imp {
             let square = DWMWCP_DONOTROUND;
             let _ = DwmSetWindowAttribute(h, DWMWA_WINDOW_CORNER_PREFERENCE, &square as *const _ as _, size_of_val(&square) as u32);
             // A debug build can leave them in captures, for screenshots of them.
-            let seen = cfg!(debug_assertions) && std::env::var_os("CIRANDA_FLOAT_CAPTURED").is_some();
+            let seen = captures == Captures::Show || (cfg!(debug_assertions) && std::env::var_os("CIRANDA_FLOAT_CAPTURED").is_some());
             if !seen && let Err(e) = SetWindowDisplayAffinity(h, WDA_EXCLUDEFROMCAPTURE) {
                 log::info!("floating window stays in captures: {e}");
             }
@@ -167,8 +183,8 @@ mod imp {
 
 #[cfg(not(windows))]
 mod imp {
-    use super::Rect;
-    pub fn float(_: isize) {}
+    use super::{Captures, Rect};
+    pub fn float(_: isize, _: Captures) {}
     pub fn place(_: isize, _: Rect) {}
     pub fn foreground_monitor() -> Option<(Rect, Rect)> {
         None
