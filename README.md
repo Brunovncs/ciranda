@@ -5,13 +5,15 @@ Voice channels with screen and camera sharing, text channels, and private
 conversations and calls, on a server you run. Latency stays under a second
 because the server relays video and never re-encodes it.
 
-[![Download for Windows](https://img.shields.io/github/v/release/Brunovncs/ciranda?label=Download%20for%20Windows&logo=windows&style=for-the-badge&color=5b8cff)](https://github.com/Brunovncs/ciranda/releases/latest)
+[![Download for Windows](https://img.shields.io/github/v/release/Brunovncs/ciranda?label=Windows&logo=windows&style=for-the-badge&color=5b8cff)](https://github.com/Brunovncs/ciranda/releases/latest)
+[![Download for macOS](https://img.shields.io/github/v/release/Brunovncs/ciranda?label=macOS&logo=apple&style=for-the-badge&color=5b8cff)](https://github.com/Brunovncs/ciranda/releases/latest)
+[![Download for Linux](https://img.shields.io/github/v/release/Brunovncs/ciranda?label=Linux&logo=linux&style=for-the-badge&color=5b8cff)](https://github.com/Brunovncs/ciranda/releases/latest)
 
 ![A server in Ciranda: channels, people in a voice channel, and a conversation with a reply, a picture and reactions](docs/screenshots/server.png)
 
 ## How it is built
 
-**Client.** A native Windows app written in Rust on [GPUI](https://www.gpui.rs/),
+**Client.** A native app for Windows, macOS and Linux, written in Rust on [GPUI](https://www.gpui.rs/),
 the UI framework behind the Zed editor: a single `ciranda.exe`, with no browser
 engine inside. Media goes over WebRTC through
 [LiveKit's libwebrtc bindings](https://github.com/livekit/rust-sdks). Video stays
@@ -80,6 +82,36 @@ new program, checks its SHA-256, swaps it in and restarts, waiting for your call
 to end if you are in one. Settings, Advanced, "Check for updates" turns this
 off.
 
+### Client (Windows on Arm)
+
+The same release has `ciranda-<version>-windows-arm64-setup.exe` and
+`ciranda-<version>-windows-arm64.exe`, built for Arm processors (Snapdragon and
+the like). They install and update the same way.
+
+### Client (macOS 11 or later, Apple silicon and Intel)
+
+Download `ciranda-<version>-macos-universal.dmg`, open it and drag Ciranda to
+Applications. Ciranda is not notarized by Apple, so the first launch is blocked:
+right-click Ciranda and choose **Open**, or on macOS 15 and later try once, then
+go to **System Settings → Privacy & Security** and click **Open Anyway**
+(`xattr -dr com.apple.quarantine /Applications/Ciranda.app` does the same). macOS
+asks for the microphone, the camera and screen recording the first time each is
+used. Settings live in `~/Library/Application Support/Ciranda`.
+
+### Client (Linux, x86-64)
+
+Download `ciranda-<version>-linux-x64.AppImage`, make it executable
+(`chmod +x`) and run it. It needs glibc 2.35 or newer (Ubuntu 22.04, Debian 12,
+Fedora 36 and later). On a Wayland desktop it runs through XWayland, which gives
+it a title bar everywhere; `CIRANDA_WAYLAND=1` runs it on Wayland itself, for
+desktops that draw title bars for their windows (KDE, not GNOME).
+
+On macOS and Linux an update is a new download: the Update button opens the
+release's page. These are new, so a few things are still Windows only: the
+notification-area icon (closing the window quits), global hotkeys, sharing an
+app's sound, replays and the graphics card's H.264 encoder (video is encoded in
+software).
+
 ### Server (Linux, x86-64 or arm64)
 
 With the installer, on Debian, Ubuntu or Raspberry Pi OS:
@@ -111,10 +143,13 @@ reach the server directly. Ports, TLS, dynamic IPs and troubleshooting are in
 
 ### Building the client
 
-With [Rust](https://rustup.rs/) and the Visual Studio Build Tools (C++ workload):
+With [Rust](https://rustup.rs/) and the Visual Studio Build Tools (C++ workload)
+on Windows, Xcode's command line tools on macOS, or on Linux clang 21 or later
+(`CC=clang-21 CXX=clang++-21`) and the packages in
+`client/packaging/linux/build-deps.txt`:
 
 ```bash
-cargo build --release --manifest-path client/Cargo.toml   # -> client/target/release/ciranda.exe
+cargo build --release --manifest-path client/Cargo.toml   # -> client/target/release/ciranda(.exe)
 ```
 
 A build made this way never replaces itself through the updater.

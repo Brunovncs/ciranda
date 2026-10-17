@@ -122,7 +122,20 @@ fn app_menu(cx: &mut gpui::App) {
     ])]);
 }
 
+/// X11 (XWayland on a Wayland desktop) unless `CIRANDA_WAYLAND` is set: GNOME's compositor
+/// leaves window decorations to the program, and GPUI draws none, so on Wayland there the window
+/// would have no title bar to move or close it by.
+#[cfg(target_os = "linux")]
+fn prefer_x11() {
+    if std::env::var_os("DISPLAY").is_some_and(|d| !d.is_empty()) && std::env::var_os("CIRANDA_WAYLAND").is_none() {
+        // SAFETY: first thing in main, before any thread that could read the environment.
+        unsafe { std::env::remove_var("WAYLAND_DISPLAY") };
+    }
+}
+
 fn main() {
+    #[cfg(target_os = "linux")]
+    prefer_x11();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("ciranda=info,warn")).init();
     let smoke = std::env::args().any(|a| a == "--smoke");
     // The installer's way to close a running Ciranda before it replaces or removes the program.
