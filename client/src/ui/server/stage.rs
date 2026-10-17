@@ -174,7 +174,6 @@ impl ServerView {
             let name = self.session.read(cx).display_name(Some(m.user_id), Some(&m.nickname));
             let image = self.session.update(cx, |s, cx| s.avatar(m.user_id, cx));
             let (user, mid) = (m.user_id, m.mid);
-            let gain = crate::media::voice::volume_of(m.user_id);
             let card = div()
                 .id(("person", m.mid as u64))
                 .relative()
@@ -204,9 +203,6 @@ impl ServerView {
                         .when(m.deafened, |d| d.child(icon("headphones-off", 14., t.text3)))
                         .when(m.publishes("s"), |d| d.child(live_chip(t, false))),
                 )
-                .when(m.user_id != me && gain != 1., |d| {
-                    d.child(mono(trf!("{:.0}% for you", "{:.0}% para você", gain * 100.), if gain > 1. { t.caution } else { t.text3 }))
-                })
                 .when(m.user_id != me, |d| {
                     d.on_mouse_down(
                         MouseButton::Right,

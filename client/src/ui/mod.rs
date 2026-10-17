@@ -8,6 +8,7 @@ pub mod float;
 pub mod game_overlay;
 pub mod hotkeys;
 pub mod ink;
+mod mic_switch;
 pub mod overlay;
 mod rail;
 pub mod server;
@@ -141,6 +142,7 @@ impl Root {
             }
         })
         .detach();
+        mic_switch::listen(handle, cx);
         let mut root = Root {
             focus: cx.focus_handle(),
             screen: Screen::Connect { view: view.clone() },

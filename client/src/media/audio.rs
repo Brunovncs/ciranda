@@ -13,7 +13,7 @@ use parking_lot::{Condvar, Mutex};
 use rtrb::{Consumer, Producer, RingBuffer};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock, mpsc};
+use std::sync::{Arc, LazyLock, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 pub const RATE: u32 = 48_000;
@@ -517,10 +517,15 @@ pub fn output_devices() -> Vec<DeviceInfo> {
 }
 
 fn list(devices: Vec<cpal::Device>) -> Vec<DeviceInfo> {
-    devices
-        .into_iter()
-        .filter_map(|d| Some(DeviceInfo { id: d.id().ok()?.to_string(), name: d.description().ok()?.name().to_string() }))
-        .collect()
+    devices.iter().filter_map(info).collect()
+}
+
+fn info(d: &cpal::Device) -> Option<DeviceInfo> {
+    Some(DeviceInfo { id: d.id().ok()?.to_string(), name: d.description().ok()?.name().to_string() })
+}
+
+fn present(id: &str) -> bool {
+    id.parse::<cpal::DeviceId>().is_ok_and(|id| cpal::default_host().device_by_id(&id).is_some())
 }
 
 fn find(id: &str, input: bool) -> Option<cpal::Device> {
@@ -565,6 +570,53 @@ pub type MicSink = Box<dyn FnMut(&[i16]) + Send>;
 enum Command {
     Output(String),
     Input(Option<String>),
+    /// The capture's device went away, or it was Windows' default and the default changed.
+    InputLost,
+}
+
+/// The microphone changed under a capture without anyone choosing it: unplugged, Windows' default
+/// moved to another, or the chosen one came back.
+#[derive(Clone, Debug)]
+pub struct MicSwitch {
+    /// The one captured before; `None` when there never was one.
+    pub from: Option<DeviceInfo>,
+    /// `None` when no microphone is left.
+    pub to: Option<DeviceInfo>,
+}
+
+type Channel<T> = (async_channel::Sender<T>, async_channel::Receiver<T>);
+
+static MIC_SWITCHES: LazyLock<Channel<MicSwitch>> = LazyLock::new(async_channel::unbounded);
+
+/// Every microphone switch nobody chose, as it happens.
+pub fn mic_switches() -> async_channel::Receiver<MicSwitch> {
+    MIC_SWITCHES.1.clone()
+}
+
+/// Which microphone the capture is on, to tell a switch from a reopen of the same one.
+#[derive(Default)]
+struct Using {
+    /// The last one that opened, kept while none will.
+    device: Option<DeviceInfo>,
+    missing: bool,
+}
+
+impl Using {
+    /// Notes what a capture opened on (`None`: nothing would), telling the interface when it
+    /// changed and nobody asked.
+    fn opened(&mut self, now: Option<DeviceInfo>, asked: bool) {
+        let changed = match &now {
+            Some(d) => self.missing || self.device.as_ref().is_none_or(|u| u.id != d.id),
+            None => !self.missing,
+        };
+        if changed && !asked {
+            let _ = MIC_SWITCHES.0.try_send(MicSwitch { from: self.device.clone(), to: now.clone() });
+        }
+        self.missing = now.is_none();
+        if now.is_some() {
+            self.device = now;
+        }
+    }
 }
 
 pub struct Audio {
@@ -600,8 +652,8 @@ impl Audio {
         let near = Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
         let (tx, rx) = mpsc::channel();
         {
-            let (mixer, mic, near) = (mixer.clone(), mic.clone(), near.clone());
-            std::thread::Builder::new().name("ciranda-audio".into()).spawn(move || device_thread(rx, mixer, mic, near)).ok();
+            let (mixer, mic, near, tx) = (mixer.clone(), mic.clone(), near.clone(), tx.clone());
+            std::thread::Builder::new().name("ciranda-audio".into()).spawn(move || device_thread(rx, tx, mixer, mic, near)).ok();
         }
         {
             let (mixer, mic, near) = (mixer.clone(), mic.clone(), near.clone());
@@ -660,12 +712,29 @@ const CAPTURE_STALL: Duration = Duration::from_secs(3);
 /// How often a microphone that would not open is tried again, for one plugged back in.
 const CAPTURE_RETRY: Duration = Duration::from_secs(10);
 
-fn device_thread(rx: mpsc::Receiver<Command>, mixer: Arc<Mixer>, mic: Arc<Mic>, near: Arc<(Mutex<VecDeque<f32>>, Condvar)>) {
+fn device_thread(
+    rx: mpsc::Receiver<Command>,
+    tx: mpsc::Sender<Command>,
+    mixer: Arc<Mixer>,
+    mic: Arc<Mic>,
+    near: Arc<(Mutex<VecDeque<f32>>, Condvar)>,
+) {
     let mut output: Option<cpal::Stream> = None;
     let mut input: Option<cpal::Stream> = None;
     // The microphone wanted, while one is; and the frame count last seen, and when it moved.
     let mut wanted: Option<String> = None;
     let mut seen = (0, Instant::now());
+    let mut using = Using::default();
+    // Closed before opening again: some devices take one capture at a time.
+    let reopen = |input: &mut Option<cpal::Stream>, wanted: Option<&str>, using: &mut Using, asked: bool| {
+        drop(input.take());
+        let opened = open_capture(wanted, &mic, &near, &tx);
+        if wanted.is_some() {
+            using.opened(opened.as_ref().map(|(_, d)| d.clone()), asked);
+        }
+        *input = opened.map(|(s, _)| s);
+        (mic.frames.load(Ordering::Relaxed), Instant::now())
+    };
     loop {
         match rx.recv_timeout(Duration::from_secs(1)) {
             Ok(Command::Output(id)) => {
@@ -677,13 +746,18 @@ fn device_thread(rx: mpsc::Receiver<Command>, mixer: Arc<Mixer>, mic: Arc<Mic>, 
             }
             Ok(Command::Input(id)) => {
                 wanted = id;
-                // Closed before opening again: some devices take one capture at a time.
-                drop(input.take());
-                input = open_capture(wanted.as_deref(), &mic, &near);
-                seen = (mic.frames.load(Ordering::Relaxed), Instant::now());
+                seen = reopen(&mut input, wanted.as_deref(), &mut using, true);
+            }
+            Ok(Command::InputLost) => {
+                if input.is_some() {
+                    seen = reopen(&mut input, wanted.as_deref(), &mut using, false);
+                }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                if wanted.is_none() {
+                let Some(w) = wanted.as_deref() else { continue };
+                // On Windows' default because the chosen one was gone: back to it once it's in.
+                if !w.is_empty() && input.is_some() && using.device.as_ref().is_some_and(|d| d.id != w) && present(w) {
+                    seen = reopen(&mut input, Some(w), &mut using, false);
                     continue;
                 }
                 let frames = mic.frames.load(Ordering::Relaxed);
@@ -695,9 +769,7 @@ fn device_thread(rx: mpsc::Receiver<Command>, mixer: Arc<Mixer>, mic: Arc<Mic>, 
                     if input.is_some() {
                         log::warn!("the microphone stopped delivering sound; opening it again");
                     }
-                    drop(input.take());
-                    input = open_capture(wanted.as_deref(), &mic, &near);
-                    seen = (mic.frames.load(Ordering::Relaxed), Instant::now());
+                    seen = reopen(&mut input, Some(w), &mut using, false);
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -706,11 +778,17 @@ fn device_thread(rx: mpsc::Receiver<Command>, mixer: Arc<Mixer>, mic: Arc<Mic>, 
     drop((output, input));
 }
 
-/// Opens the capture for `id`; none for `None`, or for a microphone that will not open.
-fn open_capture(id: Option<&str>, mic: &Arc<Mic>, near: &Arc<(Mutex<VecDeque<f32>>, Condvar)>) -> Option<cpal::Stream> {
+/// Opens the capture for `id`, with the device it landed on; none for `None`, or for a
+/// microphone that will not open.
+fn open_capture(
+    id: Option<&str>,
+    mic: &Arc<Mic>,
+    near: &Arc<(Mutex<VecDeque<f32>>, Condvar)>,
+    tx: &mpsc::Sender<Command>,
+) -> Option<(cpal::Stream, DeviceInfo)> {
     mic.capturing.store(false, Ordering::Relaxed);
     near.0.lock().clear();
-    match open_input(id?, near.clone(), mic.clone()) {
+    match open_input(id?, near.clone(), mic.clone(), tx.clone()) {
         Ok(s) => {
             mic.capturing.store(true, Ordering::Relaxed);
             Some(s)
@@ -781,8 +859,14 @@ fn open_output(id: &str, mixer: Arc<Mixer>) -> anyhow::Result<cpal::Stream> {
     Ok(stream)
 }
 
-fn open_input(id: &str, near: Arc<(Mutex<VecDeque<f32>>, Condvar)>, mic: Arc<Mic>) -> anyhow::Result<cpal::Stream> {
+fn open_input(
+    id: &str,
+    near: Arc<(Mutex<VecDeque<f32>>, Condvar)>,
+    mic: Arc<Mic>,
+    lost: mpsc::Sender<Command>,
+) -> anyhow::Result<(cpal::Stream, DeviceInfo)> {
     let device = find(id, true).ok_or_else(|| anyhow::anyhow!("no microphone"))?;
+    let using = info(&device).ok_or_else(|| anyhow::anyhow!("the microphone has no name"))?;
     let config = device.default_input_config()?;
     let (rate, channels) = (config.sample_rate(), config.channels() as usize);
     let mut resampler = Resampler::new(rate, RATE, 1);
@@ -801,7 +885,12 @@ fn open_input(id: &str, near: Arc<(Mutex<VecDeque<f32>>, Condvar)>, mic: Arc<Mic
         b.drain(..over);
         cv.notify_one();
     };
-    let err = |e| log::warn!("microphone: {e}");
+    let err = move |e: cpal::Error| {
+        log::warn!("microphone: {e}");
+        if matches!(e.kind(), cpal::ErrorKind::DeviceNotAvailable | cpal::ErrorKind::DeviceChanged | cpal::ErrorKind::StreamInvalidated) {
+            let _ = lost.send(Command::InputLost);
+        }
+    };
     let stream = match config.sample_format() {
         cpal::SampleFormat::F32 => device.build_input_stream::<f32, _, _>(config.config(), move |i, _| take(i), err, None)?,
         cpal::SampleFormat::I16 => {
@@ -820,7 +909,7 @@ fn open_input(id: &str, near: Arc<(Mutex<VecDeque<f32>>, Condvar)>, mic: Arc<Mic
         other => anyhow::bail!("the microphone gives {other:?} samples"),
     };
     stream.play()?;
-    Ok(stream)
+    Ok((stream, using))
 }
 
 /// Turns raw microphone audio into what the call sends: echo cancelled against the mix, noise
@@ -1129,6 +1218,29 @@ pub fn decode(bytes: Vec<u8>) -> anyhow::Result<Vec<f32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_microphone_switch_nobody_chose_is_told() {
+        let dev = |id: &str| DeviceInfo { id: id.into(), name: id.to_uppercase() };
+        let told = || std::iter::from_fn(|| MIC_SWITCHES.1.try_recv().ok()).collect::<Vec<_>>();
+        told();
+        let mut u = Using::default();
+        u.opened(Some(dev("headset")), true);
+        u.opened(Some(dev("laptop")), true);
+        assert!(told().is_empty(), "choosing one, or joining a call, is no news");
+        u.opened(Some(dev("laptop")), false);
+        assert!(told().is_empty(), "the same one opened again");
+        u.opened(Some(dev("headset")), false);
+        let t = told();
+        assert_eq!((t[0].from.as_ref().unwrap().id.as_str(), t[0].to.as_ref().unwrap().id.as_str()), ("laptop", "headset"));
+        u.opened(None, false);
+        u.opened(None, false);
+        let t = told();
+        assert_eq!(t.len(), 1, "gone is told once, not on every retry");
+        assert!(t[0].to.is_none());
+        u.opened(Some(dev("headset")), false);
+        assert_eq!(told().len(), 1, "back after none is news, even the same one");
+    }
 
     #[test]
     fn resampling_keeps_length_in_proportion() {
