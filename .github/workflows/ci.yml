@@ -73,6 +73,13 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: System libraries
         run: sudo apt-get update -q && sudo apt-get install -yq --no-install-recommends $(cat packaging/linux/build-deps.txt)
+      # libwebrtc is built against Chromium's own libc++, which only a recent clang compiles.
+      - name: Clang 21
+        run: |
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          sudo bash /tmp/llvm.sh 21
+          echo "CC=clang-21" >> "$GITHUB_ENV"
+          echo "CXX=clang++-21" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: stable
