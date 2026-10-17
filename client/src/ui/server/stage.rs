@@ -247,10 +247,12 @@ impl ServerView {
             let others: Vec<Entity<Tile>> = tiles.iter().filter(|x| **x != f).cloned().collect();
             let strip_h = if others.is_empty() { 0. } else { 130. };
             let big = self.tile_el(&f, voice, w, h - strip_h, true, t, window, cx);
-            let mut strip = div().flex().gap(px(10.)).h(px(strip_h)).justify_center();
+            // As many as there are: centred while they fit, scrolled sideways (the wheel too) once not.
+            let mut row = div().flex().flex_none().gap(px(10.)).mx_auto();
             for o in &others {
-                strip = strip.child(self.tile_el(o, voice, 200., 112., false, t, window, cx));
+                row = row.child(div().flex_none().child(self.tile_el(o, voice, 200., 112., false, t, window, cx)));
             }
+            let strip = div().id("stage-strip").flex().w(px(w)).h(px(strip_h)).overflow_x_scroll().child(row);
             return div().flex().flex_col().gap(px(10.)).p(px(16.)).size_full().items_center().child(big).child(strip).into_any_element();
         }
         // The column count that makes 16:9 tiles largest.

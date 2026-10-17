@@ -23,7 +23,7 @@ import { join } from 'node:path';
  * Never edit a migration that has shipped -- add a new one. A deployed server
  * has already run the old text, and SQLite has no way to notice it changed.
  */
-const MIGRATIONS = [
+export const MIGRATIONS = [
   // v1 -- identity.
   (db) => {
     db.exec(`
@@ -423,9 +423,11 @@ const MIGRATIONS = [
    * A private conversation's versions are as sealed as the message.
    */
   (db) => {
+    // A database from Harmony 3.5 already has it: see harmonyReplies below.
+    if (!hasColumn(db, 'messages', 'reply_to')) {
+      db.exec('ALTER TABLE messages ADD COLUMN reply_to INTEGER');
+    }
     db.exec(`
-      ALTER TABLE messages ADD COLUMN reply_to INTEGER;
-
       CREATE TABLE message_edits (
         id         INTEGER PRIMARY KEY,
         message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
@@ -560,9 +562,28 @@ export function openDatabase({ dataDir, file = 'harmony.db' }) {
   return db;
 }
 
+function hasColumn(db, table, column) {
+  return db.prepare(`PRAGMA table_info(${table})`).all().some((c) => c.name === column);
+}
+
+/*
+ * Harmony, the line this server forked from, numbered its own v11: replies
+ * (messages.reply_to), where ours is the microphone lock. Taken at its word,
+ * a database from Harmony 3.5 or later would skip our v11 and then fail v13
+ * on a column it already has. It is put back at v10 instead, so v11 adds the
+ * lock and v13 leaves reply_to as it found it.
+ */
+function harmonyReplies(db, version) {
+  return version === 11 && !hasColumn(db, 'channels', 'mic_locked') && hasColumn(db, 'messages', 'reply_to');
+}
+
 /** Run any migrations this database has not seen yet. */
 export function migrate(db) {
-  const [{ user_version: current }] = db.prepare('PRAGMA user_version').all();
+  let [{ user_version: current }] = db.prepare('PRAGMA user_version').all();
+  if (harmonyReplies(db, current)) {
+    console.log('[db] a Harmony 3.5 database: taking its v11 as v10 plus replies');
+    current = 10;
+  }
 
   if (current > MIGRATIONS.length) {
     throw new Error(

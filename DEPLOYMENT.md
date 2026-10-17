@@ -142,8 +142,12 @@ The installer is safe to re-run. It:
   `./install.sh --help`.
 
 An existing `harmony.env` is only changed by the setup, and only when you run
-it, so upgrading is just `git pull && sudo ./install.sh` -- which restarts the
-services onto the new code and leaves the configuration alone.
+it. To upgrade, run `sudo ./install.sh --update`: it pulls the latest code (in
+a git checkout, as the checkout's owner), keeps a copy of the database in
+`backups/` beside it (the last five), reinstalls, restarts the services and
+checks the server answers, printing its log if it does not. It asks nothing
+and leaves the configuration alone. `--update --no-pull` does the same from
+the files as they are.
 
 ## 2. Configure
 

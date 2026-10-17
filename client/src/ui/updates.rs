@@ -16,9 +16,14 @@ use gpui::{
     StatefulInteractiveElement, Styled, Subscription, Task, Window, div, relative,
 };
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
-const CHECK_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
+/// Often enough for a program left open in the tray for days, where a long gap meant "at start-up".
+const CHECK_EVERY: Duration = Duration::from_secs(30 * 60);
+/// Coming back to the window, or the computer waking, checks again once the last check is this old.
+const RECHECK_AFTER: Duration = Duration::from_secs(10 * 60);
+/// How often the poll looks at the clock and the window.
+const TICK: Duration = Duration::from_secs(60);
 /// Builds from `cargo run` keep their program; only release builds replace themselves.
 const SELF_UPDATE: bool = !cfg!(debug_assertions);
 
@@ -42,6 +47,11 @@ enum State {
 pub struct Updater {
     state: State,
     checking: bool,
+    /// When the last check began. Wall-clock time, so a computer that slept through the gap counts
+    /// the hours it was asleep.
+    last_check: Option<SystemTime>,
+    /// Whether one of Ciranda's windows had focus at the last tick.
+    focused: bool,
     /// Why the last check failed, for Settings.
     check_error: Option<String>,
     in_call: bool,
@@ -57,7 +67,7 @@ struct Handle(Entity<Updater>);
 
 impl Global for Handle {}
 
-/// Starts checking, at once and every few hours while the setting is on.
+/// Starts checking, at once and every half hour while the setting is on.
 pub fn init(cx: &mut App) {
     let updater = cx.new(Updater::new);
     cx.set_global(Handle(updater));
@@ -121,18 +131,26 @@ impl Updater {
             async {}
         });
         let poll = cx.spawn(async move |this, cx| {
-            let check = |u: &mut Updater, cx: &mut Context<Updater>| {
-                if prefs(cx).check_updates {
+            let tick = |u: &mut Updater, cx: &mut Context<Updater>| {
+                let focused = cx.active_window().is_some();
+                let due = match u.last_check.map(|t| t.elapsed().unwrap_or(Duration::ZERO)) {
+                    None => true,
+                    Some(since) => since >= CHECK_EVERY || (focused && !u.focused && since >= RECHECK_AFTER),
+                };
+                u.focused = focused;
+                if due && prefs(cx).check_updates {
                     u.check(cx)
                 }
             };
-            while this.update(cx, check).is_ok() {
-                cx.background_executor().timer(CHECK_EVERY).await;
+            while this.update(cx, tick).is_ok() {
+                cx.background_executor().timer(TICK).await;
             }
         });
         Updater {
             state: State::Idle,
             checking: false,
+            last_check: None,
+            focused: false,
             check_error: None,
             in_call: false,
             exe,
@@ -147,6 +165,7 @@ impl Updater {
             return;
         }
         self.checking = true;
+        self.last_check = Some(SystemTime::now());
         changed(cx);
         let found = crate::core::run(update::check());
         cx.spawn(async move |this, cx| {
@@ -521,8 +540,8 @@ pub fn settings_row(t: &Theme, cx: &mut App) -> AnyElement {
                         .child(body(tr!("Check for updates", "Procurar atualizações"), t.text))
                         .child(caption(
                             tr!(
-                                "Asks GitHub for a newer version when Ciranda opens and every 6 hours. Nothing about you is sent.",
-                                "Pergunta ao GitHub por uma versão nova quando Ciranda abre e a cada 6 horas. Nada sobre você é enviado."
+                                "Asks GitHub for a newer version when Ciranda opens and every 30 minutes. Nothing about you is sent.",
+                                "Pergunta ao GitHub por uma versão nova quando Ciranda abre e a cada 30 minutos. Nada sobre você é enviado."
                             ),
                             t.text2,
                         )),

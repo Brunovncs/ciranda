@@ -42,6 +42,8 @@ pub struct Call {
     pub mid: Option<i64>,
     pub muted: bool,
     pub deafened: bool,
+    /// Deafening muted a microphone that was open, so undeafening opens it again.
+    muted_by_deafen: bool,
     pub voice: Option<Entity<Voice>>,
     password: Option<String>,
     /// A private call's media key; none in a voice channel.
@@ -165,6 +167,7 @@ impl Call {
                 mid: None,
                 muted,
                 deafened,
+                muted_by_deafen: false,
                 voice: None,
                 password,
                 key,
@@ -376,6 +379,11 @@ impl Call {
         cx.notify();
     }
 
+    fn silenced(&self, cx: &App) -> bool {
+        let me = self.session.read(cx).me.id;
+        self.session.read(cx).roster(self.place).and_then(|r| r.iter().find(|m| m.user_id == me)).is_some_and(|m| m.silenced())
+    }
+
     pub fn set_muted(&mut self, muted: bool, cx: &mut Context<Self>) {
         let me = self.session.read(cx).me.id;
         let mine = self.session.read(cx).roster(self.place).and_then(|r| r.iter().find(|m| m.user_id == me)).cloned();
@@ -404,6 +412,7 @@ impl Call {
             voice_cue(if muted { Cue::Mute } else { Cue::Unmute }, cx);
         }
         self.muted = muted;
+        self.muted_by_deafen = false;
         self.apply_mute(cx);
     }
 
@@ -414,7 +423,10 @@ impl Call {
         self.deafened = deafened;
         // Deafening mutes too; undeafening leaves the microphone as it was before.
         if deafened {
+            self.muted_by_deafen |= !self.muted;
             self.muted = true;
+        } else if std::mem::take(&mut self.muted_by_deafen) && !self.silenced(cx) {
+            self.muted = false;
         }
         self.apply_mute(cx);
     }

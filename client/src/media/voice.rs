@@ -426,6 +426,11 @@ impl Voice {
                             e.code,
                             e.status
                         );
+                        // The relay checks the token on every new publish, and the join's may
+                        // have run out (a computer that slept past its refresh, say).
+                        if e.code == ErrorCode::Unauthorized {
+                            v.refresh_tokens(cx);
+                        }
                     }
                 }
                 cx.notify();
