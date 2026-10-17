@@ -28,21 +28,22 @@ export class Throttle {
   }
 
   /**
-   * Spend one token for `key`.
+   * Spend one token for `key` -- or `cost` of them, for an action that is a
+   * fraction (or a multiple) of the usual one, such as a piece of a file.
    *
    * @returns {{allowed: boolean, retryAfterSec: number}}
    */
-  take(key) {
+  take(key, cost = 1) {
     const now = this.#now();
     const bucket = this.#buckets.get(key) ?? { tokens: this.#burst, at: now };
     bucket.tokens = Math.min(this.#burst, bucket.tokens + ((now - bucket.at) / 1000) * this.#perSecond);
     bucket.at = now;
 
-    if (bucket.tokens < 1) {
+    if (bucket.tokens < cost) {
       this.#buckets.set(key, bucket);
-      return { allowed: false, retryAfterSec: Math.ceil((1 - bucket.tokens) / this.#perSecond) };
+      return { allowed: false, retryAfterSec: Math.max(1, Math.ceil((cost - bucket.tokens) / this.#perSecond)) };
     }
-    bucket.tokens -= 1;
+    bucket.tokens -= cost;
     this.#buckets.set(key, bucket);
     this.#sweep(now);
     return { allowed: true, retryAfterSec: 0 };

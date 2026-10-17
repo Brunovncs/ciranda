@@ -47,7 +47,18 @@ pub enum ErrorCode {
     NoSuchClip,
     NoSuchUpload,
     ServerFull,
+    /// The server's disk is down to the room it keeps for itself.
+    DiskFull,
     FileTooLarge,
+    // A file in pieces (upload sessions).
+    TooManyUploads,
+    BadOffset,
+    ChunkTooLarge,
+    Incomplete,
+    Aborted,
+    BadLimit,
+    /// You stopped the upload.
+    Cancelled,
     AvatarTooLarge,
     PictureTooLarge,
     EmojiTooLarge,
@@ -690,6 +701,11 @@ pub struct ServerInfo {
     pub icon_hash: Option<String>,
     pub password_required: bool,
     pub restart_required: bool,
+    /// The largest file anybody may send there. Only servers that take files in pieces say it,
+    /// so it is also how a client knows it may send them that way.
+    pub max_file_bytes: Option<u64>,
+    /// The most the owner may set that to.
+    pub max_file_limit: Option<u64>,
 }
 
 /// `ServerInfo` as either line's server sends it. Both names at once must parse: a serde alias
@@ -708,6 +724,10 @@ struct ServerInfoWire {
     password_required: bool,
     #[serde(default)]
     restart_required: bool,
+    #[serde(default, deserialize_with = "lenient_opt")]
+    max_file_bytes: Option<u64>,
+    #[serde(default, deserialize_with = "lenient_opt")]
+    max_file_limit: Option<u64>,
 }
 
 impl From<ServerInfoWire> for ServerInfo {
@@ -717,6 +737,8 @@ impl From<ServerInfoWire> for ServerInfo {
             icon_hash: w.icon_hash.or(w.logo),
             password_required: w.password_required,
             restart_required: w.restart_required,
+            max_file_bytes: w.max_file_bytes.filter(|n| *n > 0),
+            max_file_limit: w.max_file_limit.filter(|n| *n > 0),
         }
     }
 }
@@ -804,6 +826,15 @@ pub struct SessionReply {
 #[serde(rename_all = "camelCase")]
 pub struct Upload {
     pub hash: String,
+}
+
+/// `POST /api/uploads/sessions`: a file about to go up in pieces of at most `chunk_bytes`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadSession {
+    pub id: String,
+    #[serde(default)]
+    pub chunk_bytes: u64,
 }
 
 /// `GET /api/server/storage`: the upload quota and how much of it is used.
@@ -1009,5 +1040,17 @@ mod tests {
         assert_eq!(none.icon_hash, None);
         assert_eq!(both.icon_hash.as_deref(), Some("ab"));
         assert_eq!(both_health.icon_hash().map(String::as_str), Some("ab"));
+    }
+
+    #[test]
+    fn the_file_limit_is_only_there_when_the_server_says_it() {
+        let old: ServerInfo = serde_json::from_str(r#"{"name":"x"}"#).unwrap();
+        let new: ServerInfo = serde_json::from_str(r#"{"name":"x","maxFileBytes":26214400,"maxFileLimit":2147483648}"#).unwrap();
+        let odd: ServerInfo = serde_json::from_str(r#"{"name":"x","maxFileBytes":"lots","maxFileLimit":0}"#).unwrap();
+        assert_eq!((old.max_file_bytes, old.max_file_limit), (None, None));
+        assert_eq!((new.max_file_bytes, new.max_file_limit), (Some(25 << 20), Some(2 << 30)));
+        assert_eq!((odd.max_file_bytes, odd.max_file_limit), (None, None), "nonsense is not a limit");
+        assert_eq!(ErrorCode::parse("disk_full"), ErrorCode::DiskFull);
+        assert_eq!(ErrorCode::parse("bad_offset"), ErrorCode::BadOffset);
     }
 }

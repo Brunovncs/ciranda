@@ -362,7 +362,7 @@ pub struct Session {
     /// The server's picture, by upload hash.
     pub server_icon: Option<String>,
     /// The server's settings as `GET /api/server` and the `server` push give them; asked for
-    /// when the server settings open.
+    /// with the lists, and again when the server settings open.
     pub server_info: Option<ServerInfo>,
     pub users: HashMap<UserId, User>,
     pub online: HashSet<UserId>,
@@ -658,9 +658,14 @@ impl Session {
     pub fn refresh_lists(&mut self, cx: &mut Context<Self>) {
         let api = self.api.clone();
         cx.spawn(async move |this, cx| {
-            let (users, emojis, clips, channels) =
-                core::run(async move { tokio::join!(api.users(), api.emojis(), api.soundpad(), api.channels()) }).await;
+            // The server's settings too: the largest file anybody may send is in them, and the
+            // box checks a file against it before sending.
+            let (users, emojis, clips, channels, server) =
+                core::run(async move { tokio::join!(api.users(), api.emojis(), api.soundpad(), api.channels(), api.server()) }).await;
             let _ = this.update(cx, |s, cx| {
+                if let Ok(info) = server {
+                    s.set_server_info(info, cx);
+                }
                 if let Ok(users) = users {
                     s.users = users.into_iter().map(|u| (u.id, u)).collect();
                     if let Some(me) = s.users.get(&s.me.id) {

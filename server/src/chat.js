@@ -9,7 +9,7 @@
 
 import { createHash, randomBytes } from 'node:crypto';
 import {
-  createWriteStream, mkdirSync, writeFileSync, renameSync, rmSync, unlinkSync, statSync,
+  createWriteStream, mkdirSync, writeFileSync, renameSync, rmSync, unlinkSync, statSync, statfsSync,
 } from 'node:fs';
 import { unlink } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -54,15 +54,52 @@ export const allowedTypes = () => [...ALLOWED_TYPES.keys()];
  */
 export const SEALED_TYPE = 'application/x-harmony-sealed';
 
-/** Hard ceiling per file, regardless of the total quota. */
+/**
+ * The most one request may carry: POST /api/uploads takes a file as a single
+ * body, and a private conversation's file is sealed whole on the client, so
+ * this stays small whatever the owner allows per file. Anything bigger goes
+ * up in pieces, through an upload session (upload-sessions.js).
+ */
 export const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
+
+/**
+ * The largest file the owner may allow, and what a server allows until they
+ * say otherwise. The default is the one-request cap, so a server behaves as
+ * it always did until somebody decides its disk can take more. The same key
+ * and range as the Electron line's servers.
+ */
+export const MAX_FILE_LIMIT = 2 * 1024 * 1024 * 1024;
+export const MIN_FILE_LIMIT = 1024 * 1024;
+export const DEFAULT_FILE_BYTES = MAX_UPLOAD_BYTES;
 
 /**
  * A sealed file is the plaintext plus the client's framing: a version byte,
  * a 24-byte nonce and a 16-byte tag. The plaintext cap is the same as any
- * other upload's, so this is that cap and the overhead, not a bigger one.
+ * other one-request upload's, so this is that cap and the overhead, not a
+ * bigger one.
  */
-export const MAX_SEALED_BYTES = MAX_UPLOAD_BYTES + 64;
+const SEALED_OVERHEAD = 64;
+export const MAX_SEALED_BYTES = MAX_UPLOAD_BYTES + SEALED_OVERHEAD;
+
+/**
+ * Free disk never given to uploads, whatever the quota says.
+ *
+ * The quota is a number somebody typed into the environment, with no idea
+ * what else shares the disk; this is the floor under it. Once the filesystem
+ * is full every SQLite write throws, so uploads have to stop while there is
+ * still room for the server itself to run.
+ */
+export const DISK_RESERVE_BYTES = 512 * 1024 * 1024;
+
+/** Free space on the filesystem holding `dir`, or null where it cannot be asked. */
+function freeBytesOn(dir) {
+  try {
+    const { bavail, bsize } = statfsSync(dir);
+    return Number(bavail) * Number(bsize);
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Per-clip ceiling for the soundpad, far below the generic upload cap.
@@ -178,16 +215,27 @@ export class Chat {
   #dir;
   #incoming;
   #maxBytes;
+  #maxFileBytes = DEFAULT_FILE_BYTES;
   /** SUM(bytes) over uploads, kept here: only this class adds or deletes a row. */
   #used = 0;
   /** Bytes reserved by uploads still arriving. */
   #arriving = 0;
+  #diskFree;
+  #diskReserve;
   #q;
 
-  constructor(db, { dataDir, maxDiskBytes }) {
+  /**
+   * `diskFree` and `diskReserveBytes` are there for the tests, which cannot
+   * fill a real disk to see the floor hold.
+   */
+  constructor(db, {
+    dataDir, maxDiskBytes, diskReserveBytes = DISK_RESERVE_BYTES, diskFree = null,
+  }) {
     this.#db = db;
     this.#dir = join(dataDir, 'uploads');
     this.#maxBytes = maxDiskBytes;
+    this.#diskReserve = diskReserveBytes;
+    this.#diskFree = diskFree ?? (() => freeBytesOn(this.#dir));
     mkdirSync(this.#dir, { recursive: true });
     // Files still arriving. Inside uploads/ so moving one into place is a
     // rename on the same filesystem; anything here at startup is an upload
@@ -285,6 +333,77 @@ export class Chat {
     return this.#maxBytes;
   }
 
+  /** The largest file one upload may be: the owner's choice, from server settings. */
+  get maxFileBytes() {
+    return this.#maxFileBytes;
+  }
+
+  set maxFileBytes(bytes) {
+    const n = Math.round(Number(bytes));
+    this.#maxFileBytes = Number.isFinite(n) && n > 0 ? Math.min(MAX_FILE_LIMIT, n) : DEFAULT_FILE_BYTES;
+  }
+
+  /**
+   * The most one request may carry: the one-request cap, or the owner's
+   * per-file limit when that is lower. A sealed file has room for its framing.
+   */
+  requestLimit({ sealed = false } = {}) {
+    const plain = Math.min(MAX_UPLOAD_BYTES, this.#maxFileBytes);
+    return sealed ? plain + SEALED_OVERHEAD : plain;
+  }
+
+  /** Where files still arriving are written. Same filesystem as the store, so keeping one is a rename. */
+  get incomingDir() {
+    return this.#incoming;
+  }
+
+  /**
+   * Hold room for `bytes` that have yet to arrive, against both the quota and
+   * the free disk, so twenty uploads at once cannot each be told there is
+   * room for theirs alone and between them fill the disk.
+   *
+   * @returns {{ok: true, release: () => void} | {ok: false, error: string}}
+   *   `release` gives the room back; calling it twice gives it back once.
+   */
+  reserve(bytes) {
+    const refused = this.#room(bytes);
+    if (refused) return refused;
+    this.#arriving += bytes;
+    let held = true;
+    return {
+      ok: true,
+      release: () => {
+        if (held) this.#arriving -= bytes;
+        held = false;
+      },
+    };
+  }
+
+  /**
+   * Why `bytes` more cannot be let in on top of everything still arriving, or
+   * null when they can. Unreferenced files are evicted, oldest first, when the
+   * quota is what is short; nothing can be evicted to make the disk bigger.
+   */
+  #room(bytes) {
+    const needed = this.#arriving + bytes;
+    if (this.#used + needed > this.#maxBytes) {
+      this.#evictOrphans(needed);
+      if (this.#used + needed > this.#maxBytes) return { ok: false, error: 'server_full' };
+    }
+    if (!this.#diskHolds(needed)) return { ok: false, error: 'disk_full' };
+    return null;
+  }
+
+  /**
+   * Whether the disk can take `bytes` more and keep its reserve. Counts what
+   * is arriving at its full size although some of it is already written --
+   * cautious by at most the files in flight, which is the right side to err on.
+   */
+  #diskHolds(bytes) {
+    const free = this.#diskFree();
+    return free === null || free - bytes >= this.#diskReserve;
+  }
+
   /** Sharded, so one directory never holds tens of thousands of entries. */
   pathFor(hash) {
     return join(this.#dir, hash.slice(0, 2), hash.slice(2, 4), hash);
@@ -305,13 +424,14 @@ export class Chat {
   store(buffer, contentType, { sealed = false } = {}) {
     if (!sealed && !mediaTypeOf(contentType)) return { ok: false, error: 'type_not_allowed' };
     if (!buffer?.length) return { ok: false, error: 'empty_file' };
-    if (buffer.length > (sealed ? MAX_SEALED_BYTES : MAX_UPLOAD_BYTES)) {
+    if (buffer.length > this.requestLimit({ sealed })) {
       return { ok: false, error: 'file_too_large' };
     }
 
     const hash = createHash('sha256').update(buffer).digest('hex');
     const refused = this.#admit(hash, buffer.length, sealed);
     if (refused) return refused;
+    if (!this.#diskHolds(this.#arriving + buffer.length)) return { ok: false, error: 'disk_full' };
 
     // Write then rename, so a crash mid-write cannot leave a truncated file
     // sitting at the name its hash promises.
@@ -331,30 +451,43 @@ export class Chat {
    * an answer to give on the same connection.
    *
    * The quota is checked once the size is known, before the file is moved
-   * into place. Until then it costs at most the per-file cap on disk, and
-   * only while it arrives.
+   * into place. Until then it costs at most the per-request cap on disk, and
+   * only while it arrives. The disk's floor is checked before a byte is
+   * written, since by the time the size is known the bytes are already there.
    *
    * @returns {Promise<{ok: true, upload: object, deduplicated: boolean}
    *   | {ok: false, error: string}>} `aborted` when the sender went away.
    */
   async receive(source, contentType, { sealed = false } = {}) {
     if (!sealed && !mediaTypeOf(contentType)) return { ok: false, error: 'type_not_allowed' };
-    const limit = sealed ? MAX_SEALED_BYTES : MAX_UPLOAD_BYTES;
+    const limit = this.requestLimit({ sealed });
     // What's still arriving counts against the room left, at the size it says
     // it is (or the cap): twenty uploads at once would otherwise fill the disk
     // with files the quota never saw, and a full disk stops SQLite too.
     const declared = Number(source.headers?.['content-length']);
-    const reserved = Number.isFinite(declared) && declared > 0 && declared <= limit ? declared : limit;
-    if (this.#used + this.#arriving + reserved > this.#maxBytes) {
-      this.#evictOrphans(reserved);
-      if (this.#used + this.#arriving + reserved > this.#maxBytes) return { ok: false, error: 'server_full' };
-    }
-    this.#arriving += reserved;
+    const room = this.reserve(Number.isFinite(declared) && declared > 0 && declared <= limit ? declared : limit);
+    if (!room.ok) return room;
     try {
       return await this.#receive(source, contentType, sealed, limit);
     } finally {
-      this.#arriving -= reserved;
+      room.release();
     }
+  }
+
+  /**
+   * Keep a file an upload session finished writing in incoming/ (see
+   * upload-sessions.js), hashed as it arrived. The same door as every other
+   * upload -- the type, the quota, and a hash already kept as the other kind
+   * -- and then a rename into place. The file at `temp` is this function's
+   * from here: kept, or deleted.
+   */
+  adopt(temp, { hash, bytes, contentType }) {
+    const refused = mediaTypeOf(contentType) ? this.#admit(hash, bytes, false) : { ok: false, error: 'type_not_allowed' };
+    if (refused) {
+      try { unlinkSync(temp); } catch { /* already gone */ }
+      return refused;
+    }
+    return this.#keep(temp, hash, bytes, contentType);
   }
 
   async #receive(source, contentType, sealed, limit) {

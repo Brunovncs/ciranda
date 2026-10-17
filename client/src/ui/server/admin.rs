@@ -48,6 +48,9 @@ pub struct ServerAdmin {
     /// What the name field was last filled with, so a rename made elsewhere replaces it unless
     /// someone is typing a new one.
     shown_name: String,
+    /// The largest file, in MB, and what it was last filled with (the same rule as the name's).
+    max_file: Entity<TextField>,
+    shown_max_file: String,
     /// The upload quota and its use, once the server has said.
     storage: Option<Storage>,
     _subs: Vec<Subscription>,
@@ -113,12 +116,23 @@ impl ServerAdmin {
             f
         });
         let search = cx.new(|cx| TextField::new(cx, false, 40).placeholder(tr!("Find someone", "Encontrar alguém")));
+        let shown_max_file = session.read(cx).server_info.as_ref().and_then(|i| i.max_file_bytes).map(megabytes).unwrap_or_default();
+        let max_file = cx.new(|cx| {
+            let mut f = TextField::new(cx, false, 6);
+            f.set_text(&shown_max_file, cx);
+            f
+        });
         let subs = vec![
             cx.observe(&session, |this, _, cx| this.on_session(cx)),
             cx.subscribe(&search, |_, _, _: &TextFieldEvent, cx| cx.notify()),
             cx.subscribe(&name, |this, _, ev: &TextFieldEvent, cx| {
                 if let TextFieldEvent::Submit = ev {
                     this.save_name(cx);
+                }
+            }),
+            cx.subscribe(&max_file, |this, _, ev: &TextFieldEvent, cx| {
+                if let TextFieldEvent::Submit = ev {
+                    this.save_max_file(cx);
                 }
             }),
         ];
@@ -142,6 +156,8 @@ impl ServerAdmin {
             search,
             picked: None,
             shown_name,
+            max_file,
+            shown_max_file,
             storage: None,
             _subs: subs,
         };
@@ -162,10 +178,16 @@ impl ServerAdmin {
     }
 
     fn on_session(&mut self, cx: &mut Context<Self>) {
-        let (role, name) = {
+        let (role, name, max_file) = {
             let s = self.session.read(cx);
-            (s.me.role, s.server_name.clone())
+            (s.me.role, s.server_name.clone(), s.server_info.as_ref().and_then(|i| i.max_file_bytes).map(megabytes).unwrap_or_default())
         };
+        if max_file != self.shown_max_file {
+            if self.max_file.read(cx).text() == self.shown_max_file {
+                self.max_file.update(cx, |f, cx| f.set_text(&max_file, cx));
+            }
+            self.shown_max_file = max_file;
+        }
         // Demoted while it was open: nothing here is theirs to change any more.
         if !role.is_admin() {
             cx.emit(Dismiss);
@@ -196,6 +218,40 @@ impl ServerAdmin {
                 |s, info, cx| {
                     s.set_server_info(info, cx);
                     toast(tr!("Server renamed.", "Servidor renomeado."), cx);
+                    cx.notify();
+                },
+            )
+        });
+    }
+
+    /// The largest file anybody may send, typed in MB.
+    fn save_max_file(&mut self, cx: &mut Context<Self>) {
+        let s = self.session.read(cx);
+        if s.me.role != Role::Owner {
+            return;
+        }
+        let limit = s.server_info.as_ref().and_then(|i| i.max_file_limit).unwrap_or(2 << 30);
+        let typed = self.max_file.read(cx).text().trim().replace(',', ".");
+        let bytes = typed.parse::<f64>().ok().filter(|mb| mb.is_finite()).map(|mb| (mb * (1u64 << 20) as f64).round() as u64);
+        let Some(bytes) = bytes.filter(|b| (1 << 20..=limit).contains(b)) else {
+            toast(
+                trf!(
+                    "Type a size in MB, from 1 to {}.",
+                    "Digite um tamanho em MB, de 1 a {}.",
+                    limit >> 20
+                ),
+                cx,
+            );
+            return;
+        };
+        self.session.update(cx, |s, cx| {
+            s.call(
+                cx,
+                move |api| Box::pin(async move { api.set_max_file_bytes(Some(bytes)).await }),
+                |s, info, cx| {
+                    let shown = info.max_file_bytes.map(byte_size).unwrap_or_default();
+                    s.set_server_info(info, cx);
+                    toast(trf!("Files can now be up to {}.", "Agora os arquivos podem ter até {}.", shown), cx);
                     cx.notify();
                 },
             )
@@ -473,6 +529,43 @@ impl ServerAdmin {
             ));
         }
 
+        // Only from a server that takes files in pieces: an older one has no such setting.
+        let files_card = info.as_ref().and_then(|i| i.max_file_bytes).map(|max| {
+            let files = card(t)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .child(icon("paperclip", 16., t.text2))
+                        .child(div().flex_1().child(body(tr!("Largest file", "Maior arquivo"), t.text)))
+                        .child(chip(byte_size(max), t.text2)),
+                )
+                .child(caption(
+                    tr!(
+                        "Anything bigger is turned away before it is sent. Files go up in pieces, so big ones survive a shaky connection; private conversations stay at 25 MB.",
+                        "Arquivos maiores são recusados antes do envio. Eles sobem em partes, então os grandes aguentam uma conexão instável; nas conversas privadas o limite continua 25 MB."
+                    ),
+                    t.text2,
+                ));
+            if owner {
+                files.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(div().w(px(120.)).child(self.max_file.clone()))
+                        .child(div().flex_1().child(caption(tr!("MB, up to 2048 (2 GB)", "MB, até 2048 (2 GB)"), t.text3)))
+                        .child(
+                            button("save-max-file", tr!("Save", "Salvar"), Kind::Standard, t)
+                                .on_click(cx.listener(|this, _, _, cx| this.save_max_file(cx))),
+                        ),
+                )
+            } else {
+                files.child(lock_note(tr!("Only the owner can change it.", "Só o dono pode mudar isso."), t))
+            }
+        });
+
         let mut tiles = div().flex().flex_wrap().gap(px(8.));
         for (name, n, sub) in stats {
             tiles = tiles.child(
@@ -543,6 +636,7 @@ impl ServerAdmin {
             .child(name_block)
             .child(icon_block)
             .child(door_card)
+            .children(files_card)
             .child(div().flex().flex_col().gap(px(8.)).child(label(tr!("At a glance", "Resumo"), t)).child(tiles))
             .into_any_element()
     }
@@ -1261,6 +1355,11 @@ fn readonly(value: String, t: &Theme) -> gpui::Div {
 }
 
 /// A size the way people read one: 820 KB, 12.4 MB, 9.8 GB.
+/// The largest file as the field shows it: whole megabytes, or one decimal when it isn't.
+fn megabytes(bytes: u64) -> String {
+    if bytes % (1 << 20) == 0 { (bytes >> 20).to_string() } else { format!("{:.1}", bytes as f64 / (1u64 << 20) as f64) }
+}
+
 fn byte_size(n: u64) -> String {
     let n = n as f64;
     if n >= (1u64 << 30) as f64 {

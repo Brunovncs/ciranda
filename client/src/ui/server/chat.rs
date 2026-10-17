@@ -6,6 +6,7 @@ use super::picker::Picker;
 use super::rich::{self, Lookup};
 use super::sidebar::{Menu, MenuEntry};
 use crate::core::types::*;
+use crate::core::upload::{Progress, Source};
 use crate::core::{self};
 use crate::files;
 use crate::prefs::{prefs, set_prefs};
@@ -28,15 +29,36 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const GROUP_WINDOW_MS: i64 = 5 * 60 * 1000;
+/// The most a file may be where it goes up in one request: a private conversation's, sealed whole
+/// on this computer, or any file to a server that doesn't take pieces. Also the most read into
+/// memory to send; a bigger file stays on disk and is read a piece at a time.
 const MAX_UPLOAD: usize = 25 * 1024 * 1024;
 /// How many older pages a jump to a message not loaded yet will fetch looking for it.
 const JUMP_PAGES: usize = 40;
 
 struct Pending {
-    bytes: Arc<Vec<u8>>,
+    source: Source,
+    size: u64,
     content_type: String,
     name: String,
     preview: Option<Arc<RenderImage>>,
+}
+
+impl Pending {
+    fn in_memory(&self) -> Option<Arc<Vec<u8>>> {
+        match &self.source {
+            Source::Memory(b) => Some(b.clone()),
+            Source::Disk(_) => None,
+        }
+    }
+}
+
+/// A file on its way to the server, for the bar in the box.
+struct Sending {
+    name: String,
+    /// Only a channel's file can be followed and stopped: a private conversation's is sealed whole
+    /// and goes in one request.
+    progress: Option<Arc<Progress>>,
 }
 
 /// What the box is doing besides writing a new message.
@@ -83,7 +105,9 @@ pub struct ChatView {
     searching: Task<()>,
     show_pins: bool,
     pending: Option<Pending>,
-    uploading: bool,
+    uploading: Option<Sending>,
+    /// Draws the box again while a file goes up, so its bar moves.
+    upload_tick: Task<()>,
     sending: bool,
     mode: Option<Mode>,
     /// What was in the box when an edit took it over, put back when the edit is done.
@@ -162,7 +186,8 @@ impl ChatView {
             searching: Task::ready(()),
             show_pins: false,
             pending: None,
-            uploading: false,
+            uploading: None,
+            upload_tick: Task::ready(()),
             sending: false,
             mode: None,
             draft: None,
@@ -278,11 +303,20 @@ impl ChatView {
             _ => None,
         };
         let reply_to = answering.as_ref().map(|m| m.id);
-        self.uploading = pending.is_some();
         self.composer.update(cx, |f, cx| f.clear(cx));
         cx.notify();
         if let Room::Dm(conversation) = self.room {
-            let file = pending.as_ref().map(|p| crate::session::Outgoing { bytes: p.bytes.clone(), name: p.name.clone(), mime: p.content_type.clone() });
+            let file = match pending.as_ref().map(|p| (p.in_memory(), p)) {
+                Some((Some(bytes), p)) => Some(crate::session::Outgoing { bytes, name: p.name.clone(), mime: p.content_type.clone() }),
+                // Only a file kept in memory is ever attached here (`max_file`), but should one on
+                // disk get this far, it is put back rather than sent without its file.
+                Some((None, _)) => {
+                    self.sent(Some((tr!("Files can be up to 25 MB.", "Os arquivos podem ter até 25 MB.").into(), text)), answering, pending, cx);
+                    return;
+                }
+                None => None,
+            };
+            self.uploading = pending.as_ref().map(|p| Sending { name: p.name.clone(), progress: None });
             let reply = answering.as_ref().map(preview_of);
             let task = self.session.update(cx, |s, cx| s.send_dm(conversation, text.clone(), file, reply, cx));
             cx.spawn(async move |this, cx| {
@@ -297,13 +331,30 @@ impl ChatView {
             let s = self.session.read(cx);
             (s.api.clone(), s.cache.clone())
         };
-        let upload = pending.as_ref().map(|p| (p.bytes.clone(), p.content_type.clone(), p.name.clone()));
+        let pieces = self.in_pieces(cx);
+        let progress = Arc::new(Progress::default());
+        self.uploading = pending.as_ref().map(|p| Sending { name: p.name.clone(), progress: Some(progress.clone()) });
+        if self.uploading.is_some() {
+            self.upload_tick = cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(Duration::from_millis(250)).await;
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        let upload = pending.as_ref().map(|p| (p.source.clone(), p.size, p.content_type.clone(), p.name.clone()));
         cx.spawn(async move |this, cx| {
             let result = core::run(async move {
                 let attachment = match upload {
-                    Some((bytes, content_type, name)) => {
-                        let up = api.upload(bytes.to_vec(), &content_type).await?;
-                        cache.insert(&bytes, &content_type);
+                    Some((source, size, content_type, name)) => {
+                        let up = core::upload::send(&api, source.clone(), size, &content_type, pieces, progress).await?;
+                        // Kept as it is sent, so your own picture draws without a round trip. One
+                        // only on disk is too big to be a picture worth keeping.
+                        if let Source::Memory(bytes) = &source {
+                            cache.insert(bytes, &content_type);
+                        }
                         Some((up.hash, name))
                     }
                     None => None,
@@ -331,7 +382,8 @@ impl ChatView {
     /// file it carried, so nothing typed or attached is lost.
     fn sent(&mut self, failed: Option<(String, String)>, answering: Option<Message>, pending: Option<Pending>, cx: &mut Context<Self>) {
         self.sending = false;
-        self.uploading = false;
+        let stopped = self.uploading.take().and_then(|u| u.progress).is_some_and(|p| p.is_cancelled());
+        self.upload_tick = Task::ready(());
         if let Some((why, text)) = failed {
             if self.composer.read(cx).text().is_empty() {
                 self.composer.update(cx, |f, cx| f.set_text(&text, cx));
@@ -343,9 +395,41 @@ impl ChatView {
             if self.pending.is_none() {
                 self.pending = pending;
             }
-            overlay::toast(why, cx);
+            // Stopping it was your doing: it is back in the box, which says enough.
+            if !stopped {
+                overlay::toast(why, cx);
+            }
         }
         cx.notify();
+    }
+
+    /// Stops the file going up; the message and the file go back in the box.
+    fn cancel_upload(&mut self, cx: &mut Context<Self>) {
+        if let Some(p) = self.uploading.as_ref().and_then(|u| u.progress.as_ref()) {
+            p.cancel();
+        }
+        cx.notify();
+    }
+
+    /// Files here go up in pieces: a channel, on a server that takes them.
+    fn in_pieces(&self, cx: &App) -> bool {
+        self.room.channel().is_some() && self.session.read(cx).server_info.as_ref().is_some_and(|i| i.max_file_bytes.is_some())
+    }
+
+    /// The largest file that can be sent here: the server's limit where files go up in pieces;
+    /// elsewhere the one-request cap, or the server's limit if that's lower.
+    fn max_file(&self, cx: &App) -> u64 {
+        let server = self.session.read(cx).server_info.as_ref().and_then(|i| i.max_file_bytes);
+        match server {
+            Some(max) if self.in_pieces(cx) => max,
+            Some(max) => max.min(MAX_UPLOAD as u64),
+            None => MAX_UPLOAD as u64,
+        }
+    }
+
+    fn too_big(&self, cx: &mut Context<Self>) {
+        let max = human_size(self.max_file(cx));
+        overlay::toast(trf!("Files can be up to {}.", "Os arquivos podem ter até {}.", max), cx);
     }
 
     /// A send is on its way: its answer needs this pane to come back to.
@@ -509,11 +593,60 @@ impl ChatView {
         .detach();
     }
 
-    /// A file on disk, picked, dropped or copied. One too big is turned away before it is read.
+    /// Files dropped or copied: one is sent at a time, so the first is attached, and you're told
+    /// when there were more.
+    fn attach_paths(&mut self, paths: &[std::path::PathBuf], cx: &mut Context<Self>) {
+        let Some(first) = paths.first() else { return };
+        self.attach_path(first, cx);
+        if paths.len() > 1 && !first.is_dir() {
+            let name = first.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            overlay::toast(
+                trf!(
+                    "Files go one at a time: {} is attached, send the others after it.",
+                    "Os arquivos vão um de cada vez: {} foi anexado, envie os outros depois.",
+                    name
+                ),
+                cx,
+            );
+        }
+    }
+
+    /// Files dropped anywhere on the server's window, while this chat is the one open.
+    pub fn drop_paths(&mut self, paths: &[std::path::PathBuf], cx: &mut Context<Self>) {
+        if self.writable(cx) {
+            self.attach_paths(paths, cx);
+        }
+    }
+
+    /// A file on disk, picked, dropped or copied. One too big is turned away before it is read,
+    /// and one bigger than is worth holding in memory stays on disk until it is sent.
     fn attach_path(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
         let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "file".into());
-        if std::fs::metadata(path).is_ok_and(|m| m.len() > MAX_UPLOAD as u64) {
-            overlay::toast(tr!("Files can be up to 25 MB.", "Os arquivos podem ter até 25 MB."), cx);
+        let size = match std::fs::metadata(path) {
+            Ok(m) if m.is_dir() => {
+                overlay::toast(
+                    tr!("Folders can't be sent. Pick the files inside it instead.", "Pastas não podem ser enviadas. Escolha os arquivos dentro dela."),
+                    cx,
+                );
+                return;
+            }
+            Ok(m) => m.len(),
+            Err(e) => {
+                overlay::toast(trf!("Could not read that file: {}", "Não foi possível ler esse arquivo: {}", e), cx);
+                return;
+            }
+        };
+        if size > self.max_file(cx) {
+            self.too_big(cx);
+            return;
+        }
+        if size == 0 {
+            overlay::toast(tr!("That file is empty.", "Esse arquivo está vazio."), cx);
+            return;
+        }
+        if size > MAX_UPLOAD as u64 {
+            self.pending = Some(Pending { source: Source::Disk(path.to_path_buf()), size, content_type: content_type_for(&name), name, preview: None });
+            cx.notify();
             return;
         }
         // Up to 25 MB from a disk that may be slow or on the network: not on the UI thread.
@@ -554,8 +687,8 @@ impl ChatView {
                     return true;
                 }
                 ClipboardEntry::ExternalPaths(paths) => {
-                    if let Some(path) = paths.paths().first() {
-                        self.attach_path(path, cx);
+                    if !paths.paths().is_empty() {
+                        self.attach_paths(paths.paths(), cx);
                         return true;
                     }
                 }
@@ -581,8 +714,8 @@ impl ChatView {
     }
 
     fn set_pending(&mut self, bytes: Vec<u8>, content_type: String, name: String, cx: &mut Context<Self>) {
-        if bytes.len() > MAX_UPLOAD {
-            overlay::toast(tr!("Files can be up to 25 MB.", "Os arquivos podem ter até 25 MB."), cx);
+        if bytes.len() as u64 > self.max_file(cx) {
+            self.too_big(cx);
             return;
         }
         let bytes = Arc::new(bytes);
@@ -591,14 +724,15 @@ impl ChatView {
         cx.spawn(async move |this, cx| {
             let Ok((img, _)) = preview.await else { return };
             let _ = this.update(cx, |this, cx| {
-                if let Some(p) = this.pending.as_mut().filter(|p| Arc::ptr_eq(&p.bytes, &mine)) {
+                if let Some(p) = this.pending.as_mut().filter(|p| p.in_memory().is_some_and(|b| Arc::ptr_eq(&b, &mine))) {
                     p.preview = Some(img);
                     cx.notify();
                 }
             });
         })
         .detach();
-        self.pending = Some(Pending { bytes, content_type, name, preview: None });
+        let size = bytes.len() as u64;
+        self.pending = Some(Pending { source: Source::Memory(bytes), size, content_type, name, preview: None });
         cx.notify();
     }
 
@@ -1040,15 +1174,16 @@ impl ChatView {
             prompt: Some(tr!("Replace", "Substituir").into()),
         });
         let session = self.session.clone();
-        cx.spawn(async move |_, cx| {
+        let (pieces, max) = (self.in_pieces(cx), self.max_file(cx));
+        cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(paths))) = paths.await else { return };
             let Some(path) = paths.into_iter().next() else { return };
             let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "file".into());
-            if std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_UPLOAD as u64) {
-                cx.update(|cx| overlay::toast(tr!("Files can be up to 25 MB.", "Os arquivos podem ter até 25 MB."), cx));
+            let Ok(size) = std::fs::metadata(&path).map(|m| m.len()) else { return };
+            if size > max {
+                let _ = this.update(cx, |this, cx| this.too_big(cx));
                 return;
             }
-            let Ok(bytes) = cx.background_executor().spawn(async move { std::fs::read(&path) }).await else { return };
             let ct = content_type_for(&name);
             cx.update(|cx| {
                 session.update(cx, |s, cx| {
@@ -1056,7 +1191,7 @@ impl ChatView {
                         cx,
                         move |api| {
                             Box::pin(async move {
-                                let up = api.upload(bytes, &ct).await?;
+                                let up = core::upload::send(&api, Source::Disk(path), size, &ct, pieces, Default::default()).await?;
                                 api.replace_attachment(id, Some(&up.hash), Some(&name)).await
                             })
                         },
@@ -1949,7 +2084,63 @@ impl ChatView {
         let can_send = !self.composer.read(cx).is_blank() || self.pending.is_some();
         let mention_list = self.mention_matches(cx);
         let picked = self.mention.as_ref().map(|m| m.1).unwrap_or(0);
-        let focused_hint = if self.uploading { Some(tr!("Uploading…", "Enviando…")) } else { None };
+        let upload_strip = self.uploading.as_ref().map(|u| {
+            let fraction = u.progress.as_ref().map(|p| p.fraction());
+            let stopping = u.progress.as_ref().is_some_and(|p| p.is_cancelled());
+            let status = match fraction {
+                _ if stopping => tr!("Cancelling…", "Cancelando…").to_string(),
+                Some(f) => format!("{}%", (f * 100.).floor() as u32),
+                None => tr!("Uploading…", "Enviando…").to_string(),
+            };
+            div()
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .p(px(8.))
+                .rounded(px(radius::CONTROL))
+                .bg(t.layer)
+                .border_1()
+                .border_color(t.stroke)
+                .child(div().size(px(32.)).rounded(px(6.)).bg(t.control).flex().items_center().justify_center().child(icon(
+                    "paperclip",
+                    16.,
+                    t.text2,
+                )))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(5.))
+                        .flex_1()
+                        .min_w(px(0.))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.))
+                                .child(div().flex_1().min_w(px(0.)).truncate().text_size(px(13.)).child(u.name.clone()))
+                                .child(mono(status, t.text3)),
+                        )
+                        // A private conversation's file goes in one request: no bar to fill, only
+                        // the word that it's going.
+                        .when_some(fraction, |d, f| {
+                            d.child(
+                                div()
+                                    .h(px(4.))
+                                    .rounded(px(2.))
+                                    .bg(t.well)
+                                    .child(div().h_full().rounded(px(2.)).bg(t.accent).w(gpui::relative(f.max(0.01)))),
+                            )
+                        }),
+                )
+                .when(fraction.is_some() && !stopping, |d| {
+                    d.child(
+                        icon_button("cancel-upload", "close", t)
+                            .tooltip(tip(tr!("Cancel the upload", "Cancelar o envio"), t))
+                            .on_click(cx.listener(|this, _, _, cx| this.cancel_upload(cx))),
+                    )
+                })
+        });
         div()
             .relative()
             .flex()
@@ -2002,6 +2193,7 @@ impl ChatView {
                 d.child(menu)
             })
             .when_some(self.render_mode(t, cx), |d, strip| d.child(strip))
+            .when_some(upload_strip, |d, strip| d.child(strip))
             .when_some(self.pending.as_ref(), |d, p| {
                 d.child(
                     div()
@@ -2032,7 +2224,7 @@ impl ChatView {
                                 .flex_1()
                                 .min_w(px(0.))
                                 .child(div().truncate().text_size(px(13.5)).child(p.name.clone()))
-                                .child(mono(human_size(p.bytes.len()), t.text3)),
+                                .child(mono(human_size(p.size), t.text3)),
                         )
                         .child(icon_button("remove-pending", "close", t).tooltip(tip(tr!("Remove", "Remover"), t)).on_click(cx.listener(
                             |this, _, _, cx| {
@@ -2087,7 +2279,6 @@ impl ChatView {
                             .on_click(cx.listener(|this, _, window, cx| this.send(window, cx))),
                     ),
             )
-            .when_some(focused_hint, |d, h| d.child(caption(h, t.text3)))
     }
 }
 
@@ -2181,13 +2372,7 @@ impl Render for ChatView {
             .flex()
             .flex_col()
             .size_full()
-            .when(writable, |d| {
-                d.on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _, cx| {
-                    if let Some(path) = paths.paths().first() {
-                        this.attach_path(path, cx);
-                    }
-                }))
-            })
+            .when(writable, |d| d.on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _, cx| this.attach_paths(paths.paths(), cx))))
             .child(header)
             .children(pins)
             .when_some(self.results.as_ref(), |d, (q, r)| {
@@ -2196,13 +2381,18 @@ impl Render for ChatView {
             .children(notice)
             .child(div().flex_1().min_h(px(0.)).child(body))
             .when(writable, |d| d.child(composer))
-            // Texel's drop target: dashed, inset, with one line saying what happens.
+            // Texel's drop target: dashed, inset, with one line saying what happens. Up over a file
+            // dragged anywhere on the server's window, which hands a drop outside this pane to it
+            // (`ServerView`'s `DROP_GROUP`).
             .child(
                 div()
                     .absolute()
                     .inset(px(10.))
                     .invisible()
-                    .when(writable, |d| d.group_drag_over::<gpui::ExternalPaths>("chat-drop", |s| s.visible()))
+                    .when(writable, |d| {
+                        d.group_drag_over::<gpui::ExternalPaths>("chat-drop", |s| s.visible())
+                            .group_drag_over::<gpui::ExternalPaths>(super::DROP_GROUP, |s| s.visible())
+                    })
                     .flex()
                     .items_center()
                     .justify_center()
@@ -2418,9 +2608,15 @@ fn reacted(who: &[String], emoji: &str) -> String {
     }
 }
 
-fn human_size(n: usize) -> String {
+/// A size as people say it: "2 GB" and "25 MB" for the round limits, "3.4 MB" for a file.
+fn human_size(n: u64) -> String {
+    let one = |x: f64, unit: &str| {
+        let s = format!("{x:.1}");
+        format!("{} {unit}", s.strip_suffix(".0").unwrap_or(&s))
+    };
     match n {
-        n if n >= 1 << 20 => format!("{:.1} MB", n as f64 / (1 << 20) as f64),
+        n if n >= 1 << 30 => one(n as f64 / (1u64 << 30) as f64, "GB"),
+        n if n >= 1 << 20 => one(n as f64 / (1 << 20) as f64, "MB"),
         n if n >= 1 << 10 => format!("{} KB", n >> 10),
         n => format!("{n} B"),
     }

@@ -14,6 +14,9 @@ const NAME_KEY = 'server_name';
 const DOOR_KEY = 'door_password';
 const ICON_KEY = 'server_icon';
 const LEGACY_LOGO_KEY = 'server_logo';
+// The Electron line's key for the same setting, so a database that moves
+// between the two lines keeps it.
+const MAX_FILE_KEY = 'max_file_bytes';
 
 /** What a server with no name of its own is called. */
 export const DEFAULT_NAME = 'Harmony';
@@ -105,6 +108,21 @@ export class ServerSettings {
     if (hash) this.#meta.set(ICON_KEY, hash);
     else this.#meta.delete(ICON_KEY);
     return previous;
+  }
+
+  /**
+   * The largest one file may be, or null when nobody has said: the default,
+   * which is chat.js's to know. The range is the caller's to check, as the
+   * picture's hash is.
+   */
+  get maxFileBytes() {
+    const value = Number(this.#meta.get(MAX_FILE_KEY));
+    return Number.isFinite(value) && value > 0 ? value : null;
+  }
+
+  setMaxFileBytes(bytes) {
+    if (bytes === null) this.#meta.delete(MAX_FILE_KEY);
+    else this.#meta.set(MAX_FILE_KEY, String(Math.round(bytes)));
   }
 
   /** The override, or null when the environment is still in charge. */

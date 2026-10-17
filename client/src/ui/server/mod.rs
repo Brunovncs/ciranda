@@ -61,6 +61,10 @@ pub enum Then {
 /// changes, so one kept for every room ever opened would make every change cost them all.
 const KEEP_CHATS: usize = 4;
 
+/// The whole server window as somewhere to drop a file: a drop that misses the chat pane is
+/// handed to the chat open, and the pane's drop target lights up for a file dragged anywhere.
+pub(super) const DROP_GROUP: &str = "server-drop";
+
 /// Which chat a pane shows: a room of this server, or a private conversation of a server kept in
 /// the background (by its session).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -659,6 +663,16 @@ impl ServerView {
         self.chats.retain(|c| kept(&c.key));
         self.drafts.retain(|key, _| kept(key));
         self.chat_pane(ChatKey::Away(session.entity_id(), conversation), session, Room::Dm(conversation), window, cx)
+    }
+
+    /// The chat pane on screen, if the centre is a chat.
+    fn open_chat(&self) -> Option<Entity<ChatView>> {
+        let key = match self.center {
+            Center::Chat(room) => ChatKey::Here(room),
+            Center::Away(id, conversation) => ChatKey::Away(id, conversation),
+            Center::Inbox | Center::Stage => return None,
+        };
+        self.chats.iter().find(|c| c.key == key).map(|c| c.view.clone())
     }
 
     /// The pane for `key`, made if it is not kept (with what was being written in it before), and
@@ -1506,10 +1520,20 @@ impl Render for ServerView {
             _ => self.render_stage(&t, window, cx).into_any_element(),
         };
         let members = show_members.then(|| self.members.clone().cached(StyleRefinement::default().size_full()));
+        // The chat pane's own drop comes first and stops there; this is for one anywhere else.
+        let chat_open = self.open_chat().is_some();
         div()
             .key_context("Server")
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key))
+            .group(DROP_GROUP)
+            .when(chat_open, |d| {
+                d.on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _, cx| {
+                    if let Some(chat) = this.open_chat() {
+                        chat.update(cx, |c, cx| c.drop_paths(paths.paths(), cx));
+                    }
+                }))
+            })
             .size_full()
             .flex()
             .flex_col()

@@ -42,7 +42,9 @@ import {
   Chat, Soundpad, Emojis,
   publicMessage, publicReply, publicClip, publicEmoji, allowedTypes, mediaTypeOf, mentionsIn,
   MAX_UPLOAD_BYTES, MAX_AVATAR_BYTES, MAX_CLIP_BYTES, MAX_EMOJI_BYTES, MAX_EMOJIS,
+  MAX_FILE_LIMIT, MIN_FILE_LIMIT, DEFAULT_FILE_BYTES,
 } from './chat.js';
+import { CHUNK_BYTES, UploadSessions } from './upload-sessions.js';
 
 const app = express();
 app.disable('x-powered-by');
@@ -87,7 +89,10 @@ const voice = new VoiceRooms({
     && accounts.byId(userId)?.role !== 'owner',
 });
 const mediaSecret = channelSecret(metaStore);
-const chat = new Chat(db, { dataDir: config.dataDir, maxDiskBytes: config.maxDiskBytes });
+const chat = new Chat(db, {
+  dataDir: config.dataDir, maxDiskBytes: config.maxDiskBytes, diskReserveBytes: config.diskReserveBytes,
+});
+const uploads = new UploadSessions(chat);
 const soundpad = new Soundpad(db);
 const emojis = new Emojis(db);
 const dms = new DirectMessages(db);
@@ -118,6 +123,7 @@ const calls = new Calls({
  * more, to seed it, and nothing else in this file should consult it again.
  */
 const serverSettings = new ServerSettings(metaStore, { envPassword: config.password });
+chat.maxFileBytes = serverSettings.maxFileBytes ?? DEFAULT_FILE_BYTES;
 
 const rooms = new Rooms({ claimTtlMs: config.claimTtlMs });
 const limiter = new LoginLimiter({
@@ -665,8 +671,20 @@ app.post('/api/accounts/:id/delete', requireRole('owner'), (req, res) => {
 // The server itself
 // ---------------------------------------------------------------------------
 
+/*
+ * What the server says about itself, with the upload limit beside the name:
+ * every client checks a file against maxFileBytes before sending it, and the
+ * owner's settings offer up to maxFileLimit. A client that sees maxFileBytes
+ * also knows it may send files in pieces (upload-sessions.js).
+ */
+const serverView = () => ({
+  ...serverSettings.publicView(),
+  maxFileBytes: chat.maxFileBytes,
+  maxFileLimit: MAX_FILE_LIMIT,
+});
+
 app.get('/api/server', requireLogin, (_req, res) => {
-  res.json({ server: serverSettings.publicView() });
+  res.json({ server: serverView() });
 });
 
 /**
@@ -707,12 +725,24 @@ function iconProblem(hash) {
  * The picture is checked before anything is applied, so a bad hash does not
  * leave a half-made change behind. Its references are juggled as an avatar's
  * are: the new one retained before the old one is released.
+ *
+ * `maxFileBytes` is the largest file anybody may send, null for the default.
+ * It is not checked against the disk: the disk changes, and the floor in
+ * Chat#room is what keeps the server running when it fills.
  */
 app.post('/api/server', requireRole('owner'), (req, res) => {
   const icon = req.body?.iconHash !== undefined ? req.body.iconHash : req.body?.logo;
   if (icon !== undefined && icon !== null) {
     const problem = iconProblem(String(icon));
     if (problem) return res.status(400).json(problem);
+  }
+  const rawLimit = req.body?.maxFileBytes;
+  const limit = rawLimit === undefined || rawLimit === null ? rawLimit : Math.round(Number(rawLimit));
+  if (typeof limit === 'number' && !(limit >= MIN_FILE_LIMIT && limit <= MAX_FILE_LIMIT)) {
+    return res.status(400).json({
+      error: 'bad_limit',
+      message: `The largest file has to be between 1 MB and ${MAX_FILE_LIMIT / 1024 ** 3} GB.`,
+    });
   }
 
   if (req.body?.name !== undefined) serverSettings.setName(req.body.name);
@@ -725,8 +755,12 @@ app.post('/api/server', requireRole('owner'), (req, res) => {
     const previous = serverSettings.setIcon(hash);
     if (previous) chat.release(previous);
   }
+  if (limit !== undefined) {
+    serverSettings.setMaxFileBytes(limit);
+    chat.maxFileBytes = serverSettings.maxFileBytes ?? DEFAULT_FILE_BYTES;
+  }
 
-  const view = serverSettings.publicView();
+  const view = serverView();
   realtime?.broadcast({ type: 'server', server: view });
   return res.json({ server: view });
 });
@@ -1335,8 +1369,55 @@ app.get('/api/channels/:id/search', requireLogin, (req, res) => {
  * Uploads per person: a burst for somebody adding a set of emoji or a few
  * screenshots, then one every five seconds. Each can be 25 MB written to an
  * SD card, and the quota only stops the disk filling, not the churn.
+ *
+ * A piece of a big file spends its share of a token: its size over the
+ * one-request cap, so a file in pieces costs about what the same bytes would
+ * as whole uploads -- 20 x 25 MB at once, then 5 MB a second -- and a 2 GB
+ * file is paced rather than turned away.
  */
 const uploadThrottle = new Throttle({ burst: 20, perSecond: 0.2 });
+
+/** Why an upload was refused, as an HTTP answer. */
+const UPLOAD_REFUSALS = {
+  empty_file: () => [400, 'That file is empty.'],
+  type_not_allowed: () => [400, `Allowed types: ${allowedTypes().join(', ')}`],
+  file_too_large: () => [413, `Files on this server are limited to ${formatBytes(chat.maxFileBytes)}.`],
+  server_full: () => [507, 'The server has run out of space for uploads.'],
+  disk_full: () => [507, "The server's disk is nearly full, so it is not taking files."],
+  too_many_uploads: () => [429, 'Finish or cancel your other uploads first.'],
+  no_such_upload: () => [404, 'That upload has expired. Start it again.'],
+  bad_offset: () => [409, 'The upload lost its place.'],
+  chunk_too_large: () => [413, 'That piece of the file is too big.'],
+  incomplete: () => [409, 'The file has not all arrived yet.'],
+  aborted: () => [400, 'The upload was interrupted.'],
+};
+
+function refuseUpload(res, result) {
+  const [status, message] = (UPLOAD_REFUSALS[result.error] ?? (() => [400, 'Upload refused.']))();
+  return res.status(status).json({
+    error: result.error,
+    message,
+    ...(result.received !== undefined ? { received: result.received } : {}),
+  });
+}
+
+function formatBytes(bytes) {
+  if (bytes >= 1024 ** 3) return `${+(bytes / 1024 ** 3).toFixed(1)} GB`;
+  return `${Math.round(bytes / 1024 ** 2)} MB`;
+}
+
+/** The throttle's answer as a 429, or null to go on. */
+function uploadGate(req, res, cost = 1) {
+  const gate = uploadThrottle.take(req.user.id, cost);
+  if (gate.allowed) return null;
+  if (!req.complete) res.set('Connection', 'close');
+  res.set('Retry-After', String(gate.retryAfterSec));
+  return res.status(429).json({
+    error: 'slow_down',
+    retryAfterSec: gate.retryAfterSec,
+    message: 'Too many uploads at once. Wait a moment and try again.',
+  });
+}
 
 /**
  * Upload a file: the raw bytes as the body, its type as Content-Type.
@@ -1361,18 +1442,13 @@ app.post('/api/uploads', requireLogin, async (req, res) => {
   };
   const tooLarge = () => refuse(413, {
     error: 'file_too_large',
-    message: `Files are limited to ${Math.round(MAX_UPLOAD_BYTES / 1024 / 1024)} MB.`,
+    message: chat.requestLimit() < chat.maxFileBytes
+      ? `Files are limited to ${formatBytes(chat.requestLimit())} in one request. `
+        + 'Newer versions of Ciranda send bigger ones in pieces.'
+      : `Files are limited to ${formatBytes(chat.requestLimit())}.`,
   });
 
-  const gate = uploadThrottle.take(req.user.id);
-  if (!gate.allowed) {
-    res.set('Retry-After', String(gate.retryAfterSec));
-    return refuse(429, {
-      error: 'slow_down',
-      retryAfterSec: gate.retryAfterSec,
-      message: 'Too many uploads at once. Wait a moment and try again.',
-    });
-  }
+  if (uploadGate(req, res)) return undefined;
 
   const type = req.get('content-type')?.split(';')[0]?.trim().toLowerCase();
   if (!mediaTypeOf(type)) {
@@ -1388,7 +1464,7 @@ app.post('/api/uploads', requireLogin, async (req, res) => {
   }
   // Said up front by every client that knows the size, so it is refused
   // before a byte is read.
-  if (Number(req.get('content-length')) > MAX_UPLOAD_BYTES) return tooLarge();
+  if (Number(req.get('content-length')) > chat.requestLimit()) return tooLarge();
 
   let result;
   try {
@@ -1400,25 +1476,84 @@ app.post('/api/uploads', requireLogin, async (req, res) => {
   if (!result.ok) {
     if (result.error === 'aborted') return undefined;
     if (result.error === 'file_too_large') return tooLarge();
-    const messages = {
-      empty_file: `Send the file as a raw body with one of: ${allowedTypes().join(', ')}`,
-      type_not_allowed: `Allowed types: ${allowedTypes().join(', ')}`,
-      server_full: 'The server has run out of space for uploads.',
-    };
-    return res.status(result.error === 'server_full' ? 507 : 400).json({
-      error: result.error,
-      message: messages[result.error] ?? 'Upload refused.',
-    });
+    unread();
+    if (result.error === 'empty_file') {
+      return res.status(400).json({
+        error: result.error,
+        message: `Send the file as a raw body with one of: ${allowedTypes().join(', ')}`,
+      });
+    }
+    return refuseUpload(res, result);
   }
 
-  return res.status(201).json({
-    hash: result.upload.hash,
-    contentType: result.upload.content_type,
-    bytes: result.upload.bytes,
-    deduplicated: result.deduplicated,
-    usedBytes: chat.usedBytes,
-    quotaBytes: chat.quotaBytes,
+  return res.status(201).json(uploadReply(result));
+});
+
+/** What a stored upload is answered with, however it arrived. */
+const uploadReply = (result) => ({
+  hash: result.upload.hash,
+  contentType: result.upload.content_type,
+  bytes: result.upload.bytes,
+  deduplicated: result.deduplicated,
+  usedBytes: chat.usedBytes,
+  quotaBytes: chat.quotaBytes,
+});
+
+/*
+ * Upload sessions: a file of any size up to the owner's limit, in pieces,
+ * straight to disk. See upload-sessions.js for the shape and the reasons.
+ *
+ * Opening one spends a whole token of the upload throttle, as a POST to
+ * /api/uploads does; each piece then spends its share by size.
+ */
+app.post('/api/uploads/sessions', requireLogin, async (req, res) => {
+  if (uploadGate(req, res)) return undefined;
+  const result = await uploads.open({
+    userId: req.user.id,
+    size: Number(req.body?.size),
+    contentType: req.body?.contentType,
   });
+  if (!result.ok) return refuseUpload(res, result);
+  return res.status(201).json({ id: result.id, chunkBytes: result.chunkBytes });
+});
+
+/*
+ * One piece, at ?offset=. The raw body, unparsed: the JSON parser only reads
+ * application/json, and a piece is sent as application/octet-stream. A
+ * refusal before the piece is read hangs up after answering, as
+ * /api/uploads does, rather than read 8 MB only to throw them away.
+ */
+app.post('/api/uploads/sessions/:id/chunk', requireLogin, async (req, res) => {
+  const declared = Number(req.get('content-length'));
+  const cost = (Number.isFinite(declared) && declared > 0 ? declared : CHUNK_BYTES) / MAX_UPLOAD_BYTES;
+  if (uploadGate(req, res, Math.min(1, cost))) return undefined;
+  if ((req.get('content-encoding') ?? 'identity').toLowerCase() !== 'identity') {
+    res.set('Connection', 'close');
+    return res.status(415).json({ error: 'unsupported_encoding', message: 'Send the file uncompressed.' });
+  }
+  const result = await uploads.append({
+    id: String(req.params.id),
+    userId: req.user.id,
+    offset: Number(req.query.offset),
+    body: req,
+  });
+  if (!result.ok) {
+    if (result.error === 'aborted') return undefined;
+    if (!req.complete) res.set('Connection', 'close');
+    return refuseUpload(res, result);
+  }
+  return res.json({ received: result.received });
+});
+
+app.post('/api/uploads/sessions/:id/finish', requireLogin, async (req, res) => {
+  const result = await uploads.finish({ id: String(req.params.id), userId: req.user.id });
+  if (!result.ok) return refuseUpload(res, result);
+  return res.status(201).json(uploadReply(result));
+});
+
+app.post('/api/uploads/sessions/:id/cancel', requireLogin, async (req, res) => {
+  await uploads.cancel({ id: String(req.params.id), userId: req.user.id });
+  return res.json({ ok: true });
 });
 
 /**

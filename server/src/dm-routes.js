@@ -8,7 +8,6 @@
 // sealed blob except destroy somebody else's conversation, and that is not a
 // moderation tool, it is a way to make people distrust the feature.
 
-import { MAX_SEALED_BYTES } from './chat.js';
 import {
   DirectMessages, ownKey, publicConversation, publicDmMessage, publicKey,
 } from './dms.js';
@@ -270,14 +269,16 @@ export function mountDirectMessages(app, { requireLogin, dms, chat, accounts, pu
       unread();
       return res.status(413).json({
         error: 'file_too_large',
-        message: `Files are limited to ${Math.round(MAX_SEALED_BYTES / 1024 / 1024)} MB.`,
+        message: `Files are limited to ${Math.round(chat.requestLimit() / 1024 / 1024)} MB.`,
       });
     };
     if ((req.get('content-encoding') ?? 'identity').toLowerCase() !== 'identity') {
       unread();
       return res.status(415).json({ error: 'unsupported_encoding', message: 'Send the file uncompressed.' });
     }
-    if (Number(req.get('content-length')) > MAX_SEALED_BYTES) return tooLarge();
+    // The one-request cap, or the owner's limit when lower: a sealed file is
+    // sealed whole on the client, so it never comes in pieces.
+    if (Number(req.get('content-length')) > chat.requestLimit({ sealed: true })) return tooLarge();
 
     let result;
     try {
@@ -289,7 +290,9 @@ export function mountDirectMessages(app, { requireLogin, dms, chat, accounts, pu
     if (!result.ok) {
       if (result.error === 'aborted') return undefined;
       if (result.error === 'file_too_large') return tooLarge();
-      return res.status(result.error === 'server_full' ? 507 : 400).json({ error: result.error });
+      unread();
+      const full = result.error === 'server_full' || result.error === 'disk_full';
+      return res.status(full ? 507 : 400).json({ error: result.error });
     }
     return res.status(201).json({ hash: result.upload.hash, bytes: result.upload.bytes });
   });

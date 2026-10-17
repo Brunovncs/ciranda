@@ -140,6 +140,11 @@ export const config = {
   // server, it stops it. 2 GB by default.
   maxDiskBytes: num(process.env.HARMONY_MAX_DISK_BYTES, 2 * 1024 * 1024 * 1024),
 
+  // Free disk that uploads may never take, whatever the quota above says:
+  // the quota is a guess at what the disk can spare, this is what it must
+  // keep. 512 MB by default; see DISK_RESERVE_BYTES in chat.js.
+  diskReserveBytes: num(process.env.HARMONY_DISK_RESERVE_BYTES, 512 * 1024 * 1024),
+
   // A session nobody has used in this long is dropped. Long enough that the
   // "remember me" box is worth ticking, short enough that an abandoned laptop
   // does not stay logged in forever.

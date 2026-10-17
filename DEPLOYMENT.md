@@ -607,11 +607,14 @@ guessing.
 - **Admin force-mute is enforced by refusing the publish**, not by kicking the
   session. Kicking stops the audio within ~3 seconds but the path is
   immediately re-publishable, so the refusal is what makes it stick.
-- **Uploads are capped three ways**: 25 MB per file, an allowlist of content
-  types (no HTML or scripts, ever), and `HARMONY_MAX_DISK_BYTES` (2 GB default)
-  for the total. The last one is not optional on an SD card: once the
-  filesystem fills, *every* SQLite write throws and the whole server stops, not
-  just uploads.
+- **Uploads are capped four ways**: a largest file the owner sets in Server
+  settings (25 MB until they do, 2 GB at most; anything over 25 MB goes up in
+  8 MB pieces), an allowlist of content types (no HTML or scripts, ever),
+  `HARMONY_MAX_DISK_BYTES` (2 GB default) for the total, and
+  `HARMONY_DISK_RESERVE_BYTES` (512 MB default) of free disk that uploads never
+  take, whatever the total says. The last two are not optional on an SD card:
+  once the filesystem fills, *every* SQLite write throws and the whole server
+  stops, not just uploads.
 - **There is now one writable directory.** `/var/lib/harmony-server` under
   systemd (`StateDirectory=`), or the `harmony-data` volume under Docker. It
   holds the database; back it up. The container still runs `read_only: true`

@@ -12,6 +12,7 @@ pub mod secret;
 pub mod settings;
 pub mod types;
 pub mod update;
+pub mod upload;
 
 use std::future::Future;
 use std::sync::OnceLock;

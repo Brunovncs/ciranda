@@ -258,6 +258,11 @@ impl Api {
         Ok(self.post::<ServerReply>("/api/server", json!({ "iconHash": hash, "logo": hash })).await?.server)
     }
 
+    /// The largest file anybody may send; `None` puts the server's default back.
+    pub async fn set_max_file_bytes(&self, bytes: Option<u64>) -> Result<ServerInfo> {
+        Ok(self.post::<ServerReply>("/api/server", json!({ "maxFileBytes": bytes })).await?.server)
+    }
+
     pub async fn storage(&self) -> Result<Storage> {
         self.get("/api/server/storage").await
     }
@@ -492,6 +497,35 @@ impl Api {
         let url = format!("{}/api/uploads", self.base());
         let limit = transfer_timeout(bytes.len());
         self.send(self.http.post(url).header("Content-Type", content_type).body(bytes), limit).await
+    }
+
+    // Files in pieces: see core/upload.rs, which drives these.
+
+    pub async fn open_upload(&self, size: u64, content_type: &str) -> Result<UploadSession> {
+        self.post("/api/uploads/sessions", json!({ "size": size, "contentType": content_type })).await
+    }
+
+    /// One piece at `offset`; the reply is how much of the file the server now has.
+    pub async fn upload_chunk(&self, id: &str, offset: u64, bytes: Vec<u8>) -> Result<u64> {
+        #[derive(serde::Deserialize)]
+        struct R {
+            received: u64,
+        }
+        let url = format!("{}/api/uploads/sessions/{id}/chunk?offset={offset}", self.base());
+        let limit = transfer_timeout(bytes.len());
+        let rb = self.http.post(url).header("Content-Type", "application/octet-stream").body(bytes);
+        Ok(self.send::<R>(rb, limit).await?.received)
+    }
+
+    /// The last step: the file is put in place, which on a slow disk takes a moment for a big one.
+    pub async fn finish_upload(&self, id: &str) -> Result<Upload> {
+        let url = format!("{}/api/uploads/sessions/{id}/finish", self.base());
+        self.send(self.http.post(url).json(&json!({})), Duration::from_secs(60)).await
+    }
+
+    /// Best effort: a session nobody finishes is forgotten by the server anyway.
+    pub async fn cancel_upload(&self, id: &str) {
+        let _ = self.post::<Value>(&format!("/api/uploads/sessions/{id}/cancel"), json!({})).await;
     }
 
     pub async fn download(&self, hash: &str) -> Result<(Vec<u8>, String)> {
@@ -735,7 +769,17 @@ pub fn friendly(code: ErrorCode, body: &Value) -> Option<String> {
         }
         E::ChannelFull => tr!("That voice channel is full.", "Esse canal de voz está cheio."),
         E::ServerFull => tr!("The server is out of space for files.", "O servidor ficou sem espaço para arquivos."),
-        E::FileTooLarge => tr!("Files can be up to 25 MB.", "Os arquivos podem ter até 25 MB."),
+        E::DiskFull => tr!(
+            "The server's disk is nearly full, so it isn't taking files.",
+            "O disco do servidor está quase cheio, então ele não está aceitando arquivos."
+        ),
+        E::FileTooLarge => tr!("That file is too big for this server.", "Esse arquivo é grande demais para este servidor."),
+        E::TooManyUploads => tr!("Finish or cancel your other uploads first.", "Termine ou cancele seus outros envios primeiro."),
+        E::BadOffset | E::Incomplete | E::ChunkTooLarge | E::Aborted => {
+            tr!("The upload was interrupted. Send it again.", "O envio foi interrompido. Envie de novo.")
+        }
+        E::BadLimit => tr!("The largest file has to be between 1 MB and 2 GB.", "O maior arquivo tem que ficar entre 1 MB e 2 GB."),
+        E::Cancelled => tr!("Upload cancelled.", "Envio cancelado."),
         E::AvatarTooLarge | E::PictureTooLarge | E::EmojiTooLarge => {
             tr!("That picture is too big. 256 KB at most.", "Essa imagem é grande demais. No máximo 256 KB.")
         }
