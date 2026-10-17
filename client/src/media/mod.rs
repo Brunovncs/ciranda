@@ -4,6 +4,7 @@ pub mod audio;
 pub mod background;
 pub mod call;
 pub mod camera;
+pub mod composite;
 pub mod diagnose;
 pub mod loopback;
 pub mod replay;

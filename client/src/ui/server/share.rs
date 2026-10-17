@@ -1,6 +1,7 @@
 //! Turning your camera and your screen on and off in a call.
 
 use super::ServerView;
+use super::composer::Composer;
 use super::picker::Picker;
 use super::sidebar::{Menu, MenuEntry};
 use crate::ui::camera::CameraDialog;
@@ -42,17 +43,29 @@ impl ServerView {
             return;
         }
         let this = cx.entity().downgrade();
-        let items = vec![
-            MenuEntry::item("screen-share", tr!("Change what you share", "Trocar o que você compartilha"), false, move |window, cx| {
-                if let Some(this) = this.upgrade() {
-                    this.update(cx, |this, cx| this.pick_screen(window, cx));
-                }
-            }),
-            MenuEntry::item("screen-share-off", tr!("Stop sharing", "Parar de compartilhar"), true, move |_, cx| {
-                voice.update(cx, |v, cx| v.stop_screen(cx));
-            }),
-        ];
+        let mut items = Vec::new();
+        if voice.read(cx).composition().is_some() {
+            let voice = voice.clone();
+            items.push(MenuEntry::item("layers", tr!("Edit layout", "Editar o layout"), false, move |window, cx| {
+                Composer::open(voice.clone(), window, cx);
+            }));
+        }
+        items.push(MenuEntry::item("screen-share", tr!("Change what you share", "Trocar o que você compartilha"), false, move |window, cx| {
+            if let Some(this) = this.upgrade() {
+                this.update(cx, |this, cx| this.pick_screen(window, cx));
+            }
+        }));
+        items.push(MenuEntry::item("screen-share-off", tr!("Stop sharing", "Parar de compartilhar"), true, move |_, cx| {
+            voice.update(cx, |v, cx| v.stop_screen(cx));
+        }));
         overlay::open_menu_above(cx.new(|_| Menu { items }), at, cx);
+    }
+
+    /// The editor over your composition, while that is what you share.
+    pub fn edit_composition(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(voice) = self.voice(cx) {
+            Composer::open(voice, window, cx);
+        }
     }
 
     pub fn stop_screen(&mut self, cx: &mut Context<Self>) {
@@ -72,10 +85,15 @@ impl ServerView {
         let current = voice.read(cx).screen_choice();
         let this = cx.entity().downgrade();
         let picker = cx.new(|cx| {
-            Picker::new(current, cx, move |choice, _, cx| {
+            Picker::new(current, cx, move |choice, window, cx| {
+                let composite = choice.composition.is_some();
                 voice.update(cx, |v, cx| v.start_screen(choice, cx));
                 if let Some(this) = this.upgrade() {
                     this.update(cx, |this, cx| this.ensure_stage(cx));
+                }
+                // Arranging it is the point, and a new one is empty until something is added.
+                if composite {
+                    Composer::open(voice.clone(), window, cx);
                 }
             })
         });

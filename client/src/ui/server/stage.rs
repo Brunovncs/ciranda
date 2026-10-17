@@ -302,6 +302,7 @@ impl ServerView {
         let group = SharedString::from(format!("tile-{id}"));
         let (t1, t2, t3) = (tile.clone(), tile.clone(), tile.clone());
         let voice = voice.cloned();
+        let composite = local && kind == TileKind::Screen && voice.as_ref().is_some_and(|v| v.read(cx).composition().is_some());
         let lit = kind == TileKind::Camera && self.call_place(cx).is_some_and(|p| self.is_speaking(p, user, cx));
         let ink = if kind == TileKind::Screen { self.ink_layer(tile, cx) } else { None };
         let screen_tools = self.screen_tools(kind, local, id, t, cx);
@@ -357,6 +358,13 @@ impl ServerView {
                     .invisible()
                     .group_hover(group, |s| s.visible())
                     .children(screen_tools)
+                    .when(composite, |d| {
+                        d.child(
+                            tool_button(("edit-layout", id), "layers", false, gpui::white(), t)
+                                .tooltip(tip(tr!("Edit the layout", "Editar o layout"), t))
+                                .on_click(cx.listener(|this, _, window, cx| this.edit_composition(window, cx))),
+                        )
+                    })
                     .when(local && kind == TileKind::Screen, |d| {
                         d.child(
                             tool_button(("change-share", id), "screen-share", false, gpui::white(), t)

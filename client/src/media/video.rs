@@ -76,6 +76,11 @@ impl FrameSlot {
         }
     }
 
+    /// A tile shows this slot: frames put here are seen.
+    pub fn watched(&self) -> bool {
+        self.wake.lock().is_some()
+    }
+
     fn take_fresh(&self) -> Option<SurfaceFrame> {
         self.fresh.swap(false, Ordering::Acquire).then(|| self.frame.lock().clone()).flatten()
     }

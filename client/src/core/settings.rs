@@ -94,6 +94,8 @@ pub struct Settings {
     /// "app" or "off".
     pub share_kind: String,
     pub share_sound: String,
+    /// The last composition shared, bottom first, so the picker's "Composite" opens with it.
+    pub composite_layout: Vec<CompositeLayer>,
     /// The in-game overlay: who is in your call, over whatever has the screen. Off until turned on.
     pub overlay_enabled: bool,
     /// Its corner of the screen: "top-left", "top-right", "bottom-left" or "bottom-right".
@@ -555,6 +557,27 @@ pub enum Background {
     },
 }
 
+/// One source of a saved composition and where it was: a rect in fractions of the canvas, and
+/// the fractions of the source cropped off each side.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CompositeLayer {
+    /// "screen", "window" or "camera".
+    pub kind: String,
+    /// A screen's monitor id, a window's handle as it was (found again by `app` and `title` once
+    /// it has changed) or a camera's device id.
+    pub id: String,
+    pub title: String,
+    /// The window's program file, such as "obs64.exe".
+    pub app: String,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    /// Left, top, right, bottom.
+    pub crop: [f32; 4],
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
@@ -610,6 +633,7 @@ impl Default for Settings {
             folded_groups: BTreeMap::new(),
             share_kind: "screen".into(),
             share_sound: "system".into(),
+            composite_layout: Vec::new(),
             overlay_enabled: false,
             overlay_corner: "top-left".into(),
             overlay_only_speaking: false,

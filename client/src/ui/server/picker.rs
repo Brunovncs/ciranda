@@ -1,5 +1,8 @@
-//! "Choose what to share": a screen or a window, with a still of each, and how to send it.
+//! "Choose what to share": a screen or a window, with a still of each, and how to send it; or a
+//! composition of several, screens, windows and the camera, arranged on one canvas.
 
+use crate::media::camera;
+use crate::media::composite::{self, Composition, Layout};
 use crate::media::screen::{self, Resolution, ScreenChoice, ScreenSource, Sound, SourceKind};
 use crate::prefs::{prefs, set_prefs};
 use crate::theme::{current, px, radius};
@@ -15,14 +18,28 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 type OnPick = Rc<dyn Fn(ScreenChoice, &mut Window, &mut App)>;
+/// A source to put on a composition already running, with its name and program.
+type OnAdd = Rc<dyn Fn(composite::Source, String, String, &mut Window, &mut App)>;
 
 pub struct Picker {
     focus: FocusHandle,
     kind: SourceKind,
     sources: Option<Vec<ScreenSource>>,
+    /// The cameras, for a composition.
+    cameras: Vec<camera::Device>,
+    /// Each window's program, for a composition to find it again another time.
+    apps: HashMap<u64, String>,
     /// Stills by source, filled in as they land; dropped from the window's atlas when replaced.
-    stills: HashMap<u64, Arc<RenderImage>>,
+    stills: HashMap<(SourceKind, u64), Arc<RenderImage>>,
     picked: Option<u64>,
+    /// What a composition starts with, bottom first.
+    ticked: Vec<composite::Source>,
+    /// The saved layout's sources found among those here now, with where they were.
+    saved: Vec<(composite::Source, composite::Rect, composite::Crop)>,
+    /// The ticks were set from the saved layout or the running composition, once.
+    restored: bool,
+    /// The composition being shared now, when that is what is being changed.
+    composition: Option<(Arc<Composition>, Option<(u32, u32)>)>,
     resolution: Resolution,
     fps: u32,
     sharp: bool,
@@ -32,6 +49,8 @@ pub struct Picker {
     /// Picking something to take a screenshot of, not to share: no stream settings.
     snapshot: bool,
     on_pick: OnPick,
+    /// Picking a source to add to a running composition instead: one click adds it.
+    adding: Option<OnAdd>,
     _load: Task<()>,
 }
 
@@ -50,12 +69,23 @@ impl Picker {
         on_pick: impl Fn(ScreenChoice, &mut Window, &mut App) + 'static,
     ) -> Picker {
         let p = prefs(cx);
+        let saved_kind = match p.share_kind.as_str() {
+            "window" => SourceKind::Window,
+            "composite" => SourceKind::Composite,
+            _ => SourceKind::Screen,
+        };
         let mut picker = Picker {
             focus: cx.focus_handle(),
-            kind: current.as_ref().map(|c| c.source.kind).unwrap_or(if p.share_kind == "window" { SourceKind::Window } else { SourceKind::Screen }),
+            kind: current.as_ref().map(|c| c.source.kind).unwrap_or(saved_kind),
             sources: None,
+            cameras: Vec::new(),
+            apps: HashMap::new(),
             stills: HashMap::new(),
             picked: current.as_ref().map(|c| c.source.id),
+            ticked: Vec::new(),
+            saved: Vec::new(),
+            restored: false,
+            composition: current.as_ref().and_then(|c| c.composition.clone().map(|comp| (comp, c.source.size))),
             resolution: current.as_ref().map(|c| c.resolution).unwrap_or_else(|| Resolution::from_setting(&p.resolution)),
             fps: current.as_ref().map(|c| c.fps).unwrap_or(if p.framerate == 0 { 30 } else { p.framerate }),
             sharp: current.as_ref().map(|c| c.sharp).unwrap_or(p.priority != "smooth"),
@@ -67,6 +97,7 @@ impl Picker {
             changing: current.is_some(),
             snapshot: false,
             on_pick: Rc::new(on_pick),
+            adding: None,
             _load: Task::ready(()),
         };
         cx.on_release(|this: &mut Picker, cx| this.drop_stills(cx)).detach();
@@ -78,22 +109,60 @@ impl Picker {
     pub fn snapshot(cx: &mut Context<Self>, on_pick: impl Fn(ScreenChoice, &mut Window, &mut App) + 'static) -> Picker {
         let mut picker = Picker::new(None, cx, on_pick);
         picker.snapshot = true;
+        if picker.kind == SourceKind::Composite {
+            picker.kind = SourceKind::Screen;
+            picker.load(cx);
+        }
         picker
     }
 
-    /// The list first, by title; then the stills, in parallel, each drawn as it lands.
+    /// Every screen, window and camera, to put one more on a running composition.
+    pub fn adding(cx: &mut Context<Self>, on_add: impl Fn(composite::Source, String, String, &mut Window, &mut App) + 'static) -> Picker {
+        let mut picker = Picker::new(None, cx, |_, _, _| {});
+        picker.adding = Some(Rc::new(on_add));
+        picker.restored = true;
+        if picker.kind != SourceKind::Composite {
+            picker.kind = SourceKind::Composite;
+            picker.load(cx);
+        }
+        picker
+    }
+
+    fn composite(&self) -> bool {
+        self.kind == SourceKind::Composite
+    }
+
+    /// The list first, by title; then the stills, in parallel, each drawn as it lands. A
+    /// composition lists screens, then windows, then cameras.
     fn load(&mut self, cx: &mut Context<Self>) {
         self.sources = None;
         self.drop_stills(cx);
         let kind = self.kind;
+        let composite = self.composite();
+        let kinds = if composite { vec![SourceKind::Screen, SourceKind::Window] } else { vec![kind] };
         self._load = cx.spawn(async move |this, cx| {
-            let list = cx.background_executor().spawn(async move { screen::sources(kind) }).await;
-            let ids = list.iter().map(|s| s.id).collect();
+            let listed = kinds.clone();
+            let (list, apps, cameras) = cx
+                .background_executor()
+                .spawn(async move {
+                    let list: Vec<ScreenSource> = listed.iter().flat_map(|k| screen::sources(*k)).collect();
+                    let apps: HashMap<u64, String> = if composite {
+                        list.iter().filter(|s| s.kind == SourceKind::Window).map(|s| (s.id, composite::window_app(s.id))).collect()
+                    } else {
+                        HashMap::new()
+                    };
+                    (list, apps, if composite { camera::devices() } else { Vec::new() })
+                })
+                .await;
+            let ids: Vec<(SourceKind, u64)> = list.iter().map(|s| (s.kind, s.id)).collect();
             let shown = this.update(cx, |this, cx| {
                 if this.picked.is_none_or(|id| !list.iter().any(|s| s.id == id)) {
                     this.picked = list.first().map(|s| s.id);
                 }
-                this.sources = Some(list);
+                (this.sources, this.apps, this.cameras) = (Some(list), apps, cameras);
+                if composite {
+                    this.restore(cx);
+                }
                 cx.notify();
             });
             if shown.is_err() {
@@ -101,20 +170,22 @@ impl Picker {
             }
             // Dropping this task (closed, or another kind picked) drops the receiver, which
             // stops the threads taking stills.
-            let stills = screen::stills(kind, ids);
-            while let Ok((id, still)) = stills.recv().await {
-                let Some(still) = still else { continue };
-                let ok = this.update(cx, |this, cx| {
-                    if let Some(s) = this.sources.iter_mut().flatten().find(|s| s.id == id) {
-                        s.size = Some(still.size);
+            for k in kinds {
+                let stills = screen::stills(k, ids.iter().filter(|(sk, _)| *sk == k).map(|(_, id)| *id).collect());
+                while let Ok((id, still)) = stills.recv().await {
+                    let Some(still) = still else { continue };
+                    let ok = this.update(cx, |this, cx| {
+                        if let Some(s) = this.sources.iter_mut().flatten().find(|s| s.kind == k && s.id == id) {
+                            s.size = Some(still.size);
+                        }
+                        if let Some(old) = this.stills.insert((k, id), still.image) {
+                            cx.drop_image(old, None);
+                        }
+                        cx.notify();
+                    });
+                    if ok.is_err() {
+                        return;
                     }
-                    if let Some(old) = this.stills.insert(id, still.image) {
-                        cx.drop_image(old, None);
-                    }
-                    cx.notify();
-                });
-                if ok.is_err() {
-                    break;
                 }
             }
         });
@@ -127,10 +198,116 @@ impl Picker {
         }
     }
 
+    fn is_here(&self, s: &composite::Source) -> bool {
+        match s {
+            composite::Source::Screen(id) | composite::Source::Window(id) => self.sources.iter().flatten().any(|x| x.id == *id),
+            composite::Source::Camera(d) => self.cameras.iter().any(|c| &c.id == d),
+        }
+    }
+
+    /// The ticks a composition starts with, the first time the lists are in: what the running
+    /// one shows, or else what the last one did, wherever those sources are found now.
+    fn restore(&mut self, cx: &App) {
+        if std::mem::replace(&mut self.restored, true) {
+            let ticked = std::mem::take(&mut self.ticked);
+            self.ticked = ticked.into_iter().filter(|s| self.is_here(s)).collect();
+            return;
+        }
+        if let Some((comp, _)) = &self.composition {
+            self.ticked = comp.layout().layers.iter().map(|l| l.source.clone()).collect();
+            return;
+        }
+        let list = self.sources.clone().unwrap_or_default();
+        let screens: Vec<ScreenSource> = list.iter().filter(|s| s.kind == SourceKind::Screen).cloned().collect();
+        let windows: Vec<(ScreenSource, String)> = list
+            .iter()
+            .filter(|s| s.kind == SourceKind::Window)
+            .map(|s| (s.clone(), self.apps.get(&s.id).cloned().unwrap_or_default()))
+            .collect();
+        for layer in &prefs(cx).composite_layout {
+            let Some((source, _, _)) = composite::find(layer, &screens, &windows, &self.cameras) else { continue };
+            if !self.ticked.contains(&source) {
+                self.ticked.push(source.clone());
+                self.saved.push((source, layer.rect(), layer.crop()));
+            }
+        }
+    }
+
+    /// A source's name and program, as listed.
+    fn describe(&self, s: &composite::Source) -> (String, String) {
+        match s {
+            composite::Source::Screen(id) | composite::Source::Window(id) => {
+                let title = self.sources.iter().flatten().find(|x| x.id == *id).map(|x| x.title.clone()).unwrap_or_default();
+                (title, self.apps.get(id).cloned().unwrap_or_default())
+            }
+            composite::Source::Camera(d) => (self.cameras.iter().find(|c| &c.id == d).map(|c| c.name.clone()).unwrap_or(d.clone()), String::new()),
+        }
+    }
+
+    fn tick(&mut self, source: composite::Source, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(add) = self.adding.clone() {
+            let (name, app) = self.describe(&source);
+            cx.emit(Dismiss);
+            add(source, name, app, window, cx);
+            return;
+        }
+        match self.ticked.iter().position(|s| *s == source) {
+            Some(i) => {
+                self.ticked.remove(i);
+            }
+            None => self.ticked.push(source),
+        }
+        cx.notify();
+    }
+
+    /// The composition to share: the running one with its sources made the ticked ones, or a
+    /// new one, each source where the last one had it or else placed once it is seen.
+    fn composition(&self, cx: &App) -> (Arc<Composition>, (u32, u32)) {
+        let largest = self
+            .sources
+            .iter()
+            .flatten()
+            .filter(|s| s.kind == SourceKind::Screen)
+            .filter_map(|s| s.size)
+            .max_by_key(|(w, h)| w * h)
+            .unwrap_or((1920, 1080));
+        if let Some((comp, size)) = &self.composition {
+            comp.edit(|l| {
+                l.layers.retain(|x| self.ticked.contains(&x.source));
+                for s in &self.ticked {
+                    if !l.layers.iter().any(|x| x.source == *s) {
+                        let (name, app) = self.describe(s);
+                        l.add(s.clone(), name, app);
+                    }
+                }
+            });
+            return (comp.clone(), size.unwrap_or(largest));
+        }
+        let mut layout = Layout::new(largest);
+        for s in &self.ticked {
+            let (name, app) = self.describe(s);
+            match self.saved.iter().find(|(x, _, _)| x == s) {
+                Some((_, rect, crop)) => layout.add_at(s.clone(), name, app, *rect, *crop),
+                None => layout.add(s.clone(), name, app),
+            };
+        }
+        (Composition::new(layout, prefs(cx).camera_background.clone()), largest)
+    }
+
     fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(source) = self.sources.as_ref().and_then(|l| l.iter().find(|s| Some(s.id) == self.picked)).cloned() else { return };
-        let sound = if self.sound == Sound::App && source.kind == SourceKind::Screen { Sound::System } else { self.sound };
-        let choice = ScreenChoice { source, resolution: self.resolution, fps: self.fps, sharp: self.sharp, sound };
+        let choice = if self.composite() {
+            let (comp, size) = self.composition(cx);
+            let source = ScreenSource { id: 0, kind: SourceKind::Composite, title: tr!("Composition", "Composição").into(), size: Some(size) };
+            let sound = if self.sound == Sound::Off { Sound::Off } else { Sound::System };
+            let choice =
+                ScreenChoice { source, resolution: self.resolution, fps: self.fps, sharp: self.sharp, sound, composition: Some(comp.clone()) };
+            comp.edit(|l| l.canvas = composite::canvas_size(&choice));
+            choice
+        } else {
+            let Some(source) = self.sources.as_ref().and_then(|l| l.iter().find(|s| Some(s.id) == self.picked)).cloned() else { return };
+            let sound = if self.sound == Sound::App && source.kind == SourceKind::Screen { Sound::System } else { self.sound };
+            ScreenChoice { source, resolution: self.resolution, fps: self.fps, sharp: self.sharp, sound, composition: None }
+        };
         let (res, fps, sharp, kind, sound) = (self.resolution, self.fps, self.sharp, self.kind, self.sound);
         if self.snapshot {
             cx.emit(Dismiss);
@@ -141,7 +318,12 @@ impl Picker {
             p.resolution = res.setting().into();
             p.framerate = fps;
             p.priority = if sharp { "sharp" } else { "smooth" }.into();
-            p.share_kind = if kind == SourceKind::Window { "window" } else { "screen" }.into();
+            p.share_kind = match kind {
+                SourceKind::Window => "window",
+                SourceKind::Composite => "composite",
+                SourceKind::Screen => "screen",
+            }
+            .into();
             p.share_sound = match sound {
                 Sound::System => "system",
                 Sound::App => "app",
@@ -152,11 +334,64 @@ impl Picker {
         cx.emit(Dismiss);
         (self.on_pick)(choice, window, cx);
     }
+
+    /// A source's card: its still (or an icon) and its name, marked when picked; in a composition
+    /// its place in the stack.
+    fn card(&self, key: (SourceKind, u64), title: String, size: Option<(u32, u32)>, glyph: &'static str, on: Option<usize>) -> gpui::Div {
+        let t = current();
+        let hover = t.stroke_strong;
+        let (picked, order) = (on.is_some(), on.filter(|_| self.composite() && self.adding.is_none()));
+        div()
+            .relative()
+            .w(px(214.))
+            .flex()
+            .flex_col()
+            .rounded(px(radius::CARD))
+            .overflow_hidden()
+            .bg(t.layer)
+            .border_2()
+            .border_color(if picked { t.accent } else { t.stroke })
+            .cursor_pointer()
+            .when(!picked, |d| d.hover(move |s| s.border_color(hover)))
+            .child(div().h(px(120.)).bg(t.stage).flex().items_center().justify_center().child(match self.stills.get(&key) {
+                Some(i) => img(i.clone()).size_full().object_fit(gpui::ObjectFit::Contain).into_any_element(),
+                None => icon(glyph, 24., t.text3).into_any_element(),
+            }))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .px(px(10.))
+                    .py(px(8.))
+                    .child(div().flex_1().min_w(px(0.)).truncate().text_size(px(13.)).font_weight(gpui::FontWeight::MEDIUM).child(title))
+                    .when_some(size, |d, (w, h)| d.child(mono(format!("{w}×{h}"), t.text3))),
+            )
+            .when_some(order, |d, i| {
+                d.child(
+                    div()
+                        .absolute()
+                        .top(px(6.))
+                        .left(px(6.))
+                        .size(px(22.))
+                        .rounded_full()
+                        .bg(t.accent)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(12.))
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .text_color(t.on_accent)
+                        .child(format!("{}", i + 1)),
+                )
+            })
+    }
 }
 
 impl Render for Picker {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = current();
+        let composite = self.composite();
         let mut grid = div().id("sources").flex().flex_wrap().gap(px(10.)).max_h(px(330.)).overflow_y_scroll();
         match &self.sources {
             None => {
@@ -169,7 +404,7 @@ impl Render for Picker {
                         .child(caption(tr!("Looking for what you can share…", "Procurando o que dá para compartilhar…"), t.text3)),
                 );
             }
-            Some(list) if list.is_empty() => {
+            Some(list) if list.is_empty() && (!composite || self.cameras.is_empty()) => {
                 grid = grid.child(div().w_full().py(px(60.)).flex().justify_center().child(caption(
                     if self.kind == SourceKind::Window {
                         tr!(
@@ -184,55 +419,39 @@ impl Render for Picker {
             }
             Some(list) => {
                 for s in list.clone() {
-                    let on = Some(s.id) == self.picked;
                     let id = s.id;
-                    let hover = t.stroke_strong;
-                    grid = grid.child(
-                        div()
-                            .id(("source", s.id))
-                            .w(px(214.))
-                            .flex()
-                            .flex_col()
-                            .rounded(px(radius::CARD))
-                            .overflow_hidden()
-                            .bg(t.layer)
-                            .border_2()
-                            .border_color(if on { t.accent } else { t.stroke })
-                            .cursor_pointer()
-                            .when(!on, |d| d.hover(move |s| s.border_color(hover)))
-                            .child(
-                                div().h(px(120.)).bg(t.stage).flex().items_center().justify_center().child(match self.stills.get(&s.id) {
-                                    Some(i) => img(i.clone()).size_full().object_fit(gpui::ObjectFit::Contain).into_any_element(),
-                                    None => icon(if s.kind == SourceKind::Screen { "monitor" } else { "image" }, 24., t.text3)
-                                        .into_any_element(),
-                                }),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(6.))
-                                    .px(px(10.))
-                                    .py(px(8.))
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w(px(0.))
-                                            .truncate()
-                                            .text_size(px(13.))
-                                            .font_weight(gpui::FontWeight::MEDIUM)
-                                            .child(s.title.clone()),
-                                    )
-                                    .when_some(s.size, |d, (w, h)| d.child(mono(format!("{w}×{h}"), t.text3))),
-                            )
-                            .on_click(cx.listener(move |this, e: &gpui::ClickEvent, window, cx| {
-                                this.picked = Some(id);
-                                if e.click_count() == 2 {
-                                    this.start(window, cx);
-                                }
-                                cx.notify();
-                            })),
-                    );
+                    let glyph = if s.kind == SourceKind::Screen { "monitor" } else { "image" };
+                    if composite {
+                        let source = if s.kind == SourceKind::Screen { composite::Source::Screen(id) } else { composite::Source::Window(id) };
+                        let on = self.ticked.iter().position(|x| *x == source);
+                        grid = grid.child(
+                            self.card((s.kind, id), s.title.clone(), s.size, glyph, on)
+                                .id(("source", id))
+                                .on_click(cx.listener(move |this, _, window, cx| this.tick(source.clone(), window, cx))),
+                        );
+                        continue;
+                    }
+                    let on = (Some(id) == self.picked).then_some(0);
+                    grid = grid.child(self.card((s.kind, id), s.title.clone(), s.size, glyph, on).id(("source", id)).on_click(cx.listener(
+                        move |this, e: &gpui::ClickEvent, window, cx| {
+                            this.picked = Some(id);
+                            if e.click_count() == 2 {
+                                this.start(window, cx);
+                            }
+                            cx.notify();
+                        },
+                    )));
+                }
+                if composite {
+                    for (i, c) in self.cameras.clone().into_iter().enumerate() {
+                        let source = composite::Source::Camera(c.id.clone());
+                        let on = self.ticked.iter().position(|x| *x == source);
+                        grid = grid.child(
+                            self.card((SourceKind::Composite, i as u64), c.name.clone(), None, "camera", on)
+                                .id(("camera-source", i))
+                                .on_click(cx.listener(move |this, _, window, cx| this.tick(source.clone(), window, cx))),
+                        );
+                    }
                 }
             }
         }
@@ -255,7 +474,13 @@ impl Render for Picker {
             Sound::App => tr!("Viewers hear only this app.", "Quem assiste ouve só este app."),
             Sound::Off => tr!("Viewers see the picture without sound.", "Quem assiste vê a imagem sem som."),
         };
+        let adding = self.adding.is_some();
+        let settings = !self.snapshot && !adding;
         let field = |name: &'static str, control: gpui::Div| div().flex().flex_col().gap(px(6.)).child(label(name, &t)).child(control);
+        let mut kinds = vec![(SourceKind::Screen, tr!("Screens", "Telas").into()), (SourceKind::Window, tr!("Windows", "Janelas").into())];
+        if !self.snapshot {
+            kinds.push((SourceKind::Composite, tr!("Composite", "Composição").into()));
+        }
         dialog_card(&t, 720.)
             .track_focus(&self.focus)
             .child(
@@ -270,7 +495,9 @@ impl Render for Picker {
                             .flex_col()
                             .gap(px(2.))
                             .child(title(
-                                if self.snapshot {
+                                if adding {
+                                    tr!("Add a source", "Adicionar uma fonte")
+                                } else if self.snapshot {
                                     tr!("Send a screenshot", "Enviar uma captura de tela")
                                 } else if self.changing {
                                     tr!("Change what you share", "Trocar o que você compartilha")
@@ -280,10 +507,17 @@ impl Render for Picker {
                                 t.text,
                             ))
                             .child(caption(
-                                if self.snapshot {
+                                if adding {
+                                    tr!("It goes on top of your composition.", "Ela entra por cima da sua composição.")
+                                } else if self.snapshot {
                                     tr!(
                                         "It goes into your message at full size, for you to send or drop.",
                                         "Ela entra na sua mensagem em tamanho real, para você enviar ou descartar."
+                                    )
+                                } else if composite {
+                                    tr!(
+                                        "Pick any number to start with, or none: once live you can add, move, resize and crop them.",
+                                        "Escolha quantas quiser para começar, ou nenhuma: ao vivo dá para adicionar, mover, redimensionar e cortar."
                                     )
                                 } else {
                                     tr!("People in the channel see it as a tile.", "Quem está no canal vê isso num quadro.")
@@ -296,27 +530,20 @@ impl Render for Picker {
                             .flex()
                             .gap(px(8.))
                             .items_center()
-                            .child(div().flex_1().child(segmented(
-                                "kind",
-                                vec![
-                                    (SourceKind::Screen, tr!("Screens", "Telas").into()),
-                                    (SourceKind::Window, tr!("Windows", "Janelas").into()),
-                                ],
-                                self.kind,
-                                &t,
-                                cx,
-                                |this, k, _, cx| {
+                            .when(!adding, |d| {
+                                d.child(div().flex_1().child(segmented("kind", kinds, self.kind, &t, cx, |this, k, _, cx| {
                                     this.kind = k;
                                     this.load(cx);
-                                },
-                            )))
+                                })))
+                            })
+                            .when(adding, |d| d.child(div().flex_1()))
                             .child(
                                 button("refresh", tr!("Refresh", "Atualizar"), Kind::Standard, &t)
                                     .on_click(cx.listener(|this, _, _, cx| this.load(cx))),
                             ),
                     )
                     .child(grid)
-                    .when(!self.snapshot, |d| {
+                    .when(settings, |d| {
                         d.child(
                             div()
                                 .flex()
@@ -396,27 +623,29 @@ impl Render for Picker {
                     .bg(t.layer)
                     .border_t_1()
                     .border_color(t.stroke)
-                    .child(div().flex_1().when(!self.snapshot, |d| d.child(caption(note, t.text2))))
+                    .child(div().flex_1().when(settings, |d| d.child(caption(note, t.text2))))
                     .child(
                         button("picker-cancel", tr!("Cancel", "Cancelar"), Kind::Standard, &t)
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(Dismiss))),
                     )
-                    .child(
-                        button(
-                            "picker-start",
-                            if self.snapshot {
-                                tr!("Capture", "Capturar")
-                            } else if self.changing {
-                                tr!("Use this", "Usar")
-                            } else {
-                                tr!("Start sharing", "Começar a compartilhar")
-                            },
-                            Kind::Primary,
-                            &t,
+                    .when(!adding, |d| {
+                        d.child(
+                            button(
+                                "picker-start",
+                                if self.snapshot {
+                                    tr!("Capture", "Capturar")
+                                } else if self.changing {
+                                    tr!("Use this", "Usar")
+                                } else {
+                                    tr!("Start sharing", "Começar a compartilhar")
+                                },
+                                Kind::Primary,
+                                &t,
+                            )
+                            .when(self.picked.is_none() && !composite, |b| b.opacity(0.5))
+                            .on_click(cx.listener(|this, _, window, cx| this.start(window, cx))),
                         )
-                        .when(self.picked.is_none(), |b| b.opacity(0.5))
-                        .on_click(cx.listener(|this, _, window, cx| this.start(window, cx))),
-                    ),
+                    }),
             )
     }
 }

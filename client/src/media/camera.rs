@@ -84,17 +84,83 @@ fn picture(bg: &Background, w: u32, h: u32) -> Option<Vec<u8>> {
     Some(img.into_raw())
 }
 
+/// The newest frame a camera sent, for a composition that shows the camera too: Media Foundation
+/// opens a device once, so a composition reads the frames of whichever capture has it.
+#[derive(Default)]
+pub struct Tap {
+    frame: Mutex<Option<I420Buffer>>,
+    /// Counts the frames put here, so a reader knows a new one from the last.
+    serial: std::sync::atomic::AtomicU64,
+    /// Someone reads it; until then frames aren't copied here.
+    wanted: AtomicBool,
+    /// The capture has let go of the camera.
+    pub ended: AtomicBool,
+}
+
+impl Tap {
+    fn put(&self, b: &I420Buffer) {
+        if !self.wanted.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut slot = self.frame.lock();
+        yuv::scale(b, yuv::pooled(&mut slot, b.width(), b.height()));
+        self.serial.fetch_add(1, Ordering::Release);
+    }
+
+    pub fn serial(&self) -> u64 {
+        self.wanted.store(true, Ordering::Relaxed);
+        self.serial.load(Ordering::Acquire)
+    }
+
+    /// The newest frame, borrowed while `f` runs.
+    pub fn with<T>(&self, f: impl FnOnce(&I420Buffer) -> T) -> Option<T> {
+        self.frame.lock().as_ref().map(f)
+    }
+}
+
+/// The capture that has the camera, or is about to: the device asked for and its frames. One
+/// that only lends (a composition's own) gives the camera up to any other that asks for it.
+struct Holder {
+    device: String,
+    tap: Arc<Tap>,
+    lends: bool,
+    give_up: Arc<AtomicBool>,
+}
+
+static HOLDER: Mutex<Option<Holder>> = parking_lot::const_mutex(None);
+
+/// The frames of the capture that has (or is opening) the camera `device`, if one does; else
+/// whether some other camera is in use.
+pub fn borrow(device: &str) -> Result<Arc<Tap>, bool> {
+    match &*HOLDER.lock() {
+        Some(h) if !h.tap.ended.load(Ordering::Relaxed) && (h.device == device || h.device.is_empty()) => Ok(h.tap.clone()),
+        Some(h) => Err(!h.tap.ended.load(Ordering::Relaxed)),
+        None => Err(false),
+    }
+}
+
 pub struct Capture {
     stop: Arc<AtomicBool>,
     pub source: NativeVideoSource,
     pub preview: Arc<FrameSlot>,
     background: Arc<Mutex<Background>>,
     pub error: Arc<Mutex<Option<String>>>,
+    pub tap: Arc<Tap>,
 }
 
 impl Capture {
     /// Opens the camera (by id, or the first one) and starts sending frames.
     pub fn start(device: &str, background: Background) -> Capture {
+        Capture::open_with(device, background, false)
+    }
+
+    /// The camera for a composition alone: given up to the call's camera or a preview that asks
+    /// for it, whose frames the composition then reads instead.
+    pub fn lending(device: &str, background: Background) -> Capture {
+        Capture::open_with(device, background, true)
+    }
+
+    fn open_with(device: &str, background: Background, lends: bool) -> Capture {
         // The source keeps itself alive with a task on the network runtime.
         let _rt = crate::core::runtime().enter();
         let source = NativeVideoSource::new(VideoResolution { width: WIDTH, height: HEIGHT }, false);
@@ -102,18 +168,36 @@ impl Capture {
         let stop = Arc::new(AtomicBool::new(false));
         let background = Arc::new(Mutex::new(background));
         let error = Arc::new(Mutex::new(None));
-        let (src, prev, st, bg, err, device) =
-            (source.clone(), preview.clone(), stop.clone(), background.clone(), error.clone(), device.to_string());
+        let tap = Arc::new(Tap::default());
+        let give_up = Arc::new(AtomicBool::new(false));
+        if !lends {
+            // Said at once, so a composition waiting for the camera reads this one's frames
+            // rather than opening the device itself meanwhile.
+            let mut holder = HOLDER.lock();
+            if let Some(h) = holder.as_ref().filter(|h| h.lends) {
+                h.give_up.store(true, Ordering::Relaxed);
+            }
+            *holder = Some(Holder { device: device.to_string(), tap: tap.clone(), lends, give_up: give_up.clone() });
+        }
+        let (src, prev, st, bg, err, device, tp) =
+            (source.clone(), preview.clone(), stop.clone(), background.clone(), error.clone(), device.to_string(), tap.clone());
         std::thread::Builder::new()
             .name("ciranda-camera".into())
             .spawn(move || {
-                if let Err(e) = run(&device, src, prev, st, bg) {
+                let out = run(&device, src, prev, st, bg, &tp, lends.then_some(&give_up));
+                tp.ended.store(true, Ordering::Relaxed);
+                let mut holder = HOLDER.lock();
+                if holder.as_ref().is_some_and(|h| Arc::ptr_eq(&h.tap, &tp)) {
+                    *holder = None;
+                }
+                drop(holder);
+                if let Err(e) = out {
                     log::warn!("camera: {e}");
                     *err.lock() = Some(e.to_string());
                 }
             })
             .ok();
-        Capture { stop, source, preview, background, error }
+        Capture { stop, source, preview, background, error, tap }
     }
 
     pub fn set_background(&self, bg: Background) {
@@ -416,14 +500,29 @@ fn run(
     preview: Arc<FrameSlot>,
     stop: Arc<AtomicBool>,
     background: Arc<Mutex<Background>>,
+    tap: &Arc<Tap>,
+    give_up: Option<&Arc<AtomicBool>>,
 ) -> anyhow::Result<()> {
     let Some(_device) = DEVICE.try_lock_for(Duration::from_secs(5)) else {
         anyhow::bail!(tr!("The camera is still in use.", "A câmera ainda está em uso."));
     };
-    if stop.load(Ordering::Relaxed) {
+    let given_up = || give_up.is_some_and(|g| g.load(Ordering::Relaxed));
+    if stop.load(Ordering::Relaxed) || given_up() {
         return Ok(());
     }
+    if let Some(give_up) = give_up {
+        let mut holder = HOLDER.lock();
+        // Another capture asked for the camera while this one waited for it.
+        if holder.as_ref().is_some_and(|h| !h.tap.ended.load(Ordering::Relaxed) && !Arc::ptr_eq(&h.tap, tap)) {
+            return Ok(());
+        }
+        *holder = Some(Holder { device: device.to_string(), tap: tap.clone(), lends: true, give_up: give_up.clone() });
+    }
     let mut cam = open(device)?;
+    // Asked for by id or as "the first one": named now as opened, for a composition to match.
+    if let Some(h) = HOLDER.lock().as_mut().filter(|h| Arc::ptr_eq(&h.tap, tap)) {
+        h.device = cam.info().human_name();
+    }
     let mut converter = Converter::default();
     let mut compositor = Compositor::new();
     let mut masker: Option<Masker> = None;
@@ -436,7 +535,7 @@ fn run(
     let mut meter = Meter::new();
     let started = Instant::now();
     let mut bad = 0u32;
-    while !stop.load(Ordering::Relaxed) {
+    while !stop.load(Ordering::Relaxed) && !given_up() {
         let frame = match cam.frame() {
             Ok(f) => f,
             Err(e) => {
@@ -506,9 +605,10 @@ fn run(
         let mut vf = VideoFrame::new(VideoRotation::VideoRotation0, i420);
         vf.timestamp_us = started.elapsed().as_micros() as i64;
         source.capture_frame(&vf);
+        tap.put(&vf.buffer);
         meter.sent += 1;
         // The encoder only reads the frame, so the preview can be made from it meanwhile.
-        if !video::window_hidden() {
+        if !video::window_hidden() && preview.watched() {
             let frame = meter.time(4, || preview_frame(&vf.buffer, preview.id, &mut frames));
             preview.put(frame);
         }

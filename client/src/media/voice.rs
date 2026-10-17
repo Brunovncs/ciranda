@@ -679,6 +679,7 @@ impl Voice {
             self.stop_camera(cx);
             crate::ui::overlay::toast(trf!("Your camera stopped: {}", "Sua câmera parou: {}", e), cx);
         }
+        self.check_composition(cx);
         self.reconcile(cx);
     }
 

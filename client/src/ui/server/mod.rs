@@ -4,6 +4,7 @@
 mod account;
 mod admin;
 pub mod chat;
+mod composer;
 pub mod emoji_picker;
 mod members;
 mod picker;
@@ -968,6 +969,8 @@ impl ServerView {
             let shared = match choice.source.kind {
                 SourceKind::Screen => Shared::Screen(choice.source.id),
                 SourceKind::Window => Shared::Window(choice.source.id),
+                // A composition is many places at once: its drawings stay on its tiles.
+                SourceKind::Composite => return None,
             };
             Some((share, shared))
         });

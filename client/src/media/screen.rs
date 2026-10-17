@@ -2,6 +2,7 @@
 //! picked, turned into I420 (or NV12) for the encoder, and previewed small (drawn by the GPU). Its
 //! sound comes from `loopback`.
 
+use super::composite::{self, Composition};
 use super::loopback::{self, Loopback};
 use super::rtc::VideoParams;
 use super::video::{self, FrameSlot};
@@ -20,10 +21,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SourceKind {
     Screen,
     Window,
+    /// Several screens, windows and the camera on one canvas (`composite`).
+    Composite,
 }
 
 #[derive(Clone)]
@@ -94,6 +97,9 @@ pub struct ScreenChoice {
     pub fps: u32,
     pub sharp: bool,
     pub sound: Sound,
+    /// What a composite share puts on its canvas, edited while it runs; its source's size is
+    /// the screen the canvas takes its shape from.
+    pub composition: Option<Arc<Composition>>,
 }
 
 impl ScreenChoice {
@@ -117,7 +123,7 @@ impl ScreenChoice {
     }
 }
 
-fn capturer(kind: SourceKind) -> Option<DesktopCapturer> {
+pub(super) fn capturer(kind: SourceKind) -> Option<DesktopCapturer> {
     capturer_with(kind, true)
 }
 
@@ -125,6 +131,7 @@ fn capturer_with(kind: SourceKind, cursor: bool) -> Option<DesktopCapturer> {
     let mut opts = DesktopCapturerOptions::new(match kind {
         SourceKind::Screen => DesktopCaptureSourceType::Screen,
         SourceKind::Window => DesktopCaptureSourceType::Window,
+        SourceKind::Composite => return None,
     });
     opts.set_include_cursor(cursor);
     DesktopCapturer::new(opts)
@@ -137,7 +144,7 @@ pub fn sources(kind: SourceKind) -> Vec<ScreenSource> {
     for (i, src) in list_capturer.get_source_list().into_iter().enumerate() {
         let title = match kind {
             SourceKind::Screen => trf!("Screen {}", "Tela {}", i + 1),
-            SourceKind::Window => src.title(),
+            _ => src.title(),
         };
         if kind == SourceKind::Window && (title.trim().is_empty() || title == "Ciranda") {
             continue;
@@ -277,7 +284,7 @@ impl Staging {
 }
 
 /// A frame for the encoder in the format that costs it least.
-enum EncoderFrame {
+pub(super) enum EncoderFrame {
     I420(I420Buffer),
     Nv12(NV12Buffer),
 }
@@ -417,6 +424,10 @@ impl ScreenCapture {
         }
     }
 
+    pub fn composition(&self) -> Option<Arc<Composition>> {
+        self.choice.lock().composition.clone()
+    }
+
     pub fn stop(&self) {
         if !self.stop.swap(true, Ordering::Relaxed) {
             super::replay::sharing(false);
@@ -446,7 +457,7 @@ fn target_size(c: &ScreenChoice) -> (u32, u32) {
 }
 
 /// The size to send: the source scaled down to the resolution's height, never up, even sides.
-fn fit(sw: u32, sh: u32, r: Resolution) -> (u32, u32) {
+pub(super) fn fit(sw: u32, sh: u32, r: Resolution) -> (u32, u32) {
     let (w, h) = match r.height() {
         Some(th) if sh > th => ((sw as u64 * th as u64 / sh as u64) as u32, th),
         _ => (sw, sh),
@@ -465,6 +476,25 @@ fn run(
     let mut waiting = false;
     let mut replay_scratch = Vec::new();
     'outer: while !stop.load(Ordering::Relaxed) {
+        if choice.source.kind == SourceKind::Composite {
+            // The same source and connection either way: switching between a composition and
+            // a single screen or window renegotiates nothing.
+            let switched = composite::run(
+                choice.clone(),
+                &mut || control.try_recv().ok().map(|Control::Switch(c)| c),
+                &source,
+                &preview,
+                &stop,
+                &|| encoder.lock().load(Ordering::Relaxed),
+            );
+            match switched {
+                Some(next) => {
+                    choice = next;
+                    continue 'outer;
+                }
+                None => return,
+            }
+        }
         let Some(mut c) = capturer(choice.source.kind) else {
             log::warn!("screen capture is unavailable");
             return;
@@ -542,7 +572,7 @@ fn run(
 /// replay says first whether it wants this frame at all, and the scaling and converting are done
 /// straight into its buffer: no picture in between, even from above 1080p. `scratch` is kept by
 /// the caller for chroma on its way from I420.
-fn keep_for_replay(frame: &EncoderFrame, fps: u32, scratch: &mut Vec<u8>) {
+pub(super) fn keep_for_replay(frame: &EncoderFrame, fps: u32, scratch: &mut Vec<u8>) {
     let (fw, fh) = {
         let b = frame.as_ref();
         (b.width(), b.height())
@@ -588,7 +618,7 @@ fn replay_size(w: u32, h: u32) -> (u32, u32) {
 }
 
 /// `w` and `h` scaled down to `max_w` wide at most, keeping the shape.
-fn preview_size(w: u32, h: u32, max_w: u32) -> (u32, u32) {
+pub(super) fn preview_size(w: u32, h: u32, max_w: u32) -> (u32, u32) {
     let tw = max_w.min(w).max(1);
     (tw, (h as u64 * tw as u64 / w.max(1) as u64).max(1) as u32)
 }

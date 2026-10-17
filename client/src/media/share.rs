@@ -4,6 +4,7 @@
 
 use super::audio::Cue;
 use super::camera::{self, Capture};
+use super::composite::{self, Composition};
 use super::rtc::{self, Link, VideoParams};
 use super::screen::{ScreenCapture, ScreenChoice};
 use super::video::{Tile, TileKind};
@@ -64,6 +65,23 @@ impl Voice {
 
     pub fn screen_choice(&self) -> Option<ScreenChoice> {
         self.shares.screen.as_ref().map(|s| s.capture.choice.lock().clone())
+    }
+
+    /// What your composite share shows, while that is what you share.
+    pub fn composition(&self) -> Option<Arc<Composition>> {
+        self.shares.screen.as_ref().and_then(|s| s.capture.composition())
+    }
+
+    /// A composition whose every source has ended (their windows closed) ends the share, as a
+    /// shared window that closes leaves nothing to show.
+    pub(super) fn check_composition(&mut self, cx: &mut Context<Self>) {
+        if self.composition().is_some_and(|c| c.gone()) {
+            self.stop_screen(cx);
+            crate::ui::overlay::toast(
+                tr!("Everything in your composition has closed, so the share ended.", "Tudo o que estava na sua composição fechou, então o compartilhamento terminou."),
+                cx,
+            );
+        }
     }
 
     pub fn start_camera(&mut self, device: &str, background: Background, cx: &mut Context<Self>) {
@@ -137,6 +155,10 @@ impl Voice {
     /// Stops sharing without a sound, for leaving the call; true if there was a share.
     pub(super) fn end_screen(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(mut share) = self.shares.screen.take() else { return false };
+        if let Some(c) = share.capture.composition().filter(|c| !c.gone()) {
+            let layout = composite::saved(&c.layout());
+            crate::prefs::set_prefs(cx, |p| p.composite_layout = layout);
+        }
         share.capture.stop();
         share.out.hang_up();
         self.unpublish(&share.tile, cx);
