@@ -1,6 +1,7 @@
 //! Every HTTP call to the control server and to MediaMTX's WHIP/WHEP endpoints.
 
 use super::types::*;
+use super::upload::{Progress, stoppable};
 use parking_lot::RwLock;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -532,6 +533,97 @@ impl Api {
         self.file(&format!("/api/uploads/{hash}")).await
     }
 
+    /// A stored file saved straight to `path` as it arrives, so a 2 GB one never sits in memory.
+    ///
+    /// Not through the cache: a file being saved is not one being looked at, and a big one would
+    /// push everything else out of it. Written beside `path` first and renamed once it has all
+    /// come and matches its hash, so a download that breaks or is cancelled never leaves half a
+    /// file under the name asked for. `size` is what the message said, for a reply without a length.
+    pub async fn download_to(&self, hash: &str, path: &std::path::Path, size: Option<u64>, progress: &Progress) -> Result<u64> {
+        let part = {
+            let mut name = path.file_name().unwrap_or_default().to_os_string();
+            name.push(".part");
+            path.with_file_name(name)
+        };
+        let got = stoppable(progress, self.download_part(hash, &part, size, progress)).await;
+        match got {
+            Ok(n) => std::fs::rename(&part, path).map(|_| n).map_err(|e| broken_download(e.to_string())),
+            Err(e) => {
+                // A cancel can land while a write still holds the file open, and Windows won't
+                // delete an open file: a few tries, a moment apart.
+                let _ = tokio::task::spawn_blocking(move || {
+                    for _ in 0..20 {
+                        if std::fs::remove_file(&part).is_ok() || !part.exists() {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                })
+                .await;
+                Err(e)
+            }
+        }
+    }
+
+    async fn download_part(&self, hash: &str, part: &std::path::Path, size: Option<u64>, progress: &Progress) -> Result<u64> {
+        use sha2::Digest;
+        let base = self.base();
+        let url = format!("{base}/api/uploads/{hash}");
+        let unreachable = || ApiError::unreachable(&base);
+        let mut res = tokio::time::timeout(STALL, self.authed(self.http.get(url)).send())
+            .await
+            .map_err(|_| unreachable())?
+            .map_err(|_| unreachable())?;
+        let status = res.status().as_u16();
+        if !(200..300).contains(&status) {
+            return Err(ApiError {
+                status,
+                code: ErrorCode::NoSuchFile,
+                message: message_for(ErrorCode::NoSuchFile, status, &Value::Null),
+                body: Value::Null,
+            });
+        }
+        progress.total(res.content_length().or(size).unwrap_or(0));
+        let mut file = Some(std::fs::File::create(part).map_err(|e| broken_download(e.to_string()))?);
+        let mut digest = sha2::Sha256::new();
+        let mut buf = Vec::with_capacity(WRITE_BYTES);
+        let mut received = 0u64;
+        loop {
+            let chunk = tokio::time::timeout(STALL, res.chunk()).await.map_err(|_| unreachable())?.map_err(|_| unreachable())?;
+            let done = chunk.is_none();
+            if let Some(chunk) = chunk {
+                digest.update(&chunk);
+                received += chunk.len() as u64;
+                buf.extend_from_slice(&chunk);
+            }
+            // To the disk a megabyte at a time, on a blocking thread: a disk that is slow or on
+            // the network must not hold up the runtime every other request runs on.
+            if buf.len() >= WRITE_BYTES || (done && !buf.is_empty()) {
+                let (mut f, bytes) = (file.take().expect("file between writes"), std::mem::replace(&mut buf, Vec::with_capacity(WRITE_BYTES)));
+                file = Some(
+                    tokio::task::spawn_blocking(move || {
+                        use std::io::Write;
+                        f.write_all(&bytes).map(|_| f)
+                    })
+                    .await
+                    .map_err(|e| broken_download(e.to_string()))?
+                    .map_err(|e| broken_download(e.to_string()))?,
+                );
+                progress.sent(received);
+            }
+            if done {
+                break;
+            }
+        }
+        // Content-addressed: the name is the hash of the bytes, so a file that arrived damaged
+        // (or cut short by a proxy that says nothing) is caught here rather than opened later.
+        if hex::encode(digest.finalize()) != hash {
+            return Err(broken_download(tr!("it arrived damaged", "chegou corrompido").into()));
+        }
+        drop(file);
+        Ok(received)
+    }
+
     /// The server's picture, which needs no account: the sign-in screen shows it. A server of the
     /// Electron line keeps its one picture at `/api/server/logo` instead.
     pub async fn server_icon(&self, hash: &str) -> Result<(Vec<u8>, String)> {
@@ -708,6 +800,18 @@ pub struct Sealed {
 /// How long a download may go without a byte before it's taken for stalled.
 const STALL: Duration = Duration::from_secs(30);
 
+/// How much of a download saved to disk is held before it is written.
+const WRITE_BYTES: usize = 1 << 20;
+
+fn broken_download(why: String) -> ApiError {
+    ApiError {
+        status: 0,
+        code: ErrorCode::Unknown,
+        message: trf!("The download broke off: {}", "O download foi interrompido: {}", why),
+        body: Value::Null,
+    }
+}
+
 /// How long an upload of `bytes` may take in all: a minute, or longer at 64 KB/s, so a big file
 /// over a slow uplink isn't cut off while it's still going.
 fn transfer_timeout(bytes: usize) -> Duration {
@@ -825,6 +929,56 @@ pub fn friendly(code: ErrorCode, body: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A server on this computer that answers every request with `body`, until the test ends.
+    fn serving(body: Vec<u8>) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut head = Vec::new();
+                let mut byte = [0; 1];
+                while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).is_ok_and(|n| n == 1) {
+                    head.push(byte[0]);
+                }
+                let reply = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                let _ = stream.write_all(reply.as_bytes()).and_then(|_| stream.write_all(&body));
+            }
+        });
+        base
+    }
+
+    #[test]
+    fn a_download_goes_to_disk_whole_or_not_at_all() {
+        use sha2::Digest;
+        let body: Vec<u8> = (0..3 * WRITE_BYTES + 17).map(|i| (i % 251) as u8).collect();
+        let hash = hex::encode(sha2::Sha256::digest(&body));
+        let api = Api::new();
+        api.set_server(&serving(body.clone()), "");
+        let dir = std::env::temp_dir().join(format!("ciranda-download-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (good, bad) = (dir.join("good.bin"), dir.join("bad.bin"));
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+
+        let progress = Progress::default();
+        assert_eq!(rt.block_on(api.download_to(&hash, &good, None, &progress)).unwrap(), body.len() as u64);
+        assert_eq!(std::fs::read(&good).unwrap(), body);
+        assert_eq!(progress.fraction(), 1.);
+
+        // Not the bytes its name promises: nothing is left under the name, nor beside it.
+        let wrong = "0".repeat(64);
+        assert!(rt.block_on(api.download_to(&wrong, &bad, None, &Progress::default())).is_err());
+        assert!(!bad.exists());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "no .part left behind");
+
+        let stopped = Progress::default();
+        stopped.cancel();
+        let got = rt.block_on(api.download_to(&hash, &bad, None, &stopped));
+        assert_eq!(got.unwrap_err().code, ErrorCode::Cancelled);
+        assert!(!bad.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn bases_get_a_scheme_and_lose_trailing_slashes() {

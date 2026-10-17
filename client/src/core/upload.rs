@@ -33,7 +33,8 @@ pub enum Source {
     Disk(PathBuf),
 }
 
-/// How far an upload has got, read by the window while it runs, and the way to stop it.
+/// How far an upload has got, read by the window while it runs, and the way to stop it. A
+/// download saved to disk (`Api::download_to`) is followed the same way.
 #[derive(Default)]
 pub struct Progress {
     sent: AtomicU64,
@@ -60,8 +61,12 @@ impl Progress {
         self.cancelled.load(Ordering::Relaxed)
     }
 
-    fn sent(&self, n: u64) {
+    pub(crate) fn sent(&self, n: u64) {
         self.sent.store(n, Ordering::Relaxed);
+    }
+
+    pub(crate) fn total(&self, n: u64) {
+        self.total.store(n, Ordering::Relaxed);
     }
 }
 
@@ -187,7 +192,7 @@ async fn read_piece(source: Source, offset: u64, len: u64) -> Result<Vec<u8>> {
 }
 
 /// `f`, unless the upload is cancelled first.
-async fn stoppable<T>(progress: &Progress, f: impl Future<Output = Result<T>>) -> Result<T> {
+pub(crate) async fn stoppable<T>(progress: &Progress, f: impl Future<Output = Result<T>>) -> Result<T> {
     if progress.is_cancelled() {
         return Err(cancelled());
     }

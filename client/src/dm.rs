@@ -483,6 +483,7 @@ impl Vault {
             body,
             attachment_hash: m.attachment_hash.clone().filter(|_| private.file.is_some()),
             attachment_name: private.file.as_ref().map(|f| f.name.clone()),
+            attachment_bytes: private.file.as_ref().map(|f| f.size),
             media_type,
             pinned: false,
             edited_at: m.edited_at,

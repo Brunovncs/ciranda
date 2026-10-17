@@ -207,6 +207,15 @@ export function mentionsIn(body, idOf) {
   return { userIds, everyone };
 }
 
+/**
+ * The attachment's size, beside every message read: how a client decides
+ * between showing a file and offering it, since nobody wants a 2 GB video
+ * downloading because it scrolled into view. A subquery rather than a join,
+ * so every message query takes it the same way. The Electron line's servers
+ * send it under the same name.
+ */
+const ATTACHMENT_BYTES = '(SELECT bytes FROM uploads WHERE hash = m.attachment_hash) AS attachment_bytes';
+
 /** A stored file's name as a request may carry it: a sha256 in hex, or nothing. */
 const isHash = (value) => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
 
@@ -271,30 +280,30 @@ export class Chat {
       ),
       deleteMessage: db.prepare('DELETE FROM messages WHERE id = ?'),
       messageById: db.prepare(`
-        SELECT m.*, u.nickname FROM messages m JOIN users u ON u.id = m.user_id
+        SELECT m.*, u.nickname, ${ATTACHMENT_BYTES} FROM messages m JOIN users u ON u.id = m.user_id
         WHERE m.id = ?
       `),
       history: db.prepare(`
-        SELECT m.*, u.nickname FROM messages m JOIN users u ON u.id = m.user_id
+        SELECT m.*, u.nickname, ${ATTACHMENT_BYTES} FROM messages m JOIN users u ON u.id = m.user_id
         WHERE m.channel_id = ? AND m.id < ?
         ORDER BY m.id DESC LIMIT ?
       `),
       pinned: db.prepare(`
-        SELECT m.*, u.nickname FROM messages m JOIN users u ON u.id = m.user_id
+        SELECT m.*, u.nickname, ${ATTACHMENT_BYTES} FROM messages m JOIN users u ON u.id = m.user_id
         WHERE m.channel_id = ? AND m.pinned = 1
         ORDER BY m.id DESC LIMIT 50
       `),
       setPinned: db.prepare('UPDATE messages SET pinned = ? WHERE id = ?'),
 
       searchFts: db.prepare(`
-        SELECT m.*, u.nickname FROM messages_fts f
+        SELECT m.*, u.nickname, ${ATTACHMENT_BYTES} FROM messages_fts f
         JOIN messages m ON m.id = f.rowid
         JOIN users u ON u.id = m.user_id
         WHERE messages_fts MATCH ? AND m.channel_id = ?
         ORDER BY m.id DESC LIMIT ?
       `),
       searchLike: db.prepare(`
-        SELECT m.*, u.nickname FROM messages m JOIN users u ON u.id = m.user_id
+        SELECT m.*, u.nickname, ${ATTACHMENT_BYTES} FROM messages m JOIN users u ON u.id = m.user_id
         WHERE m.channel_id = ?
           AND (m.body LIKE ? ESCAPE '\\' OR u.nickname LIKE ? ESCAPE '\\'
             OR IFNULL(m.media_type, '') LIKE ? ESCAPE '\\')
@@ -1276,6 +1285,7 @@ export const publicMessage = (m, reactions = [], mentions = null, reply = null) 
   body: m.body,
   attachmentHash: m.attachment_hash ?? null,
   attachmentName: m.attachment_name ?? null,
+  attachmentBytes: m.attachment_bytes ?? null,
   mediaType: m.media_type ?? null,
   pinned: Boolean(m.pinned),
   editedAt: m.edited_at ?? null,

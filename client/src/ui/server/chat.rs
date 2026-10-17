@@ -33,6 +33,8 @@ const GROUP_WINDOW_MS: i64 = 5 * 60 * 1000;
 /// on this computer, or any file to a server that doesn't take pieces. Also the most read into
 /// memory to send; a bigger file stays on disk and is read a piece at a time.
 const MAX_UPLOAD: usize = 25 * 1024 * 1024;
+/// The biggest picture loaded and shown in the chat; a bigger one is a file to save, with its size.
+const INLINE_MEDIA: u64 = 64 * 1024 * 1024;
 /// How many older pages a jump to a message not loaded yet will fetch looking for it.
 const JUMP_PAGES: usize = 40;
 
@@ -108,6 +110,9 @@ pub struct ChatView {
     uploading: Option<Sending>,
     /// Draws the box again while a file goes up, so its bar moves.
     upload_tick: Task<()>,
+    /// Attachments being saved to disk, by hash, and what draws their cards again meanwhile.
+    saving: HashMap<String, Arc<Progress>>,
+    save_tick: Task<()>,
     sending: bool,
     mode: Option<Mode>,
     /// What was in the box when an edit took it over, put back when the edit is done.
@@ -188,6 +193,8 @@ impl ChatView {
             pending: None,
             uploading: None,
             upload_tick: Task::ready(()),
+            saving: HashMap::new(),
+            save_tick: Task::ready(()),
             sending: false,
             mode: None,
             draft: None,
@@ -432,9 +439,9 @@ impl ChatView {
         overlay::toast(trf!("Files can be up to {}.", "Os arquivos podem ter até {}.", max), cx);
     }
 
-    /// A send is on its way: its answer needs this pane to come back to.
+    /// A send is on its way, or a download: its answer needs this pane to come back to.
     pub fn busy(&self) -> bool {
-        self.sending
+        self.sending || !self.saving.is_empty()
     }
 
     /// What is being written here, taken out for the window to keep while this pane is let go.
@@ -1145,9 +1152,20 @@ impl ChatView {
         self.session.update(cx, |s, cx| s.call(cx, move |api| Box::pin(async move { api.pin(id, pinned).await }), |_, _, _| {}));
     }
 
-    fn save_attachment(&mut self, hash: String, name: String, how: Fetch, cx: &mut Context<Self>) {
+    /// Saves an attachment where you choose. A channel's file streams straight to disk with its
+    /// progress on its card, unless a copy is already kept here (a picture on screen); a private
+    /// conversation's is sealed in one piece, so it can only be opened once all of it has come,
+    /// and is saved whole as before. `size` is what the message says, if it says.
+    fn save_attachment(&mut self, hash: String, name: String, how: Fetch, size: Option<u64>, cx: &mut Context<Self>) {
+        if self.saving.contains_key(&hash) {
+            return;
+        }
         let dir = dirs::download_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
         let target = cx.prompt_for_new_path(&dir, Some(&name));
+        if let Fetch::Public = how {
+            self.save_public(hash, target, size, cx);
+            return;
+        }
         let bytes = self.session.read(cx).attachment(&hash, how);
         cx.spawn(async move |_, cx| {
             let Ok(Ok(Some(path))) = target.await else { return };
@@ -1163,6 +1181,73 @@ impl ChatView {
             });
         })
         .detach();
+    }
+
+    fn save_public(
+        &mut self,
+        hash: String,
+        target: futures::channel::oneshot::Receiver<anyhow::Result<Option<std::path::PathBuf>>>,
+        size: Option<u64>,
+        cx: &mut Context<Self>,
+    ) {
+        let (api, cache) = {
+            let s = self.session.read(cx);
+            (s.api.clone(), s.cache.clone())
+        };
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(path))) = target.await else { return };
+            let progress = Arc::new(Progress::default());
+            let (h, p) = (hash.clone(), progress.clone());
+            let started = this.update(cx, |this, cx| {
+                this.saving.insert(h, p);
+                this.save_tick = cx.spawn(async move |this, cx| {
+                    loop {
+                        cx.background_executor().timer(Duration::from_millis(250)).await;
+                        match this.update(cx, |this, cx| {
+                            cx.notify();
+                            !this.saving.is_empty()
+                        }) {
+                            Ok(true) => {}
+                            _ => break,
+                        }
+                    }
+                });
+                cx.notify();
+            });
+            if started.is_err() {
+                return;
+            }
+            let h = hash.clone();
+            // None: you stopped it.
+            let result: Result<(), Option<String>> = core::run(async move {
+                // Already kept here, a picture on screen say: written from that copy.
+                if let Some((bytes, _)) = cache.read(&h) {
+                    return std::fs::write(&path, bytes.as_slice()).map_err(|e| Some(e.to_string()));
+                }
+                api.download_to(&h, &path, size, &progress)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| (e.code != ErrorCode::Cancelled).then_some(e.message))
+            })
+            .await;
+            let _ = this.update(cx, |this, cx| {
+                this.saving.remove(&hash);
+                match result {
+                    Ok(()) => overlay::toast(tr!("Saved.", "Salvo."), cx),
+                    Err(None) => overlay::toast(tr!("Download cancelled.", "Download cancelado."), cx),
+                    Err(Some(e)) => overlay::toast(trf!("Could not save it: {}", "Não foi possível salvar: {}", e), cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn cancel_save(&mut self, hash: &str, cx: &mut Context<Self>) {
+        if let Some(p) = self.saving.get(hash) {
+            p.cancel();
+        }
+        cx.notify();
     }
 
     /// Swaps the file on one of your messages for another.
@@ -1613,7 +1698,11 @@ impl ChatView {
         let hash = m.attachment_hash.clone()?;
         let name = m.attachment_name.clone().unwrap_or_else(|| tr!("attachment", "anexo").into());
         let how = Fetch::of(m);
-        if m.media_type == Some(MediaType::Image) {
+        let file = FileCard { id: m.id, size: m.attachment_bytes, saving: self.saving.get(&hash).cloned() };
+        // A picture too big to be worth loading because it scrolled into view is offered as a
+        // file instead, with its size.
+        let inline = !m.attachment_bytes.is_some_and(|n| n > INLINE_MEDIA);
+        if m.media_type == Some(MediaType::Image) && inline {
             let pic = self.session.update(cx, |s, cx| s.picture_from(&hash, how.clone(), cx));
             return Some(match pic {
                 Picture::Ready(image) => {
@@ -1639,7 +1728,7 @@ impl ChatView {
                         .into_any_element()
                 }
                 Picture::Loading => div().w(px(240.)).h(px(160.)).rounded(px(radius::CARD)).bg(t.layer).into_any_element(),
-                Picture::Failed => file_card(m.id, &name, &hash, how, t, cx),
+                Picture::Failed => file_card(file, &name, &hash, how, t, cx),
             });
         }
         // Swapping the file is a channel's: a sealed message would have to be sealed again.
@@ -1650,7 +1739,7 @@ impl ChatView {
                 .flex()
                 .items_center()
                 .gap(px(6.))
-                .child(file_card(m.id, &name, &hash, how, t, cx))
+                .child(file_card(file, &name, &hash, how, t, cx))
                 .when(mine, |d| {
                     d.child(
                         icon_button(("replace", m.id as u64), "paperclip", t)
@@ -2428,8 +2517,41 @@ pub fn empty_state(glyph: &'static str, heading: &str, text: &str, t: &Theme) ->
     )
 }
 
-fn file_card(id: MessageId, name: &str, hash: &str, how: Fetch, t: &Theme, cx: &mut Context<ChatView>) -> AnyElement {
+/// What a file's card shows beside its name: its size, when the server said, and how far saving
+/// it has got, while it saves.
+struct FileCard {
+    id: MessageId,
+    size: Option<u64>,
+    saving: Option<Arc<Progress>>,
+}
+
+fn file_card(card: FileCard, name: &str, hash: &str, how: Fetch, t: &Theme, cx: &mut Context<ChatView>) -> AnyElement {
+    let FileCard { id, size, saving } = card;
     let (h, n) = (hash.to_string(), name.to_string());
+    let fraction = saving.as_ref().map(|p| p.fraction());
+    let stopping = saving.as_ref().is_some_and(|p| p.is_cancelled());
+    let action = match fraction {
+        Some(f) => {
+            let h = h.clone();
+            div()
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .child(mono(if stopping { tr!("Cancelling…", "Cancelando…").to_string() } else { format!("{}%", (f * 100.).floor() as u32) }, t.text3))
+                .when(!stopping, |d| {
+                    d.child(
+                        icon_button(("cancel-save", id as u64), "close", t)
+                            .tooltip(tip(tr!("Cancel the download", "Cancelar o download"), t))
+                            .on_click(cx.listener(move |this, _, _, cx| this.cancel_save(&h, cx))),
+                    )
+                })
+                .into_any_element()
+        }
+        None => icon_button(("save", id as u64), "download", t)
+            .tooltip(tip(tr!("Save", "Salvar"), t))
+            .on_click(cx.listener(move |this, _, _, cx| this.save_attachment(h.clone(), n.clone(), how.clone(), size, cx)))
+            .into_any_element(),
+    };
     div()
         .flex()
         .items_center()
@@ -2445,12 +2567,27 @@ fn file_card(id: MessageId, name: &str, hash: &str, how: Fetch, t: &Theme, cx: &
             16.,
             t.text2,
         )))
-        .child(div().flex_1().min_w(px(0.)).truncate().text_size(px(13.5)).child(name.to_string()))
         .child(
-            icon_button(("save", id as u64), "download", t)
-                .tooltip(tip(tr!("Save", "Salvar"), t))
-                .on_click(cx.listener(move |this, _, _, cx| this.save_attachment(h.clone(), n.clone(), how.clone(), cx))),
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(3.))
+                .flex_1()
+                .min_w(px(0.))
+                .child(div().truncate().text_size(px(13.5)).child(name.to_string()))
+                .when_some(size.filter(|_| fraction.is_none()), |d, n| d.child(mono(human_size(n), t.text3)))
+                .when_some(fraction, |d, f| {
+                    d.child(
+                        div()
+                            .h(px(4.))
+                            .my(px(3.))
+                            .rounded(px(2.))
+                            .bg(t.well)
+                            .child(div().h_full().rounded(px(2.)).bg(t.accent).w(gpui::relative(f.max(0.01)))),
+                    )
+                }),
         )
+        .child(action)
         .into_any_element()
 }
 
@@ -2780,7 +2917,7 @@ impl Render for Lightbox {
                     .child(button("lightbox-save", tr!("Save", "Salvar"), Kind::Standard, &t).on_click(cx.listener(|this, _, _, cx| {
                         let (h, n, how) = (this.hash.clone(), this.name.clone(), this.how.clone());
                         if let Some(chat) = this.chat.upgrade() {
-                            chat.update(cx, |c, cx| c.save_attachment(h, n, how, cx));
+                            chat.update(cx, |c, cx| c.save_attachment(h, n, how, None, cx));
                         }
                     })))
                     .child(

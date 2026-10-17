@@ -261,6 +261,10 @@ pub struct Message {
     pub attachment_hash: Option<String>,
     #[serde(default)]
     pub attachment_name: Option<String>,
+    /// The attachment's size, from servers that say it: what decides between showing a picture
+    /// and offering it as a file to save.
+    #[serde(default, deserialize_with = "lenient_opt")]
+    pub attachment_bytes: Option<u64>,
     #[serde(default)]
     pub media_type: Option<MediaType>,
     #[serde(default)]

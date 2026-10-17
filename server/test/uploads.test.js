@@ -484,6 +484,18 @@ describe('over HTTP', () => {
       const back = await fetch(`${BASE}/api/uploads/${done.body.hash}`, { headers: { Authorization: `Bearer ${memberToken}` } });
       assert.deepEqual(Buffer.from(await back.arrayBuffer()), bytes);
       assert.deepEqual(readdirSync(resolve(dataDir, 'uploads', 'incoming')), [], 'nothing left half-arrived');
+
+      // Its size goes with the message, so a client can offer it rather than load it.
+      const channel = (await api('/api/channels', { token: memberToken })).body.channels.find((c) => c.kind === 'text');
+      const posted = await api(`/api/channels/${channel.id}/messages`, {
+        method: 'POST', body: { body: '', attachmentHash: done.body.hash, attachmentName: 'big.mp4' }, token: memberToken,
+      });
+      assert.equal(posted.status, 201, posted.text);
+      assert.equal(posted.body.message.attachmentBytes, bytes.length);
+      const history = await api(`/api/channels/${channel.id}/messages`, { token: memberToken });
+      assert.equal(history.body.messages.find((m) => m.id === posted.body.message.id).attachmentBytes, bytes.length);
+      const plain = await api(`/api/channels/${channel.id}/messages`, { method: 'POST', body: { body: 'no file' }, token: memberToken });
+      assert.equal(plain.body.message.attachmentBytes, null);
     });
 
     it('answers a piece at the wrong place with the right one', async () => {
