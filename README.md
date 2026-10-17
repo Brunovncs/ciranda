@@ -88,7 +88,7 @@ The same release has `ciranda-<version>-windows-arm64-setup.exe` and
 `ciranda-<version>-windows-arm64.exe`, built for Arm processors (Snapdragon and
 the like). They install and update the same way.
 
-### Client (macOS 11 or later, Apple silicon and Intel)
+### Client (macOS 12.3 or later, Apple silicon and Intel)
 
 Download `ciranda-<version>-macos-universal.dmg`, open it and drag Ciranda to
 Applications. Ciranda is not notarized by Apple, so the first launch is blocked:
