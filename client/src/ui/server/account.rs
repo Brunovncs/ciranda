@@ -4,7 +4,7 @@
 use super::ServerView;
 use crate::core::types::{ErrorCode, User};
 use crate::core::{self};
-use crate::prefs::set_prefs;
+use crate::prefs::{prefs, set_prefs};
 use crate::session::Session;
 use crate::ui::overlay::{Ask, toast};
 use gpui::{Context, PathPromptOptions, Task, Window};
@@ -61,15 +61,21 @@ impl ServerView {
     /// sign-in of the account, so this one carries on with the new token it hands back.
     pub fn change_password(&mut self, current: String, password: String, cx: &mut Context<Self>) -> Task<Option<String>> {
         let api = self.session.read(cx).api.clone();
+        let user = self.session.read(cx).me.nickname.clone();
         cx.spawn(async move |_, cx| {
-            let a = api.clone();
-            match core::run(async move { a.change_password(&current, &password).await }).await {
+            let (a, new) = (api.clone(), password.clone());
+            match core::run(async move { a.change_password(&current, &new).await }).await {
                 Ok(token) => {
                     api.set_token(&token);
+                    let url = api.base();
                     cx.update(|cx| {
                         set_prefs(cx, |p| {
                             if !p.session_token.is_empty() {
                                 p.session_token = token;
+                            }
+                            // A kept password is kept as it now is, not as it was.
+                            if !p.account_password(&url, &user).is_empty() {
+                                p.keep_account_password(&url, &user, &password);
                             }
                         })
                     });
@@ -88,10 +94,20 @@ impl ServerView {
     pub fn sign_out(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let session = self.session.clone();
         let root = self.root.clone();
-        let server = session.read(cx).server_name.clone();
+        let s = session.read(cx);
+        let server = s.server_name.clone();
+        let text = if prefs(cx).account_password(&s.api.base(), &s.me.nickname).is_empty() {
+            trf!("You will need your password to get back into {}.", "Você vai precisar da sua senha para entrar de novo em {}.", server)
+        } else {
+            trf!(
+                "Your password stays saved on this computer, so getting back into {} is one click.",
+                "Sua senha continua salva neste computador, então voltar para {} é um clique.",
+                server
+            )
+        };
         Ask::confirm_action(
             tr!("Sign out?", "Sair da conta?"),
-            trf!("You will need your password to get back into {}.", "Você vai precisar da sua senha para entrar de novo em {}.", server),
+            text,
             tr!("Sign out", "Sair da conta"),
             window,
             cx,

@@ -131,6 +131,9 @@ pub struct SavedServer {
     pub password: String,
     pub username: String,
     pub session_token: String,
+    /// Your password on the server, kept only with "Remember me", so that signing out, or a
+    /// sign-in the server let expire, does not mean typing it again. Sealed like the others.
+    pub account_password: String,
     pub name: String,
     /// The picture's upload hash, kept in the media cache; empty for none.
     pub icon: String,
@@ -280,7 +283,19 @@ impl Settings {
         self.saved_servers.insert(to.min(self.saved_servers.len()), s);
     }
 
-    /// Drops a sign-in the server refused.
+    /// The account password kept for that server and name, or "" for none.
+    pub fn account_password(&self, url: &str, username: &str) -> &str {
+        self.saved_server_as(url, username).map_or("", |s| s.account_password.as_str())
+    }
+
+    /// Keeps the account password for a saved server and name, or forgets it with "".
+    pub fn keep_account_password(&mut self, url: &str, username: &str, password: &str) {
+        if let Some(s) = self.saved_servers.iter_mut().find(|s| s.is(url, username)) {
+            s.account_password = password.to_string();
+        }
+    }
+
+    /// Drops a sign-in the server refused. A kept password stays: it is the way back in.
     pub fn forget_token(&mut self, url: &str, username: &str) {
         if let Some(s) = self.saved_servers.iter_mut().find(|s| s.is(url, username)) {
             s.session_token.clear();
@@ -654,10 +669,10 @@ pub struct Store {
 }
 
 /// Visits every secret in the file's shape: the server password and the sign-in, at the top and
-/// in each saved server.
+/// in each saved server, and the account password kept there.
 fn each_secret(map: &mut Map<String, Value>, f: &mut impl FnMut(&mut String)) {
     let mut visit = |m: &mut Map<String, Value>| {
-        for key in ["password", "sessionToken"] {
+        for key in ["password", "sessionToken", "accountPassword"] {
             if let Some(Value::String(s)) = m.get_mut(key) {
                 f(s);
             }
@@ -1052,6 +1067,52 @@ mod tests {
         again.update(|s| s.session_token = "new".into());
         let after: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(after["savedServers"][0]["sessionToken"].as_str().and_then(secret::open).as_deref(), Some("new"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_kept_account_password_is_sealed_outlives_signing_out_and_goes_with_its_server() {
+        let (dir, path) = scratch("account-password", r#"{"theme":"onyx"}"#);
+        let mut store = Store::load_from(path.clone());
+        store.update(|s| {
+            s.remember_server(SavedServer { account_password: "hunter22".into(), ..server("pi.local:8080", "predo", "tok", "Pi") });
+            s.remember_server(server("box:9000", "predo", "tok2", "Box"));
+        });
+        let text = std::fs::read_to_string(&path).unwrap();
+        let back: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(back["savedServers"][0]["accountPassword"].as_str().and_then(secret::open).as_deref(), Some("hunter22"));
+        assert_eq!(back["savedServers"][1]["accountPassword"], "", "none kept, none written");
+        if secret::SEALS {
+            assert!(!text.contains("hunter22"), "{text}");
+        }
+
+        // Read back; signing out and an expired sign-in end the session, not the password.
+        let mut again = Store::load_from(path.clone());
+        assert_eq!(again.values.account_password("http://PI.local:8080/", "predo"), "hunter22");
+        assert_eq!(again.values.account_password("pi.local:8080", "lis"), "", "another name's is not it");
+        again.update(|s| {
+            s.switch_server("pi.local:8080", "predo");
+            s.session_token.clear();
+            s.forget_token("pi.local:8080", "predo");
+        });
+        let v = &Store::load_from(path.clone()).values;
+        assert_eq!((v.saved_servers[0].session_token.as_str(), v.account_password("pi.local:8080", "predo")), ("", "hunter22"));
+
+        // Unticking "Remember me" forgets it; removing the server takes it off the disk.
+        again.update(|s| s.keep_account_password("box:9000", "predo", "other"));
+        again.update(|s| s.keep_account_password("pi.local:8080", "predo", ""));
+        assert_eq!(Store::load_from(path.clone()).values.account_password("pi.local:8080", "predo"), "");
+        let back: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let sealed = back["savedServers"][1]["accountPassword"].as_str().unwrap().to_string();
+        assert_eq!(secret::open(&sealed).as_deref(), Some("other"));
+        again.update(|s| {
+            s.forget_server("box:9000", "predo");
+        });
+        let text = std::fs::read_to_string(&path).unwrap();
+        let back: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(back["savedServers"].as_array().map(Vec::len), Some(1));
+        assert!(!text.contains(&sealed), "{text}");
+        assert_eq!(Store::load_from(path).values.account_password("box:9000", "predo"), "");
         let _ = std::fs::remove_dir_all(dir);
     }
 

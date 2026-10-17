@@ -4,7 +4,7 @@
 
 use crate::core::api::{Api, ApiError, sends_in_the_clear};
 use crate::core::cache::Cache;
-use crate::core::settings::SavedServer;
+use crate::core::settings::{SavedServer, same_server};
 use crate::core::types::{AuthReply, Health, IceServer, User};
 use crate::core::{self};
 use crate::prefs::{prefs, set_prefs};
@@ -92,6 +92,10 @@ impl ConnectView {
                     if f == this.server || f == this.door {
                         this.probe(cx);
                     }
+                    // Another server or name: the password kept for that one, if any.
+                    if f == this.server || f == this.nickname {
+                        this.restore_password(cx);
+                    }
                     cx.notify();
                 }
             })
@@ -128,13 +132,15 @@ impl ConnectView {
         };
         let first = if p.server_url.is_empty() {
             this.server.clone()
-        } else if p.username.is_empty() {
+        } else if p.username.is_empty() || saved_token {
             this.nickname.clone()
         } else {
             this.password.clone()
         };
         first.focus_handle(cx).focus(window, cx);
         this.probe(cx);
+        // After signing out, or a kept sign-in the server let expire.
+        this.restore_password(cx);
         // Remembered on this computer: go straight in, as a chat app does.
         if this.error.is_none() && saved_token && !p.server_url.is_empty() {
             let saved = p.saved_server(&p.server_url);
@@ -168,13 +174,63 @@ impl ConnectView {
         f.read(cx).text().trim().to_string()
     }
 
+    /// The name as the server knows it.
+    fn nickname(&self, cx: &Context<Self>) -> String {
+        self.text(&self.nickname, cx).to_lowercase().split_whitespace().collect()
+    }
+
+    /// The kept sign-in is the one for the server and name in the form, so there is no password
+    /// to type: change either and there is.
+    fn signed_in(&self, cx: &Context<Self>) -> bool {
+        let p = prefs(cx);
+        self.saved_token
+            && self.mode == Mode::SignIn
+            && self.nickname(cx) == p.username
+            && same_server(&self.text(&self.server, cx), &p.server_url)
+    }
+
+    /// Puts the password kept for this server and name in the box, so signing in again is a
+    /// click: signing out ends the sign-in, not the password you asked to have remembered. Never
+    /// over something typed; one filled in for another name gives way to this one's, or to none.
+    fn restore_password(&mut self, cx: &mut Context<Self>) {
+        if self.signed_in(cx) || self.mode != Mode::SignIn {
+            return;
+        }
+        let kept = prefs(cx).account_password(&self.text(&self.server, cx), &self.nickname(cx)).to_string();
+        let field = self.password.read(cx);
+        if field.text().is_empty() || field.is_saved() {
+            self.password.update(cx, |f, cx| f.set_saved_text(&kept, cx));
+        }
+    }
+
+    /// The box holds a kept password as it was filled in.
+    fn password_is_kept(&self, cx: &Context<Self>) -> bool {
+        self.password.read(cx).is_saved()
+    }
+
+    /// Unticking "Remember me" forgets the password kept for this server and name straight away,
+    /// as it does the sign-in at the next one.
+    fn set_remember(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.remember = on;
+        if !on {
+            let (server, nickname) = (self.text(&self.server, cx), self.nickname(cx));
+            if !prefs(cx).account_password(&server, &nickname).is_empty() {
+                set_prefs(cx, |p| p.keep_account_password(&server, &nickname, ""));
+            }
+            if self.password_is_kept(cx) {
+                self.password.update(cx, |f, cx| f.set_saved_text("", cx));
+            }
+        }
+        cx.notify();
+    }
+
     fn connect(&mut self, cx: &mut Context<Self>) {
         if self.busy {
             return;
         }
         let server = self.text(&self.server, cx);
         let door = self.door.read(cx).text();
-        let nickname = self.text(&self.nickname, cx).to_lowercase().split_whitespace().collect::<String>();
+        let nickname = self.nickname(cx);
         let password = self.password.read(cx).text();
         let confirm = self.confirm.read(cx).text();
         let owner_key = self.text(&self.owner_key, cx);
@@ -206,8 +262,7 @@ impl ConnectView {
         api.set_server(&server, &door);
         cx.spawn(async move |this, cx| {
             let result = core::run({
-                let api = api.clone();
-                let nickname = nickname.clone();
+                let (api, nickname, password) = (api.clone(), nickname.clone(), password.clone());
                 async move { sign_in(&api, mode, &nickname, &password, &owner_key, token).await }
             })
             .await;
@@ -215,7 +270,7 @@ impl ConnectView {
                 this.busy = false;
                 match result {
                     Ok(done) => {
-                        let connected = finish(done, api, &server, &door, &nickname, remember, cx);
+                        let connected = finish(done, api, &server, &door, &nickname, &password, remember, cx);
                         let wait = if this.resuming.is_some() { LOADING_AT_LEAST.saturating_sub(this.resuming_since.elapsed()) } else { Duration::ZERO };
                         if wait.is_zero() {
                             cx.emit(ConnectEvent::Connected(connected));
@@ -239,6 +294,7 @@ impl ConnectView {
                         if expired {
                             this.saved_token = false;
                             set_prefs(cx, |s| s.forget_token(&server, &nickname));
+                            this.restore_password(cx);
                         }
                         this.error = Some(message);
                     }
@@ -262,6 +318,7 @@ impl ConnectView {
     fn forget(&mut self, cx: &mut Context<Self>) {
         set_prefs(cx, |s| s.session_token.clear());
         self.saved_token = false;
+        self.restore_password(cx);
         cx.notify();
     }
 }
@@ -287,16 +344,24 @@ fn no_accounts(health: &Option<Health>) -> bool {
     health.as_ref().is_some_and(|h| h.has_accounts == Some(false))
 }
 
-/// Keeps the server and the sign-in, passes on what the server wanted said, and hands over what
-/// the session starts from.
-fn finish(done: Done, api: Api, server: &str, door: &str, nickname: &str, remember: bool, cx: &mut App) -> Box<Connected> {
+/// Keeps the server and the sign-in, and with "Remember me" the password it took (or the one kept
+/// before, when the kept sign-in did it); passes on what the server wanted said, and hands over
+/// what the session starts from.
+#[allow(clippy::too_many_arguments)]
+fn finish(done: Done, api: Api, server: &str, door: &str, nickname: &str, password: &str, remember: bool, cx: &mut App) -> Box<Connected> {
     set_prefs(cx, |s| {
+        let account_password = match (remember, password.is_empty()) {
+            (false, _) => String::new(),
+            (true, false) => password.to_string(),
+            (true, true) => s.account_password(server, nickname).to_string(),
+        };
         s.remember_account = remember;
         s.remember_server(SavedServer {
             url: server.into(),
             password: door.into(),
             username: nickname.into(),
             session_token: if remember { done.token.clone() } else { String::new() },
+            account_password,
             name: done.server_name.clone(),
             icon: done.server_icon.clone().unwrap_or_default(),
         });
@@ -429,6 +494,23 @@ async fn sign_in(api: &Api, mode: Mode, nickname: &str, password: &str, owner_ke
     Ok(Done { user, token, server_name, server_icon: health.icon_hash().cloned(), ice_servers, notes })
 }
 
+/// The password box while a kept sign-in is there: drawn as a saved password, a row of dots, and
+/// read-only, since a password typed there would not be used. No password is behind the dots.
+fn saved_password(t: &Theme) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .px(px(12.))
+        .py(px(8.))
+        .rounded(px(radius::CONTROL))
+        .border_1()
+        .border_color(t.stroke)
+        .bg(t.control)
+        .child(div().flex_1().min_w(px(0.)).child(body("•".repeat(10), t.text2)))
+        .child(caption(tr!("Saved", "Salva"), t.text3))
+}
+
 /// Said wherever a password is about to cross the internet over plain HTTP.
 pub fn clear_text_warning(t: &Theme) -> gpui::Div {
     div()
@@ -466,7 +548,7 @@ impl Render for ConnectView {
         let register = self.mode == Mode::Register;
         let needs_owner = self.health.as_ref().is_some_and(|h| h.needs_owner);
         let door_needed = self.health.as_ref().map(|h| h.password_required);
-        let saved = self.saved_token && self.mode == Mode::SignIn;
+        let saved = self.signed_in(cx);
         let field = |label_text: &'static str, f: &Entity<TextField>, t: &Theme| {
             div().flex().flex_col().gap(px(6.)).child(label(label_text, t)).child(f.clone())
         };
@@ -502,7 +584,10 @@ impl Render for ConnectView {
                             .flex_1()
                             .gap(px(14.))
                             .child(field(tr!("Username", "Nome de usuário"), &self.nickname, &t))
-                            .child(field(tr!("Password", "Senha"), &self.password, &t))
+                            .when(!saved, |d| d.child(field(tr!("Password", "Senha"), &self.password, &t)))
+                            .when(saved, |d| {
+                                d.child(div().flex().flex_col().gap(px(6.)).child(label(tr!("Password", "Senha"), &t)).child(saved_password(&t)))
+                            })
                             .when(register, |d| d.child(field(tr!("Confirm password", "Confirme a senha"), &self.confirm, &t)))
                             .when(needs_owner, |d| d.child(field(tr!("Owner key", "Chave de dono"), &self.owner_key, &t))),
                     ),
@@ -527,17 +612,13 @@ impl Render for ConnectView {
                     .child(switch(self.remember, &t))
                     .child(body(tr!("Remember me on this computer", "Lembrar de mim neste computador"), t.text2))
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.remember = !this.remember;
-                        cx.notify();
+                        let on = !this.remember;
+                        this.set_remember(on, cx);
                     })),
             )
             .when(saved, |d| {
                 d.child(caption(
-                    trf!(
-                        "Signed in as {}. Leave the password empty to continue.",
-                        "Login salvo como {}. Deixe a senha vazia para continuar.",
-                        prefs(cx).username
-                    ),
+                    trf!("Signed in as {}. Connect to continue.", "Login salvo como {}. Conecte para continuar.", prefs(cx).username),
                     t.text3,
                 ))
             })
@@ -612,6 +693,11 @@ impl Render for ConnectView {
                                 } else {
                                     this.mode = if register { Mode::SignIn } else { Mode::Register };
                                     this.error = None;
+                                    // A kept password is for signing in, not for a new account.
+                                    if this.mode == Mode::Register && this.password_is_kept(cx) {
+                                        this.password.update(cx, |f, cx| f.set_saved_text("", cx));
+                                    }
+                                    this.restore_password(cx);
                                     cx.notify();
                                 }
                             })),
@@ -850,7 +936,7 @@ impl AddServer {
         api.set_server(&server, &door);
         cx.spawn(async move |this, cx| {
             let result = core::run({
-                let (api, nickname) = (api.clone(), nickname.clone());
+                let (api, nickname, password) = (api.clone(), nickname.clone(), password.clone());
                 async move { sign_in(&api, mode, &nickname, &password, &owner_key, None).await }
             })
             .await;
@@ -859,7 +945,7 @@ impl AddServer {
                 match result {
                     Ok(done) => {
                         let remember = prefs(cx).remember_account;
-                        let connected = finish(done, api, &server, &door, &nickname, remember, cx);
+                        let connected = finish(done, api, &server, &door, &nickname, &password, remember, cx);
                         cx.emit(ConnectEvent::Connected(connected));
                         cx.emit(Dismiss);
                     }

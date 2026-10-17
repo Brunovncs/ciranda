@@ -180,6 +180,9 @@ pub struct TextField {
     masked: bool,
     /// A masked field's text shown as it is, through the eye at its end.
     revealed: bool,
+    /// The text is a password Ciranda filled in, not one typed here: it has no eye, since anyone
+    /// at the computer could read it, and typing replaces it whole rather than editing it.
+    saved: bool,
     layout: Option<Layout>,
     scroll: Point<Pixels>,
     /// Set when the caret moves, so the next frame scrolls it into view; the wheel leaves it.
@@ -212,6 +215,7 @@ impl TextField {
             bare: false,
             masked: false,
             revealed: false,
+            saved: false,
             layout: None,
             scroll: Point::default(),
             reveal: false,
@@ -289,7 +293,20 @@ impl TextField {
         self.buf.replace(0..len, text);
         self.scroll = Point::default();
         self.history = History::default();
+        self.saved = false;
         self.moved(cx);
+    }
+
+    /// Fills a masked field with a kept password (see `saved`); "" empties it.
+    pub fn set_saved_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.set_text(text, cx);
+        self.saved = !text.is_empty();
+        self.revealed = false;
+    }
+
+    /// Still holds what `set_saved_text` put there, untouched.
+    pub fn is_saved(&self) -> bool {
+        self.saved
     }
 
     /// Puts `before` and `after` around the selection, or at the caret, and leaves the caret
@@ -321,12 +338,17 @@ impl TextField {
     }
 
     fn put(&mut self, range: Option<Range<usize>>, new: &str, cx: &mut Context<Self>) {
-        let range = range.unwrap_or_else(|| self.buf.selected.clone());
+        let mut range = range.unwrap_or_else(|| self.buf.selected.clone());
+        // Kept out of the undo history too, or undoing would bring it back with an eye.
+        let saved = std::mem::take(&mut self.saved);
+        if saved {
+            range = 0..self.buf.text.len();
+        }
         if range.is_empty() && new.is_empty() {
             return;
         }
         // A composition being committed was noted when it began.
-        if self.buf.marked.is_none() {
+        if self.buf.marked.is_none() && !saved {
             let kind = match (range.is_empty(), new.chars().count()) {
                 (_, 0) => EditKind::Deleting,
                 (true, 1) => EditKind::Typing,
@@ -752,18 +774,20 @@ impl Render for TextField {
                     .items_center()
                     .gap(spx(8.))
                     .child(div().flex_1().min_w(px(0.)).child(FieldText { field: cx.entity(), colors }))
-                    .child(
-                        div()
-                            .id("reveal")
-                            .flex_none()
-                            .p(spx(2.))
-                            .cursor(CursorStyle::PointingHand)
-                            .opacity(0.7)
-                            .hover(|s| s.opacity(1.))
-                            .tooltip(crate::widgets::tip(hint, &t))
-                            .on_mouse_down(MouseButton::Left, cx.listener(Self::toggle_reveal))
-                            .child(crate::widgets::icon(glyph, 16., t.text2)),
-                    )
+                    .when(!self.saved, |d| {
+                        d.child(
+                            div()
+                                .id("reveal")
+                                .flex_none()
+                                .p(spx(2.))
+                                .cursor(CursorStyle::PointingHand)
+                                .opacity(0.7)
+                                .hover(|s| s.opacity(1.))
+                                .tooltip(crate::widgets::tip(hint, &t))
+                                .on_mouse_down(MouseButton::Left, cx.listener(Self::toggle_reveal))
+                                .child(crate::widgets::icon(glyph, 16., t.text2)),
+                        )
+                    })
             })
     }
 }
@@ -810,8 +834,14 @@ impl EntityInputHandler for TextField {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let range = self.buf.range_from_utf16(range_utf16).or_else(|| self.buf.marked.clone()).unwrap_or_else(|| self.buf.selected.clone());
-        if self.buf.marked.is_none() {
+        let mut range =
+            self.buf.range_from_utf16(range_utf16).or_else(|| self.buf.marked.clone()).unwrap_or_else(|| self.buf.selected.clone());
+        // As in `put`: a kept password goes whole, and out of the history.
+        if std::mem::take(&mut self.saved) {
+            let len = self.buf.text.len();
+            self.buf.replace(0..len, "");
+            range = 0..0;
+        } else if self.buf.marked.is_none() {
             self.history.record(self.snapshot(), EditKind::Other, new);
         }
         self.buf.compose(range, new, new_selected_range_utf16);

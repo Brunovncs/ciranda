@@ -227,7 +227,8 @@ impl Root {
             return;
         }
         let p = prefs(cx);
-        let note = p.session_token.is_empty().then(|| {
+        // With a kept password the box is already filled in: nothing to ask.
+        let note = (p.session_token.is_empty() && p.account_password(url, username).is_empty()).then(|| {
             let name =
                 p.saved_server_as(url, username).map(|s| if s.name.is_empty() { s.host() } else { s.name.clone() }).unwrap_or_default();
             trf!("Type your password to sign back in to {}.", "Digite sua senha para entrar de novo em {}.", name)
