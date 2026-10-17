@@ -150,6 +150,14 @@ export const config = {
   // does not stay logged in forever.
   sessionIdleMs: num(process.env.HARMONY_SESSION_IDLE_MS, 30 * 24 * 60 * 60 * 1000),
 
+  // The bearer token for /ops/*, the admin panel's API on this machine. Unset
+  // means the routes do not exist. See ops.js.
+  opsToken: process.env.HARMONY_OPS_TOKEN ?? '',
+
+  // What build this is, as the deploy knows it -- a git commit, say. Reported
+  // by /ops/status and nowhere else.
+  build: process.env.HARMONY_BUILD || null,
+
   // How long a private call waits for somebody whose connection dropped before
   // it ends. See GRACE_MS in calls.js.
   callGraceMs: num(process.env.HARMONY_CALL_GRACE_MS, 20 * 1000),

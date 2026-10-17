@@ -194,6 +194,22 @@ export class ServerSettings {
     return { passwordRequired: true, restartRequired: this.restartRequired };
   }
 
+  /**
+   * The host changed HARMONY_PASSWORD and wants it live now, not at the next
+   * restart. Empty means no password.
+   *
+   * It puts the environment back in charge, dropping any override the owner
+   * set from the client: the host has just written this value into the env
+   * file, and a stored override would keep winning over that file after
+   * every restart from here on -- the env file saying one thing and the
+   * server doing another, which is the state nobody can debug.
+   */
+  useEnvironmentPassword(raw) {
+    this.#envPassword = String(raw ?? '');
+    this.#meta.delete(DOOR_KEY);
+    return { passwordRequired: this.passwordRequired };
+  }
+
   /** Everything a client is allowed to know. */
   publicView() {
     return {

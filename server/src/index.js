@@ -7,9 +7,10 @@
 //
 // No media touches this process.
 
+import { join } from 'node:path';
 import express from 'express';
 import { config, iceServers, signalingBase, whepUrl, whipUrl } from './config.js';
-import { LoginLimiter, secretsMatch } from './auth.js';
+import { LoginLimiter, newMediaToken, secretsMatch } from './auth.js';
 import { Throttle } from './throttle.js';
 import { MediaMtxMonitor } from './mediamtx-api.js';
 import { Rooms, normalizeUsername, normalizePath } from './rooms.js';
@@ -37,6 +38,7 @@ import { Realtime } from './realtime.js';
 import { claimedMediaKeyAccount, mintMediaKey, verifyMediaKey } from './media-keys.js';
 import { DirectMessages, publicConversation, publicDmMessage } from './dms.js';
 import { mountDirectMessages } from './dm-routes.js';
+import { mountOps } from './ops.js';
 import { Calls } from './calls.js';
 import {
   Chat, Soundpad, Emojis,
@@ -152,6 +154,41 @@ const monitor = new MediaMtxMonitor({
 monitor.on('paths', (paths) => rooms.syncFromPaths(paths));
 monitor.on('down', (err) => console.warn(`[mediamtx] control API unreachable: ${err.message}`));
 monitor.on('up', () => console.log('[mediamtx] control API connected'));
+
+/*
+ * The host's admin panel: see ops.js. Ahead of the CORS headers below, so
+ * that a web page open in a browser on this machine is not invited to call
+ * it, and ahead of the door, which is for members.
+ */
+mountOps(app, {
+  token: config.opsToken,
+  build: config.build,
+  db,
+  dataDir: config.dataDir,
+  dbPath: join(config.dataDir, 'harmony.db'),
+  accounts,
+  metaStore,
+  serverSettings,
+  chat,
+  channels,
+  voice,
+  calls,
+  loginLimiter,
+  realtime: () => realtime,
+  serverView: () => serverView(),
+  removeAccount,
+  /*
+   * The door, changed by the host: config.password follows, and so does the
+   * watch token, which is minted at boot only on a passworded server. Kept
+   * in step here, the legacy watch URLs follow the door at once rather than
+   * after a restart, and restartRequired stays true to what it measures.
+   */
+  setDoorPassword: (password) => {
+    serverSettings.useEnvironmentPassword(password);
+    config.password = password;
+    config.mediaToken = password ? (config.mediaToken || newMediaToken()) : '';
+  },
+});
 
 // The desktop client is not served from a browser origin, but allowing CORS
 // keeps a plain browser usable for the read-only stream list.
@@ -314,7 +351,7 @@ const mediaKeySecret = (user) => `${mediaSecret}:${user.password_hash}`;
  */
 app.get('/api/media/:hash', (req, res) => {
   const user = accounts.byId(claimedMediaKeyAccount(req.query.k));
-  if (!user || verifyMediaKey(mediaKeySecret(user), req.query.k) !== user.id) {
+  if (!user || user.banned_at != null || verifyMediaKey(mediaKeySecret(user), req.query.k) !== user.id) {
     return res.status(401).json({ error: 'bad_media_key', message: 'That media link has expired.' });
   }
   return sendUpload(req, res, { scope: 'private' });
@@ -441,6 +478,11 @@ app.post('/api/accounts/login', async (req, res) => {
     });
   }
   loginLimiter.succeed(nickname);
+  // Only after the right password, so this cannot be used to find out who
+  // is banned.
+  if (user.banned_at != null) {
+    return res.status(403).json({ error: 'banned', message: 'This account is banned from this server.' });
+  }
 
   const becameOwner = req.body?.ownerKey
     ? claimOwner(accounts, metaStore, user.id, req.body.ownerKey)
@@ -638,8 +680,12 @@ app.post('/api/accounts/:id/role', requireRole('owner', 'admin'), (req, res) => 
  * The owner cannot be deleted at all, including by themselves: a server
  * with no owner has no way back short of editing the database by hand.
  */
-app.post('/api/accounts/:id/delete', requireRole('owner'), (req, res) => {
-  const id = Number.parseInt(req.params.id, 10);
+app.post('/api/accounts/:id/delete', requireRole('owner'), (req, res) => (
+  removeAccount(res, Number.parseInt(req.params.id, 10), req.user.nickname)
+));
+
+/** The whole of deleting an account, answered on `res`: see the route above. Shared with ops.js. */
+function removeAccount(res, id, by) {
   const target = accounts.byId(id);
   if (!target) return res.status(404).json({ error: 'no_such_user' });
 
@@ -662,10 +708,10 @@ app.post('/api/accounts/:id/delete', requireRole('owner'), (req, res) => {
   // they wrote, every roster they were in.
   realtime?.broadcast({ type: 'accounts', users: accounts.list().map(publicUser) });
   realtime?.broadcastPresence();
-  console.warn(`[accounts] ${target.nickname} removed by ${req.user.nickname}, `
+  console.warn(`[accounts] ${target.nickname} removed by ${by}, `
     + `${result.messages} messages deleted`);
   return res.json({ ok: true, messages: result.messages });
-});
+}
 
 // ---------------------------------------------------------------------------
 // The server itself

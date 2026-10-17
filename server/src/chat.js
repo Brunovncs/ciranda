@@ -342,6 +342,11 @@ export class Chat {
     return this.#maxBytes;
   }
 
+  /** Free space on the disk the uploads are on, or null where it cannot be asked. */
+  get diskFreeBytes() {
+    return this.#diskFree();
+  }
+
   /** The largest file one upload may be: the owner's choice, from server settings. */
   get maxFileBytes() {
     return this.#maxFileBytes;

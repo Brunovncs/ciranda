@@ -63,6 +63,13 @@ export class Calls {
     return this.#calls.get(Number(conversationId)) ?? null;
   }
 
+  /** How many calls are under way: answered, not merely ringing. */
+  get activeCount() {
+    let n = 0;
+    for (const call of this.#calls.values()) if (call.state === 'active') n += 1;
+    return n;
+  }
+
   /** Every call this person is part of: ringing them, ringing from them, or under way. */
   forUser(userId) {
     return [...this.#calls.values()].filter((c) => c.callerId === userId || c.calleeId === userId);

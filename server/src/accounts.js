@@ -136,17 +136,28 @@ export class Accounts {
       setRole: db.prepare('UPDATE users SET role = ? WHERE id = ?'),
       setDisplayName: db.prepare('UPDATE users SET display_name = ? WHERE id = ?'),
       setAvatar: db.prepare('UPDATE users SET avatar_hash = ? WHERE id = ?'),
+      // Not the banned: to everybody else on the server they are gone, as if
+      // removed, though their row stays to keep the name taken.
       list: db.prepare(
         'SELECT id, nickname, display_name, role, avatar_hash, created_at '
+        + 'FROM users WHERE banned_at IS NULL ORDER BY nickname',
+      ),
+      listAll: db.prepare(
+        'SELECT id, nickname, display_name, role, avatar_hash, created_at, banned_at '
         + 'FROM users ORDER BY nickname',
       ),
+      countBanned: db.prepare('SELECT COUNT(*) AS n FROM users WHERE banned_at IS NOT NULL'),
+      setBanned: db.prepare('UPDATE users SET banned_at = ? WHERE id = ?'),
+      demoteOwners: db.prepare("UPDATE users SET role = 'admin' WHERE role = 'owner' RETURNING id"),
 
       addSession: db.prepare(
         'INSERT INTO sessions (token_hash, user_id, created_at, last_seen) VALUES (?, ?, ?, ?)',
       ),
+      // A banned account's sessions are dropped when it is banned; this is
+      // what still refuses one that slipped in between.
       findSession: db.prepare(
         'SELECT u.*, s.token_hash, s.last_seen AS session_seen FROM sessions s JOIN users u ON u.id = s.user_id '
-        + 'WHERE s.token_hash = ?',
+        + 'WHERE s.token_hash = ? AND u.banned_at IS NULL',
       ),
       touchSession: db.prepare('UPDATE sessions SET last_seen = ? WHERE token_hash = ?'),
       dropSession: db.prepare('DELETE FROM sessions WHERE token_hash = ?'),
@@ -221,6 +232,19 @@ export class Accounts {
 
   list() {
     return this.#q.list.all();
+  }
+
+  /** Every account, the banned included, for the operations API. */
+  listAll() {
+    return this.#q.listAll.all();
+  }
+
+  get count() {
+    return this.#q.count.get().n;
+  }
+
+  get bannedCount() {
+    return this.#q.countBanned.get().n;
   }
 
   /**
@@ -305,6 +329,46 @@ export class Accounts {
     if (!token) return false;
     this.#q.dropSession.run(tokenHash(token));
     return true;
+  }
+
+  /** Sign somebody out everywhere. They can sign straight back in. */
+  endSessions(userId) {
+    this.#q.dropUserSessions.run(userId);
+  }
+
+  /**
+   * Keep somebody out: no signing in, no session. The row stays, so the
+   * nickname cannot be registered again by the same person under it.
+   *
+   * The owner cannot be banned, for the reason the owner cannot be removed.
+   */
+  ban(userId) {
+    const user = this.#q.byId.get(userId);
+    if (!user) return { ok: false, error: 'no_such_user' };
+    if (user.role === 'owner') return { ok: false, error: 'cannot_ban_owner' };
+    // Banning twice keeps the first date: that is when it happened.
+    if (user.banned_at == null) this.#q.setBanned.run(Date.now(), userId);
+    this.#q.dropUserSessions.run(userId);
+    return { ok: true, user: this.#q.byId.get(userId) };
+  }
+
+  unban(userId) {
+    const user = this.#q.byId.get(userId);
+    if (!user) return { ok: false, error: 'no_such_user' };
+    this.#q.setBanned.run(null, userId);
+    return { ok: true, user: this.#q.byId.get(userId) };
+  }
+
+  /**
+   * Make every owner an admin, so the server is waiting to be claimed again.
+   *
+   * Not through setRole, whose whole point is refusing exactly this; the
+   * caller issues the owner key that ends the wait in the same breath.
+   *
+   * @returns {number[]} who was demoted
+   */
+  demoteOwners() {
+    return this.#q.demoteOwners.all().map((r) => r.id);
   }
 
   /** Drop sessions nobody has used in a while. Called on a timer. */
@@ -465,11 +529,7 @@ export function ensureOwnerToken(accounts, metaStore) {
     metaStore.delete('owner_token');
     return null;
   }
-  let token = metaStore.get('owner_token');
-  if (!token) {
-    token = randomBytes(16).toString('base64url');
-    metaStore.set('owner_token', token);
-  }
+  const token = metaStore.get('owner_token') ?? issueOwnerToken(metaStore);
   console.log(`
   ┌──────────────────────────────────────────────────────────────┐
   │  This server has no owner yet.                               │
@@ -483,6 +543,13 @@ export function ensureOwnerToken(accounts, metaStore) {
   │  claim it now.                                               │
   └──────────────────────────────────────────────────────────────┘
 `);
+  return token;
+}
+
+/** A fresh owner string, replacing any there was. */
+export function issueOwnerToken(metaStore) {
+  const token = randomBytes(16).toString('base64url');
+  metaStore.set('owner_token', token);
   return token;
 }
 

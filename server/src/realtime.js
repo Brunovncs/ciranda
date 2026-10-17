@@ -816,6 +816,17 @@ export class Realtime {
     }
   }
 
+  /**
+   * Hang up every socket of somebody's as signed out: their sessions were all
+   * ended (signed out by the host, or banned). Unlike kickUser this does not
+   * say the account is gone, because it is not.
+   */
+  closeUser(userId) {
+    for (const [ws, client] of this.#clients) {
+      if (client.user?.id === userId) this.#endSocket(ws);
+    }
+  }
+
   #endSocket(ws) {
     try { ws.close(4401, 'session ended'); } catch { /* already going */ }
   }

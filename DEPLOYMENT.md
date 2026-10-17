@@ -241,6 +241,8 @@ a shared room password, not a credential that protects anything else.
 | `HARMONY_MAX_LOGIN_ATTEMPTS` | `3` | Wrong passwords allowed before a lockout |
 | `HARMONY_LOCKOUT_MINUTES` | `5,10,30,60` | Escalating lockout ladder, in minutes |
 | `HARMONY_TURN_URL` / `_USERNAME` / `_PASSWORD` | unset | Optional TURN relay — see [When a client still cannot connect](#when-a-client-still-cannot-connect) |
+| `HARMONY_OPS_TOKEN` | unset (off) | Bearer token, 24+ characters, for the `/ops/*` admin API. Answered only to loopback callers sending no `X-Forwarded-For`/`Forwarded`; every other request gets a plain 404 |
+| `HARMONY_BUILD` | unset | The build (a git commit, say) that `GET /ops/status` reports |
 | `MTX_WEBRTCLOCALUDPADDRESS` | `:8189` | UDP media port |
 | `MTX_WEBRTCLOCALTCPADDRESS` | `:8189` | TCP media port (ICE-TCP fallback) |
 

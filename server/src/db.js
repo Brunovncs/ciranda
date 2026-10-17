@@ -474,6 +474,19 @@ export const MIGRATIONS = [
   (db) => {
     db.exec('DELETE FROM messages_fts WHERE rowid NOT IN (SELECT id FROM messages)');
   },
+
+  /*
+   * v16 -- banning an account.
+   *
+   * A mark on the row rather than deleting it, because the row is what keeps
+   * the nickname taken: delete it and the same person registers again a
+   * minute later under the same name. Everything they wrote stays, as it
+   * would for somebody who simply stopped coming. NULL is not banned, which
+   * is every account that already exists.
+   */
+  (db) => {
+    db.exec('ALTER TABLE users ADD COLUMN banned_at INTEGER');
+  },
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;
