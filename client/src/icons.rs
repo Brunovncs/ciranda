@@ -7,7 +7,8 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-fn shapes(name: &str) -> &'static str {
+/// An icon's shapes, without the `<svg>` around them, for pictures drawn elsewhere (`crate::tray`).
+pub fn shapes(name: &str) -> &'static str {
     match name {
         // Pads that play sounds.
         "soundboard" => {

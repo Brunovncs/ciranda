@@ -500,6 +500,7 @@ impl ServerView {
         // The call before is over by now; what listened to it goes.
         self.call_subs = vec![sub, observe];
         crate::ui::game_overlay::set_call(Some((call.clone(), self.session.clone())), cx);
+        crate::ui::tray::set_call(Some(&call), cx);
         self.call = Some(call);
         crate::ui::updates::call_changed(true, cx);
         self.show_stage(cx);
@@ -821,6 +822,7 @@ impl ServerView {
             call.update(cx, |c, cx| c.leave(cx));
             crate::ui::updates::call_changed(false, cx);
             crate::ui::game_overlay::set_call(None, cx);
+            crate::ui::tray::set_call(None, cx);
             crate::ui::ink::board(cx).update(cx, |b, cx| b.set_pen(false, cx));
             cx.defer(|cx| crate::ui::ink::show_on_screen(None, cx));
             if cue && connected {
