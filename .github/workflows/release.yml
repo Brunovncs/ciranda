@@ -9,9 +9,12 @@ name: Release
 # program for both Apple silicon and Intel. Each file has its SHA-256 beside it; the notes are
 # GitHub's list of what changed since the last tag. Nothing is signed by a vendor: SmartScreen
 # warns on first launch, and macOS asks for the app to be opened from its context menu.
+# Run by hand (Actions, "Run workflow") it builds and packages everything for the version in
+# client/Cargo.toml without publishing, to try the packaging before a tag.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 # Only the publishing job may write; the build runs third-party actions and every crate's
 # build script, so it gets a read-only token. Actions are pinned to commits for the same reason.
@@ -29,7 +32,9 @@ jobs:
         id: check
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' client/Cargo.toml | head -1)
-          [ "v$version" = "$GITHUB_REF_NAME" ] || { echo "Tag $GITHUB_REF_NAME does not match version $version in client/Cargo.toml"; exit 1; }
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            [ "v$version" = "$GITHUB_REF_NAME" ] || { echo "Tag $GITHUB_REF_NAME does not match version $version in client/Cargo.toml"; exit 1; }
+          fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
   windows:
@@ -223,6 +228,7 @@ jobs:
 
   publish:
     needs: [version, windows, windows-arm64, linux, macos]
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
       contents: write
