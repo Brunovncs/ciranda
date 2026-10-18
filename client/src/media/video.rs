@@ -1,13 +1,18 @@
 //! Cameras and screens on the stage. Each is a tile: someone else's stream, watched over WHEP
 //! with its sound in the mix (screens only), or your own, previewed from the frames being sent.
-//! Frames stay YUV, as decoders give them, and the window's renderer uploads, converts and scales
-//! them on the GPU, keeping each stream's textures from frame to frame. A tile is its own view,
-//! woken by the frames themselves, so a new frame redraws that tile and nothing that merely
-//! contains it.
+//! Frames stay YUV, as decoders give them, and the GPU converts and scales them as it draws. A
+//! tile is its own view, woken by the frames themselves, so a new frame redraws that tile and
+//! nothing that merely contains it. Whatever a frame needs before it can be drawn is done as it
+//! is put in its slot, on the thread that made it, never on the UI thread.
 //!
-//! Only GPUI's Windows renderer draws YUV (see vendor/GPUI_VENDORED.md); elsewhere each frame a
-//! tile takes is converted to a BGRA picture once, as it arrives, and the previous one is let go
-//! of the window's atlas.
+//! How a frame reaches the GPU depends on the renderer (see vendor/GPUI_VENDORED.md):
+//! - Windows: the frame's planes as they are; the renderer uploads them into textures it keeps
+//!   for each stream.
+//! - macOS: a CoreVideo pixel buffer, which Metal reads where it lies (IOSurface). A hardware
+//!   decoder's (VideoToolbox) is drawn as it comes, with no copy at all; any other frame is
+//!   written into one of its stream's pool in a single pass, as NV12.
+//! - Elsewhere: a BGRA picture through the window's sprite atlas, in buffers reused from frame to
+//!   frame, each let go of the atlas when the next one replaces it.
 
 use super::audio::{self, Source, SourceKind};
 use super::rtc::Track;
@@ -24,6 +29,7 @@ use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TileKind {
@@ -40,11 +46,34 @@ impl TileKind {
     }
 }
 
+/// A frame as the window's renderer draws it (see the module's notes).
+#[derive(Clone)]
+pub struct Shown {
+    #[cfg(windows)]
+    frame: SurfaceFrame,
+    #[cfg(target_os = "macos")]
+    buffer: mac::PixelBuffer,
+    #[cfg(not(any(windows, target_os = "macos")))]
+    image: Arc<gpui::RenderImage>,
+    width: u32,
+    height: u32,
+}
+
+impl Shown {
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+}
+
 /// The newest frame, handed from the decoding thread to the window.
 pub struct FrameSlot {
     /// Names the stream to the renderer, which keeps its textures by it.
     pub id: u64,
-    frame: Mutex<Option<SurfaceFrame>>,
+    frame: Mutex<Option<Shown>>,
     fresh: AtomicBool,
     /// Wakes the tile showing this slot; one pending wake covers any number of frames.
     wake: Mutex<Option<async_channel::Sender<()>>>,
@@ -54,6 +83,16 @@ pub struct FrameSlot {
     /// The size the tile is drawn at, in device pixels; frames much bigger are scaled down to it.
     pub want_w: AtomicU32,
     pub want_h: AtomicU32,
+    /// What fed this slot died while its stream went on: the tile hangs up, so the stream is
+    /// subscribed again rather than left frozen on its last frame.
+    broken: AtomicBool,
+    /// The stream's pixel buffer pool, and room for a mirrored picture's chroma.
+    #[cfg(target_os = "macos")]
+    maker: Mutex<mac::Maker>,
+    /// Pictures the tile has let go of, whose buffers the next frames are written into once
+    /// nothing else holds them.
+    #[cfg(not(any(windows, target_os = "macos")))]
+    retired: Mutex<Vec<Arc<gpui::RenderImage>>>,
 }
 
 impl Default for FrameSlot {
@@ -67,14 +106,46 @@ impl Default for FrameSlot {
             hidden: Arc::default(),
             want_w: AtomicU32::default(),
             want_h: AtomicU32::default(),
+            broken: AtomicBool::default(),
+            #[cfg(target_os = "macos")]
+            maker: Mutex::default(),
+            #[cfg(not(any(windows, target_os = "macos")))]
+            retired: Mutex::default(),
         }
     }
 }
 
+/// Pictures a stream keeps for reuse once its tile let go of them (see `FrameSlot::retired`).
+#[cfg(not(any(windows, target_os = "macos")))]
+const RETIRED: usize = 4;
+
 impl FrameSlot {
+    /// Shows `frame` in the tile watching this slot, readied for the renderer here, on the
+    /// caller's thread.
     pub fn put(&self, frame: SurfaceFrame) {
-        *self.frame.lock() = Some(frame);
+        #[cfg(windows)]
+        let shown = Some(Shown { width: frame.width(), height: frame.height(), frame });
+        #[cfg(not(windows))]
+        let shown = self.make(planes_of(&frame), (frame.width(), frame.height()), frame.is_mirrored());
+        if let Some(shown) = shown {
+            self.show(shown);
+        }
+    }
+
+    fn show(&self, shown: Shown) {
+        // A frame replaced before its tile took it was never drawn.
+        let unseen = self.frame.lock().replace(shown);
         self.fresh.store(true, Ordering::Release);
+        self.wake();
+        #[cfg(not(any(windows, target_os = "macos")))]
+        if let Some(old) = unseen {
+            self.recycle(old.image);
+        }
+        #[cfg(any(windows, target_os = "macos"))]
+        drop(unseen);
+    }
+
+    fn wake(&self) {
         if let Some(wake) = &*self.wake.lock() {
             let _ = wake.try_send(());
         }
@@ -85,8 +156,66 @@ impl FrameSlot {
         self.wake.lock().is_some()
     }
 
-    fn take_fresh(&self) -> Option<SurfaceFrame> {
-        self.fresh.swap(false, Ordering::Acquire).then(|| self.frame.lock().clone()).flatten()
+    /// The newest frame, if it wasn't taken yet. Taken, not copied: the slot holds no frame the
+    /// window has, which on macOS would keep one more of a decoder's buffers from it.
+    fn take_fresh(&self) -> Option<Shown> {
+        self.fresh.swap(false, Ordering::Acquire).then(|| self.frame.lock().take()).flatten()
+    }
+
+    /// What feeds this slot failed; its tile hangs up (see `broken`).
+    fn break_off(&self) {
+        self.broken.store(true, Ordering::Release);
+        self.wake();
+    }
+
+    /// A `w` × `h` frame from `planes` as a pixel buffer of this stream's pool.
+    #[cfg(target_os = "macos")]
+    fn make(&self, planes: yuv::Planes, size: (u32, u32), mirror: bool) -> Option<Shown> {
+        let buffer = self.maker.lock().make(planes, size, mirror)?;
+        Some(Shown { buffer, width: size.0, height: size.1 })
+    }
+
+    /// A `w` × `h` frame from `planes` as a BGRA picture, in a retired picture's buffer if one is
+    /// free.
+    #[cfg(not(any(windows, target_os = "macos")))]
+    fn make(&self, planes: yuv::Planes, (w, h): (u32, u32), mirror: bool) -> Option<Shown> {
+        let len = w as usize * h as usize * 4;
+        let mut px = self.reuse(len).unwrap_or_else(|| vec![0; len]);
+        yuv::to_bgra(planes, (w, h), mirror, &mut px);
+        let img = image::RgbaImage::from_raw(w, h, px).expect("frame size");
+        // Moved in, not `SmallVec::from_elem`, which would copy the picture.
+        let frames: smallvec::SmallVec<[image::Frame; 1]> = smallvec::smallvec![image::Frame::new(img)];
+        let image = Arc::new(gpui::RenderImage::new(frames));
+        Some(Shown { image, width: w, height: h })
+    }
+
+    /// The buffer of a retired picture of `len` bytes that nothing holds any more.
+    #[cfg(not(any(windows, target_os = "macos")))]
+    fn reuse(&self, len: usize) -> Option<Vec<u8>> {
+        let mut retired = self.retired.lock();
+        let i = retired.iter().position(|p| Arc::strong_count(p) == 1 && p.as_bytes(0).is_some_and(|b| b.len() == len))?;
+        let image = Arc::try_unwrap(retired.swap_remove(i)).ok()?;
+        drop(retired);
+        Some(image.into_frames().into_iter().next()?.into_buffer().into_raw())
+    }
+
+    /// Keeps `image`'s buffer for a later frame; the oldest kept goes when there are too many.
+    #[cfg(not(any(windows, target_os = "macos")))]
+    fn recycle(&self, image: Arc<gpui::RenderImage>) {
+        let mut retired = self.retired.lock();
+        retired.push(image);
+        if retired.len() > RETIRED {
+            retired.remove(0);
+        }
+    }
+}
+
+/// A frame's planes, for converting it.
+#[cfg(not(windows))]
+fn planes_of(frame: &SurfaceFrame) -> yuv::Planes<'_> {
+    match frame.format() {
+        SurfaceFormat::I420 => yuv::Planes::I420 { y: frame.plane(0), u: frame.plane(1), v: frame.plane(2) },
+        SurfaceFormat::Nv12 => yuv::Planes::Nv12 { y: frame.plane(0), uv: frame.plane(1) },
     }
 }
 
@@ -202,12 +331,52 @@ pub fn surface_frame(buffer: &dyn VideoBuffer, id: u64, max: (u32, u32), scratch
     scratch.of_i420(id, &buffer.to_i420())
 }
 
+/// A decoded frame readied for `slot`'s tile, where the renderer can't take YUV planes as they
+/// are: written once into what it draws, from the planes where the decoder left them (or scaled
+/// down first, through `scratch`, when much bigger than `max`). On macOS a hardware decoder's
+/// pixel buffer is drawn as it is.
+#[cfg(not(windows))]
+fn shown(buffer: &dyn VideoBuffer, slot: &FrameSlot, max: (u32, u32), scratch: &mut Scratch) -> Option<Shown> {
+    #[cfg(target_os = "macos")]
+    if let Some(native) = buffer.as_native()
+        && let Some(buffer) = mac::PixelBuffer::of_decoder(native.get_cv_pixel_buffer())
+    {
+        let (width, height) = buffer.size();
+        return Some(Shown { buffer, width, height });
+    }
+    let size = (buffer.width(), buffer.height());
+    if shrink_to(size.0, size.1, max).is_some() {
+        let small = surface_frame(buffer, slot.id, max, scratch);
+        return slot.make(planes_of(&small), (small.width(), small.height()), false);
+    }
+    if let Some(b) = buffer.as_i420() {
+        return slot.make(yuv::Planes::of_i420(b), size, false);
+    }
+    if let Some(b) = buffer.as_nv12() {
+        return slot.make(yuv::Planes::of_nv12(b), size, false);
+    }
+    slot.make(yuv::Planes::of_i420(&buffer.to_i420()), size, false)
+}
+
+/// Marks a slot broken if the pump feeding it unwinds. A pump that is stopped (aborted) is
+/// dropped without unwinding, and leaves it be.
+struct Feeding<'a>(&'a FrameSlot);
+
+impl Drop for Feeding<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.break_off();
+        }
+    }
+}
+
 /// Starts feeding a watched track into a tile: video frames into its slot, sound into its source.
 pub fn pump(track: Track, slot: &Arc<FrameSlot>, sound: Option<&Arc<Source>>) -> Option<tokio::task::JoinHandle<()>> {
     match track {
         Track::Video(v) => {
             let slot = slot.clone();
             Some(core::runtime().spawn(async move {
+                let _feeding = Feeding(&slot);
                 let mut stream = NativeVideoStream::new(v);
                 let mut scratch = Scratch::default();
                 while let Some(frame) = stream.next().await {
@@ -219,13 +388,20 @@ pub fn pump(track: Track, slot: &Arc<FrameSlot>, sound: Option<&Arc<Source>>) ->
                     // Off the network runtime's workers. The stream holds only the newest frame
                     // meanwhile, so a slow copy or scale skips frames rather than queueing them.
                     let converted = tokio::task::spawn_blocking(move || {
+                        #[cfg(windows)]
                         into.put(surface_frame(frame.buffer.as_ref(), into.id, want, &mut kept));
+                        #[cfg(not(windows))]
+                        if let Some(shown) = shown(frame.buffer.as_ref(), &into, want, &mut kept) {
+                            into.show(shown);
+                        }
                         kept
                     });
                     match converted.await {
                         Ok(s) => scratch = s,
                         Err(e) => {
-                            log::warn!("video frame conversion failed: {e}");
+                            // Packets still arrive, so the stall check would never notice.
+                            log::warn!("video frame conversion failed: {e}; subscribing again");
+                            slot.break_off();
                             break;
                         }
                     }
@@ -251,10 +427,7 @@ pub struct Tile {
     pub local: bool,
     pub slot: Arc<FrameSlot>,
     /// What is on screen now.
-    pub frame: Option<SurfaceFrame>,
-    /// `frame` as a picture, where the renderer cannot draw YUV.
-    #[cfg(not(windows))]
-    image: Option<Arc<gpui::RenderImage>>,
+    pub frame: Option<Shown>,
     /// The screen's sound, for someone else's screen.
     pub sound: Option<Arc<Source>>,
     /// Someone else's stream: the subscription, which `Voice` keeps alive.
@@ -271,12 +444,20 @@ impl Tile {
         let redraw = cx.spawn(async move |this, cx| {
             loop {
                 let Ok(()) = this.update(cx, |t, cx| {
+                    if t.slot.broken.swap(false, Ordering::Acquire) {
+                        log::info!("{} from slot {}: its video stopped; subscribing again", t.kind.path(), t.mid);
+                        t.watch.hang_up();
+                        t.watch.backoff.fail(Instant::now());
+                        cx.notify();
+                    }
                     if let Some(frame) = t.slot.take_fresh() {
-                        #[cfg(not(windows))]
-                        if let Some(old) = t.image.replace(picture(&frame)) {
-                            cx.drop_image(old, None);
+                        let old = t.frame.replace(frame);
+                        #[cfg(not(any(windows, target_os = "macos")))]
+                        if let Some(old) = old {
+                            retire(&t.slot, old, cx);
                         }
-                        t.frame = Some(frame);
+                        #[cfg(any(windows, target_os = "macos"))]
+                        drop(old);
                         cx.notify();
                     }
                 }) else {
@@ -287,20 +468,15 @@ impl Tile {
                 }
             }
         });
-        Tile {
-            user,
-            mid,
-            kind,
-            local,
-            slot,
-            frame: None,
-            #[cfg(not(windows))]
-            image: None,
-            sound: None,
-            watch: Watch::default(),
-            failed: false,
-            _redraw: redraw,
-        }
+        // A tile dropped without being closed lets go of its picture too.
+        #[cfg(not(any(windows, target_os = "macos")))]
+        cx.on_release(|t: &mut Tile, cx| {
+            if let Some(old) = t.frame.take() {
+                retire(&t.slot, old, cx);
+            }
+        })
+        .detach();
+        Tile { user, mid, kind, local, slot, frame: None, sound: None, watch: Watch::default(), failed: false, _redraw: redraw }
     }
 
     /// A tile showing your own camera or screen, from the frames being published.
@@ -337,11 +513,13 @@ impl Tile {
         if let Some(s) = self.sound.take() {
             audio::audio().mixer.remove(&s);
         }
-        self.frame = None;
-        #[cfg(not(windows))]
-        if let Some(old) = self.image.take() {
-            cx.drop_image(old, None);
+        let old = self.frame.take();
+        #[cfg(not(any(windows, target_os = "macos")))]
+        if let Some(old) = old {
+            retire(&self.slot, old, cx);
         }
+        #[cfg(any(windows, target_os = "macos"))]
+        drop(old);
         *self.slot.wake.lock() = None;
         self._redraw = Task::ready(());
         cx.notify();
@@ -352,42 +530,27 @@ impl Tile {
     /// The frame on screen now, filling the space it is given with its shape kept and its corners
     /// rounded by `radius`.
     pub fn picture(&self, radius: Pixels) -> Option<AnyElement> {
-        use gpui::{ObjectFit, Styled};
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         use gpui::StyledImage;
+        use gpui::{ObjectFit, Styled};
+        let shown = self.frame.as_ref()?;
         #[cfg(windows)]
-        let el = gpui::surface(self.frame.clone()?);
-        #[cfg(not(windows))]
-        let el = gpui::img(self.image.clone()?);
+        let el = gpui::surface(shown.frame.clone());
+        #[cfg(target_os = "macos")]
+        let el = gpui::surface(shown.buffer.source());
+        #[cfg(not(any(windows, target_os = "macos")))]
+        let el = gpui::img(shown.image.clone());
         Some(gpui::IntoElement::into_any_element(el.size_full().rounded(radius).object_fit(ObjectFit::Contain)))
     }
 }
 
-/// `frame` as the BGRA picture GPUI draws, mirrored if the frame is.
-#[cfg(not(windows))]
-fn picture(frame: &SurfaceFrame) -> Arc<gpui::RenderImage> {
-    use libwebrtc::native::yuv_helper;
-    let (w, h) = (frame.width(), frame.height());
-    let mut px = vec![0u8; w as usize * h as usize * 4];
-    let (y, sy) = frame.plane(0);
-    match frame.format() {
-        SurfaceFormat::I420 => {
-            let ((u, su), (v, sv)) = (frame.plane(1), frame.plane(2));
-            yuv_helper::i420_to_argb(y, sy as u32, u, su as u32, v, sv as u32, &mut px, w * 4, w as i32, h as i32);
-        }
-        SurfaceFormat::Nv12 => {
-            let (uv, suv) = frame.plane(1);
-            yuv_helper::nv12_to_argb(y, sy as u32, uv, suv as u32, &mut px, w * 4, w as i32, h as i32);
-        }
-    }
-    if frame.is_mirrored() {
-        for row in px.chunks_exact_mut(w as usize * 4) {
-            let (pixels, _) = row.as_chunks_mut::<4>();
-            pixels.reverse();
-        }
-    }
-    let img = image::RgbaImage::from_raw(w, h, px).expect("frame size");
-    Arc::new(gpui::RenderImage::new(smallvec::SmallVec::from_elem(image::Frame::new(img), 1)))
+/// Lets go of a picture the tile no longer shows: out of every window's atlas (after the current
+/// update, when no window is lent out and so skipped) and its buffer back to the slot for reuse.
+#[cfg(not(any(windows, target_os = "macos")))]
+fn retire(slot: &FrameSlot, old: Shown, cx: &mut App) {
+    let image = old.image.clone();
+    cx.defer(move |cx| cx.drop_image(image, None));
+    slot.recycle(old.image);
 }
 
 /// Tiles the person closed, by (user, kind); they stay closed until that stream ends.
@@ -434,6 +597,258 @@ pub fn sync_tiles(voice: &mut Voice, roster: &[Member], me: UserId, cx: &mut Con
             continue;
         }
         voice.tiles.push(Tile::remote(user, mid, kind, voice.streams_hidden.clone(), cx));
+    }
+}
+
+/// CoreVideo pixel buffers, which Metal reads where they lie: declared here, as the parts used are
+/// few, plain C and in frameworks GPUI links already.
+#[cfg(target_os = "macos")]
+mod mac {
+    use super::yuv;
+    use std::ffi::c_void;
+    use std::ptr::{self, NonNull};
+
+    type CFTypeRef = *const c_void;
+    type CVReturn = i32;
+
+    /// `kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange`: NV12, luma 16-235, what the frames the
+    /// client makes are (BT.601, as libyuv converts).
+    const VIDEO_RANGE: u32 = u32::from_be_bytes(*b"420v");
+    /// `kCVPixelFormatType_420YpCbCr8BiPlanarFullRange`: NV12, luma 0-255, what VideoToolbox
+    /// decodes into for WebRTC.
+    const FULL_RANGE: u32 = u32::from_be_bytes(*b"420f");
+    /// `kCFNumberSInt32Type`.
+    const SINT32: isize = 3;
+
+    /// A CoreFoundation struct only ever passed by address.
+    #[repr(C)]
+    struct Opaque {
+        _private: [u8; 0],
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        static kCFTypeDictionaryKeyCallBacks: Opaque;
+        static kCFTypeDictionaryValueCallBacks: Opaque;
+        static kCFBooleanTrue: CFTypeRef;
+        fn CFDictionaryCreate(
+            allocator: CFTypeRef,
+            keys: *const CFTypeRef,
+            values: *const CFTypeRef,
+            count: isize,
+            key_callbacks: *const Opaque,
+            value_callbacks: *const Opaque,
+        ) -> CFTypeRef;
+        fn CFNumberCreate(allocator: CFTypeRef, kind: isize, value: *const c_void) -> CFTypeRef;
+        fn CFRelease(cf: CFTypeRef);
+    }
+
+    #[link(name = "CoreVideo", kind = "framework")]
+    unsafe extern "C" {
+        static kCVPixelBufferPixelFormatTypeKey: CFTypeRef;
+        static kCVPixelBufferWidthKey: CFTypeRef;
+        static kCVPixelBufferHeightKey: CFTypeRef;
+        static kCVPixelBufferIOSurfacePropertiesKey: CFTypeRef;
+        static kCVPixelBufferMetalCompatibilityKey: CFTypeRef;
+        fn CVPixelBufferPoolCreate(
+            allocator: CFTypeRef,
+            pool_attributes: CFTypeRef,
+            buffer_attributes: CFTypeRef,
+            pool: *mut *mut c_void,
+        ) -> CVReturn;
+        fn CVPixelBufferPoolCreatePixelBuffer(allocator: CFTypeRef, pool: *mut c_void, buffer: *mut *mut c_void) -> CVReturn;
+        fn CVPixelBufferPoolRelease(pool: *mut c_void);
+        fn CVPixelBufferRetain(buffer: *mut c_void) -> *mut c_void;
+        fn CVPixelBufferRelease(buffer: *mut c_void);
+        fn CVPixelBufferGetWidth(buffer: *mut c_void) -> usize;
+        fn CVPixelBufferGetHeight(buffer: *mut c_void) -> usize;
+        fn CVPixelBufferGetPixelFormatType(buffer: *mut c_void) -> u32;
+        fn CVPixelBufferLockBaseAddress(buffer: *mut c_void, flags: u64) -> CVReturn;
+        fn CVPixelBufferUnlockBaseAddress(buffer: *mut c_void, flags: u64) -> CVReturn;
+        fn CVPixelBufferGetBaseAddressOfPlane(buffer: *mut c_void, plane: usize) -> *mut c_void;
+        fn CVPixelBufferGetBytesPerRowOfPlane(buffer: *mut c_void, plane: usize) -> usize;
+        fn CVPixelBufferGetHeightOfPlane(buffer: *mut c_void, plane: usize) -> usize;
+    }
+
+    /// One reference to a bi-planar 4:2:0 pixel buffer, let go of when dropped.
+    pub struct PixelBuffer(NonNull<c_void>);
+
+    // SAFETY: CoreVideo's retain and release may be called from any thread, and a buffer is no
+    // longer written once it is shared.
+    unsafe impl Send for PixelBuffer {}
+    unsafe impl Sync for PixelBuffer {}
+
+    impl Clone for PixelBuffer {
+        fn clone(&self) -> Self {
+            // SAFETY: the buffer is alive while `self` holds it.
+            unsafe { CVPixelBufferRetain(self.0.as_ptr()) };
+            PixelBuffer(self.0)
+        }
+    }
+
+    impl Drop for PixelBuffer {
+        fn drop(&mut self) {
+            // SAFETY: `self` holds one reference.
+            unsafe { CVPixelBufferRelease(self.0.as_ptr()) }
+        }
+    }
+
+    impl PixelBuffer {
+        /// A decoder's buffer (`CVPixelBufferRef`, or null when the frame has none), held as long
+        /// as the window draws it, when the renderer can draw it as it is.
+        pub fn of_decoder(raw: *mut c_void) -> Option<PixelBuffer> {
+            let raw = NonNull::new(raw)?;
+            // SAFETY: a non-null pointer from `NativeBuffer::get_cv_pixel_buffer` is a pixel
+            // buffer the frame holds, alive for this call.
+            let format = unsafe { CVPixelBufferGetPixelFormatType(raw.as_ptr()) };
+            if format != FULL_RANGE && format != VIDEO_RANGE {
+                return None;
+            }
+            // SAFETY: as above; the new reference is the one `PixelBuffer` lets go of.
+            unsafe { CVPixelBufferRetain(raw.as_ptr()) };
+            Some(PixelBuffer(raw))
+        }
+
+        pub fn size(&self) -> (u32, u32) {
+            // SAFETY: the buffer is alive while `self` holds it.
+            unsafe { (CVPixelBufferGetWidth(self.0.as_ptr()) as u32, CVPixelBufferGetHeight(self.0.as_ptr()) as u32) }
+        }
+
+        /// The buffer for a `surface` element, which holds a reference of its own while the
+        /// window draws it.
+        pub fn source(&self) -> gpui::SurfaceSource {
+            // SAFETY: the buffer is alive while `self` holds it, and the reference taken here is
+            // handed over to the source.
+            unsafe { gpui::SurfaceSource::from_cv_pixel_buffer(CVPixelBufferRetain(self.0.as_ptr())) }
+        }
+
+        /// Writes the Y and UV planes, each with its stride, with the buffer locked; false if it
+        /// could not be.
+        fn write(&self, fill: impl FnOnce(&mut [u8], usize, &mut [u8], usize)) -> bool {
+            let raw = self.0.as_ptr();
+            // SAFETY: the buffer is alive and not yet shared; once locked, each plane's base
+            // address holds its height times its bytes per row until it is unlocked.
+            unsafe {
+                if CVPixelBufferLockBaseAddress(raw, 0) != 0 {
+                    return false;
+                }
+                let plane = |i: usize| {
+                    let base = CVPixelBufferGetBaseAddressOfPlane(raw, i).cast::<u8>();
+                    let stride = CVPixelBufferGetBytesPerRowOfPlane(raw, i);
+                    (base, stride, stride * CVPixelBufferGetHeightOfPlane(raw, i))
+                };
+                let ((y, sy, ly), (uv, suv, luv)) = (plane(0), plane(1));
+                let written = !y.is_null() && !uv.is_null();
+                if written {
+                    fill(std::slice::from_raw_parts_mut(y, ly), sy, std::slice::from_raw_parts_mut(uv, luv), suv);
+                }
+                CVPixelBufferUnlockBaseAddress(raw, 0);
+                written
+            }
+        }
+    }
+
+    /// Video-range NV12 pixel buffers of one size, IOSurface-backed so Metal reads them without a
+    /// copy; a buffer goes back to the pool when its last reference does.
+    struct Pool {
+        raw: NonNull<c_void>,
+        size: (u32, u32),
+    }
+
+    // SAFETY: a pool may be used from any thread; `Maker`'s lock keeps it to one at a time.
+    unsafe impl Send for Pool {}
+
+    impl Drop for Pool {
+        fn drop(&mut self) {
+            // SAFETY: `self` holds the reference the pool was created with. Buffers still out
+            // keep what they need.
+            unsafe { CVPixelBufferPoolRelease(self.raw.as_ptr()) }
+        }
+    }
+
+    impl Pool {
+        fn new((w, h): (u32, u32)) -> Result<Pool, CVReturn> {
+            // SAFETY: every object created here is released here once the pool holds what it
+            // needs; the key and callback statics are CoreFoundation's and CoreVideo's own.
+            unsafe {
+                let number = |n: i32| CFNumberCreate(ptr::null(), SINT32, (&raw const n).cast());
+                let dictionary = |keys: &[CFTypeRef], values: &[CFTypeRef]| {
+                    CFDictionaryCreate(
+                        ptr::null(),
+                        keys.as_ptr(),
+                        values.as_ptr(),
+                        keys.len() as isize,
+                        &raw const kCFTypeDictionaryKeyCallBacks,
+                        &raw const kCFTypeDictionaryValueCallBacks,
+                    )
+                };
+                let (format, width, height, surface) =
+                    (number(VIDEO_RANGE as i32), number(w as i32), number(h as i32), dictionary(&[], &[]));
+                let attributes = dictionary(
+                    &[
+                        kCVPixelBufferPixelFormatTypeKey,
+                        kCVPixelBufferWidthKey,
+                        kCVPixelBufferHeightKey,
+                        kCVPixelBufferIOSurfacePropertiesKey,
+                        kCVPixelBufferMetalCompatibilityKey,
+                    ],
+                    &[format, width, height, surface, kCFBooleanTrue],
+                );
+                let mut pool = ptr::null_mut();
+                let status = CVPixelBufferPoolCreate(ptr::null(), ptr::null(), attributes, &mut pool);
+                for object in [format, width, height, surface, attributes] {
+                    CFRelease(object);
+                }
+                match NonNull::new(pool) {
+                    Some(raw) if status == 0 => Ok(Pool { raw, size: (w, h) }),
+                    _ => Err(status),
+                }
+            }
+        }
+
+        fn buffer(&self) -> Result<PixelBuffer, CVReturn> {
+            let mut buffer = ptr::null_mut();
+            // SAFETY: the pool is alive; the buffer comes with the reference `PixelBuffer` holds.
+            let status = unsafe { CVPixelBufferPoolCreatePixelBuffer(ptr::null(), self.raw.as_ptr(), &mut buffer) };
+            match NonNull::new(buffer) {
+                Some(raw) if status == 0 => Ok(PixelBuffer(raw)),
+                _ => Err(status),
+            }
+        }
+    }
+
+    /// Turns one stream's frames into pixel buffers: its pool, made again when the size changes,
+    /// and room for a mirrored picture's chroma.
+    #[derive(Default)]
+    pub struct Maker {
+        pool: Option<Pool>,
+        chroma: Vec<u8>,
+        /// A failure was logged; the stream's frames are dropped without saying so again.
+        failed: bool,
+    }
+
+    impl Maker {
+        /// A `w` × `h` picture from `planes` in one of the pool's buffers, in one pass, flipped
+        /// left to right when `mirror`.
+        pub fn make(&mut self, planes: yuv::Planes, size: (u32, u32), mirror: bool) -> Option<PixelBuffer> {
+            if self.pool.as_ref().is_none_or(|p| p.size != size) {
+                self.pool = None;
+                self.pool = self.log(Pool::new(size), "buffer pool");
+            }
+            let buffer = self.pool.as_ref().map(Pool::buffer)?;
+            let buffer = self.log(buffer, "buffer")?;
+            let chroma = &mut self.chroma;
+            buffer.write(|y, sy, uv, suv| yuv::to_nv12(planes, size, mirror, y, sy, uv, suv, chroma)).then_some(buffer)
+        }
+
+        fn log<T>(&mut self, made: Result<T, CVReturn>, what: &str) -> Option<T> {
+            made.inspect_err(|status| {
+                if !std::mem::replace(&mut self.failed, true) {
+                    log::warn!("no pixel {what} for video frames: CVReturn {status}");
+                }
+            })
+            .ok()
+        }
     }
 }
 
@@ -484,5 +899,62 @@ mod tests {
         let d = surface_frame(&src, 3, (32, 18), &mut scratch);
         assert_eq!((d.width(), d.height()), (32, 18));
         assert!(plane_is(&d, 0, 100) && plane_is(&d, 1, 90) && plane_is(&d, 2, 160));
+    }
+
+    fn grey(w: u32, h: u32, scratch: &mut Scratch) -> SurfaceFrame {
+        scratch.i420(1, w, h, |y, u, v| {
+            y.fill(100);
+            u.fill(128);
+            v.fill(128);
+        })
+    }
+
+    #[test]
+    fn a_slot_hands_over_only_its_newest_frame_and_keeps_none() {
+        let (slot, mut scratch) = (FrameSlot::default(), Scratch::default());
+        let (wake, woken) = async_channel::bounded(1);
+        *slot.wake.lock() = Some(wake);
+        slot.put(grey(64, 36, &mut scratch));
+        slot.put(grey(32, 18, &mut scratch));
+        assert!(woken.try_recv().is_ok(), "one wake for both");
+        let shown = slot.take_fresh().expect("a frame");
+        assert_eq!((shown.width(), shown.height()), (32, 18), "the newest");
+        assert!(slot.take_fresh().is_none(), "taken once");
+        assert!(slot.frame.lock().is_none(), "the slot keeps no frame the tile has");
+    }
+
+    #[test]
+    fn a_pump_that_unwinds_breaks_its_slot_and_a_stopped_one_does_not() {
+        let slot = FrameSlot::default();
+        let (wake, woken) = async_channel::bounded(1);
+        *slot.wake.lock() = Some(wake);
+        drop(Feeding(&slot));
+        assert!(!slot.broken.load(Ordering::Acquire) && woken.try_recv().is_err(), "stopped");
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _feeding = Feeding(&slot);
+            panic!("a bad frame");
+        }));
+        assert!(unwound.is_err());
+        assert!(slot.broken.load(Ordering::Acquire) && woken.try_recv().is_ok(), "broken, and the tile woken to see it");
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    #[test]
+    fn pictures_are_written_into_buffers_the_window_let_go() {
+        let (slot, mut scratch) = (FrameSlot::default(), Scratch::default());
+        slot.put(grey(64, 36, &mut scratch));
+        let first = slot.take_fresh().expect("a frame");
+        let at = first.image.as_bytes(0).expect("pixels").as_ptr();
+        slot.recycle(first.image.clone());
+        slot.put(grey(64, 36, &mut scratch));
+        let second = slot.take_fresh().expect("a frame");
+        assert_ne!(second.image.as_bytes(0).unwrap().as_ptr(), at, "still held by the tile");
+        drop(first);
+        slot.recycle(second.image.clone());
+        drop(second);
+        slot.put(grey(64, 36, &mut scratch));
+        let third = slot.take_fresh().expect("a frame");
+        assert_eq!(third.image.as_bytes(0).unwrap().as_ptr(), at, "the first picture's buffer, free again");
+        assert!(third.image.as_bytes(0).unwrap().chunks_exact(4).all(|p| p[3] == 255));
     }
 }

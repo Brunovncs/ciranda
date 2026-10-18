@@ -21,6 +21,8 @@ static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 pub fn runtime() -> &'static tokio::runtime::Runtime {
     RUNTIME.get_or_init(|| {
+        // Every HTTPS and WSS client runs here, and rustls needs its provider before the first.
+        api::install_tls();
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(3)
             .thread_name("ciranda-net")

@@ -19,8 +19,9 @@ use crate::ui::overlay::{self, Dismiss, menu_card, menu_item, menu_rule};
 use crate::widgets::*;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    Animation, AnimationExt, AnyElement, App, AppContext, Context, Entity, EventEmitter, Focusable, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, Pixels, Point, Render, SharedString, StatefulInteractiveElement, StyleRefinement, Styled, Window, anchored, div,
+    Animation, AnimationExt, AnyElement, App, AppContext, Context, Entity, EventEmitter, Focusable, InteractiveElement, IntoElement,
+    MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render, SharedString, StatefulInteractiveElement, StyleRefinement, Styled,
+    Window, anchored, div,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -388,7 +389,9 @@ impl ServerView {
                         d.child(
                             // Room either side for the knob, which sits half past each end.
                             div().px(px(8.)).child(
-                                VolumeSlider::new(("tile-volume", id), gain, move |g, cx| tile.update(cx, |t, cx| t.set_gain(g, cx))).width(px(112.)).render(t, cx),
+                                VolumeSlider::new(("tile-volume", id), gain, move |g, cx| tile.update(cx, |t, cx| t.set_gain(g, cx)))
+                                    .width(px(112.))
+                                    .render(t, cx),
                             ),
                         )
                     })
@@ -514,7 +517,11 @@ impl ServerView {
             .rounded(px(8.))
             .bg(gpui::black().opacity(0.55))
             .when(kind == TileKind::Screen, |d| d.child(live_chip(t, true)))
-            .child(div().text_size(px(13.)).text_color(white).child(if local { trf!("{} (you)", "{} (você)", name) } else { name.to_string() }))
+            .child(div().text_size(px(13.)).text_color(white).child(if local {
+                trf!("{} (you)", "{} (você)", name)
+            } else {
+                name.to_string()
+            }))
             .child(div().text_size(px(12.)).text_color(white.opacity(0.7)).child(if kind == TileKind::Screen {
                 tr!("screen", "tela")
             } else {
@@ -570,7 +577,8 @@ impl ServerView {
             people = people.child(mono(format!("+{}", roster.len() - MOST), white.opacity(0.7)));
         }
 
-        let button = |id: &'static str, glyph: &'static str, on: bool, color: gpui::Hsla| tool_button(id, glyph, on, color, t).size(px(38.));
+        let button =
+            |id: &'static str, glyph: &'static str, on: bool, color: gpui::Hsla| tool_button(id, glyph, on, color, t).size(px(38.));
         let rule = || div().w(px(1.)).h(px(24.)).mx(px(4.)).bg(white.opacity(0.18));
         let fullscreen = window.is_fullscreen();
         let controls = div()
@@ -590,21 +598,30 @@ impl ServerView {
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_mute(cx))),
             )
             .child(
-                button("theater-deafen", if deafened { "headphones-off" } else { "headphones" }, deafened, if deafened { t.critical } else { white })
-                    .tooltip(tip(
-                        if deafened {
-                            tr!("Undeafen (Ctrl+Shift+D)", "Reativar o som (Ctrl+Shift+D)")
-                        } else {
-                            tr!("Deafen (Ctrl+Shift+D)", "Desativar o som (Ctrl+Shift+D)")
-                        },
-                        t,
-                    ))
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_deafen(cx))),
+                button(
+                    "theater-deafen",
+                    if deafened { "headphones-off" } else { "headphones" },
+                    deafened,
+                    if deafened { t.critical } else { white },
+                )
+                .tooltip(tip(
+                    if deafened {
+                        tr!("Undeafen (Ctrl+Shift+D)", "Reativar o som (Ctrl+Shift+D)")
+                    } else {
+                        tr!("Deafen (Ctrl+Shift+D)", "Desativar o som (Ctrl+Shift+D)")
+                    },
+                    t,
+                ))
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_deafen(cx))),
             )
             .child(
                 button("theater-camera", if camera_on { "camera-off" } else { "camera" }, false, white)
                     .tooltip(tip(
-                        if camera_on { tr!("Turn the camera off", "Desligar a câmera") } else { tr!("Turn the camera on", "Ligar a câmera") },
+                        if camera_on {
+                            tr!("Turn the camera off", "Desligar a câmera")
+                        } else {
+                            tr!("Turn the camera on", "Ligar a câmera")
+                        },
                         t,
                     ))
                     .on_click(cx.listener(|this, _, window, cx| this.toggle_camera(window, cx))),
@@ -869,13 +886,17 @@ impl Soundpad {
             None => tr!("Set hotkey", "Definir atalho").into(),
         };
         let to_record = clip.clone();
-        let mut card = menu_card(t).occlude().on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()).child(
-            menu_item("clip-hotkey", Some("keyboard"), set, false, t).on_click(cx.listener(move |this, _, window, cx| {
-                this.menu = None;
-                this.record(&to_record, window, cx);
-            })),
-        );
-        if bound.is_some() {
+        // No hotkeys where the system gives none (pure Wayland): nothing to set or remove.
+        let hotkeys = crate::ui::hotkeys::unavailable(cx).is_none();
+        let mut card = menu_card(t).occlude().on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+        if hotkeys {
+            card =
+                card.child(menu_item("clip-hotkey", Some("keyboard"), set, false, t).on_click(cx.listener(move |this, _, window, cx| {
+                    this.menu = None;
+                    this.record(&to_record, window, cx);
+                })));
+        }
+        if hotkeys && bound.is_some() {
             card = card.child(menu_item("clip-unbind", Some("close"), tr!("Remove hotkey", "Remover atalho"), false, t).on_click(
                 cx.listener(move |this, _, _, cx| {
                     this.menu = None;
@@ -1033,7 +1054,10 @@ impl Render for Soundpad {
                 Some(recorder) => d.child(recorder),
                 None => d
                     .child(
-                        VolumeSlider::new("soundpad-volume", volume, |g, cx| set_prefs(cx, |p| p.soundpad_volume = (g * 100.).round() as u32)).render(&t, cx),
+                        VolumeSlider::new("soundpad-volume", volume, |g, cx| {
+                            set_prefs(cx, |p| p.soundpad_volume = (g * 100.).round() as u32)
+                        })
+                        .render(&t, cx),
                     )
                     .child(grid)
                     .when(admin, |d| {

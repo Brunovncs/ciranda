@@ -549,6 +549,10 @@ features = [
     "js",
 ]
 
+[target.'cfg(target_os = "macos")'.dependencies.core-foundation]
+version = "0.10"
+default-features = false
+
 [target.'cfg(target_os = "macos")'.dependencies.core-video]
 version = "0.5.2"
 features = ["metal"]

@@ -12,14 +12,18 @@ fn main() {
         ];
         embed_resource::compile("assets/ciranda.rc", &version).manifest_optional().unwrap();
     }
-    // libwebrtc's screen capture asks the desktop portal over D-Bus through GLib, whose headers
-    // webrtc-sys compiles against but whose libraries it leaves to the program. Every desktop
-    // has them, so they are linked from the system and not carried in the AppImage.
     // libwebrtc's Objective-C categories (on NSString, among others) live in its static library;
     // without -ObjC the linker leaves them out, and the program dies as it loads.
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         println!("cargo:rustc-link-arg=-ObjC");
+        // Core Audio's process taps (the computer's sound in a share) are macOS 14.2's; weak, so
+        // the program still loads on 12.3 and 13, where media/loopback.rs never calls them.
+        println!("cargo:rustc-link-arg=-Wl,-weak_framework,CoreAudio");
     }
+    // libwebrtc's screen capture asks the desktop portal over D-Bus through GLib, whose headers
+    // webrtc-sys compiles against but whose libraries it leaves to the program. Every desktop
+    // has them, so they are linked from the system and not carried in the AppImage
+    // (packaging/linux/appimage.sh leaves them out).
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
         for lib in ["gio-2.0", "gobject-2.0", "glib-2.0"] {
             println!("cargo:rustc-link-lib=dylib={lib}");

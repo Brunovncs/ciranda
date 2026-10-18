@@ -179,7 +179,7 @@ impl Root {
         cx.spawn(async move |this, cx| {
             let h = hash.clone();
             let got = core::run(async move {
-                cache.fetch(&h, || async { if avatar { api.download(&h).await } else { api.server_icon(&h).await } }).await
+                cache.fetch(&h, || async { if avatar { api.download_picture(&h).await } else { api.server_icon(&h).await } }).await
             })
             .await;
             let picture = match got {

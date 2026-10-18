@@ -75,7 +75,8 @@ fn roster(session: &Entity<Session>, cx: &App) -> (Rc<Vec<Line>>, usize, usize) 
             lines.push(Line::Heading { online: false, count: offline.len() });
             lines.extend(offline.iter().map(|&id| Line::Member { id, online: false }));
         }
-        let known = Roster { session: session.downgrade(), key, lines: Rc::new(lines), online: online.len(), total: online.len() + offline.len() };
+        let known =
+            Roster { session: session.downgrade(), key, lines: Rc::new(lines), online: online.len(), total: online.len() + offline.len() };
         let out = (known.lines.clone(), known.online, known.total);
         r.push(known);
         out
@@ -123,7 +124,10 @@ impl ServerView {
                 .items_end()
                 .px(px(6.))
                 .pb(px(4.))
-                .child(label(if online { trf!("Online · {}", "Online · {}", count) } else { trf!("Offline · {}", "Offline · {}", count) }, t))
+                .child(label(
+                    if online { trf!("Online · {}", "Online · {}", count) } else { trf!("Offline · {}", "Offline · {}", count) },
+                    t,
+                ))
                 .into_any_element(),
             Line::Member { id, online } => {
                 let s = self.session.read(cx);

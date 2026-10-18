@@ -8,7 +8,9 @@ use super::rtc::VideoParams;
 use super::video::{self, FrameSlot};
 use super::yuv;
 use gpui::{RenderImage, SurfaceFrame};
-use libwebrtc::desktop_capturer::{DesktopCaptureSourceType, DesktopCapturer, DesktopCapturerOptions, DesktopFrame};
+use libwebrtc::desktop_capturer::{
+    CaptureError, CaptureSource, DesktopCaptureSourceType, DesktopCapturer, DesktopCapturerOptions, DesktopFrame,
+};
 use libwebrtc::native::yuv_helper;
 use libwebrtc::peer_connection_factory::native::PeerConnectionFactoryExt;
 use libwebrtc::prelude::VideoBuffer;
@@ -79,6 +81,19 @@ impl Resolution {
             Resolution::Native => None,
         }
     }
+
+    /// What a share is sent at until you choose: 1080p, or 720p on Windows on Arm with no
+    /// hardware H.264 encoder, where OpenH264 on the processor falls behind at 1080p.
+    pub fn default_for_this_computer() -> Resolution {
+        #[cfg(all(windows, target_arch = "aarch64"))]
+        {
+            use libwebrtc::rtp_sender::VideoEncoderBackend as B;
+            if !B::list_available().into_iter().any(|b| matches!(b, B::Hardware | B::Nvenc)) {
+                return Resolution::P720;
+            }
+        }
+        Resolution::P1080
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -137,8 +152,43 @@ fn capturer_with(kind: SourceKind, cursor: bool) -> Option<DesktopCapturer> {
     DesktopCapturer::new(opts)
 }
 
+/// Whether what to share is picked in the desktop's own dialog instead of Ciranda's: a Wayland
+/// session, where libwebrtc captures through xdg-desktop-portal and PipeWire. Decided as
+/// libwebrtc decides it, by the session type and `WAYLAND_DISPLAY` being set (empty, as `main`
+/// leaves it while Ciranda's window runs on XWayland, still counts). Its capturers list one
+/// placeholder each, with an id of their own, and the dialog opens when one starts.
+pub fn portal() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cfg!(target_os = "linux")
+        && *ON.get_or_init(|| {
+            std::env::var("XDG_SESSION_TYPE").is_ok_and(|s| s.starts_with("wayland")) && std::env::var_os("WAYLAND_DISPLAY").is_some()
+        })
+}
+
+/// The one source the portal's picker stands for, in Ciranda's list.
+const PORTAL_SOURCE: u64 = 1;
+
+/// `id` among what `c` can capture; through the portal, whatever its placeholder is.
+pub(super) fn target(c: &DesktopCapturer, id: u64) -> Option<CaptureSource> {
+    let mut list = c.get_source_list().into_iter();
+    if portal() { list.next() } else { list.find(|s| s.id() == id) }
+}
+
+/// Runs a capture callback's body, which libwebrtc calls from C++: a panic unwinding out of it
+/// would abort Ciranda, so it is caught here and `failed` set, for the capture to end as any
+/// failed one does.
+pub(super) fn guarded(failed: &AtomicBool, body: impl FnOnce()) {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).is_err() {
+        failed.store(true, Ordering::Relaxed);
+    }
+}
+
 /// Every screen or window that can be shared, at once: their stills come from `stills`.
 pub fn sources(kind: SourceKind) -> Vec<ScreenSource> {
+    if portal() {
+        let title = tr!("Chosen in the system's dialog", "Escolhida na janela do sistema").to_string();
+        return vec![ScreenSource { id: PORTAL_SOURCE, kind, title, size: None }];
+    }
     let Some(list_capturer) = capturer(kind) else { return Vec::new() };
     let mut out = Vec::new();
     for (i, src) in list_capturer.get_source_list().into_iter().enumerate() {
@@ -182,19 +232,26 @@ pub fn stills(kind: SourceKind, ids: Vec<u64>) -> async_channel::Receiver<(u64, 
     rx
 }
 
-/// One frame of a source, scaled down to 320 px wide inside the capturer's callback.
+/// One frame of a source, scaled down to 320 px wide inside the capturer's callback. None through
+/// the portal: starting a capture there opens its dialog.
 fn still(kind: SourceKind, id: u64) -> Option<Still> {
+    if portal() {
+        return None;
+    }
     let mut c = capturer(kind)?;
-    let src = c.get_source_list().into_iter().find(|s| s.id() == id)?;
+    let src = target(&c, id)?;
     let (tx, rx) = mpsc::channel();
+    let failed = AtomicBool::new(false);
     c.start_capture(Some(src), move |frame| {
-        if let Ok(f) = frame {
-            let (w, h) = (f.width() as u32, f.height() as u32);
-            if w == 0 || h == 0 {
-                return;
+        guarded(&failed, || {
+            if let Ok(f) = frame {
+                let (w, h) = (f.width() as u32, f.height() as u32);
+                if w == 0 || h == 0 {
+                    return;
+                }
+                let _ = tx.send(Still { image: bgra_preview(f.data(), w, h, f.stride(), 320), size: (w, h) });
             }
-            let _ = tx.send(Still { image: bgra_preview(f.data(), w, h, f.stride(), 320), size: (w, h) });
-        }
+        })
     });
     let deadline = Instant::now() + STILL_LIMIT;
     loop {
@@ -211,29 +268,38 @@ fn still(kind: SourceKind, id: u64) -> Option<Still> {
 /// Blocks for up to a second, so it runs off the UI thread.
 pub fn snapshot(kind: SourceKind, id: u64) -> Option<Vec<u8>> {
     let mut c = capturer_with(kind, false)?;
-    let src = c.get_source_list().into_iter().find(|s| s.id() == id)?;
+    let src = target(&c, id)?;
     let (tx, rx) = mpsc::channel();
+    let failed = AtomicBool::new(false);
     c.start_capture(Some(src), move |frame| {
-        if let Ok(f) = frame {
-            let (w, h, stride) = (f.width() as u32, f.height() as u32, f.stride() as usize);
-            if w == 0 || h == 0 {
-                return;
-            }
-            let mut rgba = Vec::with_capacity((w * h * 4) as usize);
-            for row in f.data().chunks(stride).take(h as usize) {
-                for p in row[..(w * 4) as usize].chunks_exact(4) {
-                    rgba.extend_from_slice(&[p[2], p[1], p[0], 255]);
+        guarded(&failed, || match frame {
+            Ok(f) => {
+                let (w, h, stride) = (f.width() as u32, f.height() as u32, f.stride() as usize);
+                if w == 0 || h == 0 {
+                    return;
                 }
+                let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+                for row in f.data().chunks(stride).take(h as usize) {
+                    for p in row[..(w * 4) as usize].chunks_exact(4) {
+                        rgba.extend_from_slice(&[p[2], p[1], p[0], 255]);
+                    }
+                }
+                let _ = tx.send(Some((w, h, rgba)));
             }
-            let _ = tx.send((w, h, rgba));
-        }
+            // The portal's dialog was cancelled.
+            Err(CaptureError::Permanent) if portal() => {
+                let _ = tx.send(None);
+            }
+            Err(_) => {}
+        })
     });
-    let deadline = Instant::now() + Duration::from_secs(1);
+    // Through the portal its dialog comes first, and takes as long as you do.
+    let deadline = Instant::now() + if portal() { Duration::from_secs(120) } else { Duration::from_secs(1) };
     let (w, h, rgba) = loop {
         c.capture_frame();
         let left = deadline.saturating_duration_since(Instant::now());
         match rx.recv_timeout(left.min(Duration::from_millis(50))) {
-            Ok(got) => break got,
+            Ok(got) => break got?,
             Err(_) if left.is_zero() => return None,
             Err(_) => {}
         }
@@ -352,6 +418,9 @@ pub struct ScreenCapture {
     sound: Mutex<Option<Loopback>>,
     sound_source: Mutex<Option<libwebrtc::audio_source::native::NativeAudioSource>>,
     encoder: Encoder,
+    /// The capture ended by itself: the portal's dialog was cancelled or its stream closed, or
+    /// the capturer failed for good.
+    ended: Arc<AtomicBool>,
 }
 
 impl ScreenCapture {
@@ -362,9 +431,18 @@ impl ScreenCapture {
         let preview = Arc::new(FrameSlot::default());
         let stop = Arc::new(AtomicBool::new(false));
         let encoder = Encoder::default();
+        let ended = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
-        let (src, prev, st, c, enc) = (source.clone(), preview.clone(), stop.clone(), choice.clone(), encoder.clone());
-        std::thread::Builder::new().name("ciranda-screen".into()).spawn(move || run(c, rx, src, prev, st, enc)).ok();
+        let (src, prev, st, c, enc, end) = (source.clone(), preview.clone(), stop.clone(), choice.clone(), encoder.clone(), ended.clone());
+        std::thread::Builder::new()
+            .name("ciranda-screen".into())
+            .spawn(move || {
+                run(c, rx, src, prev, &st, enc, &end);
+                if !st.load(Ordering::Relaxed) {
+                    end.store(true, Ordering::Relaxed);
+                }
+            })
+            .ok();
         super::replay::sharing(true);
         let sound = loopback_for(&choice).map(Loopback::start);
         let sound_source = sound.as_ref().map(|l| l.source.clone());
@@ -377,7 +455,13 @@ impl ScreenCapture {
             sound: Mutex::new(sound),
             sound_source: Mutex::new(sound_source),
             encoder,
+            ended,
         }
+    }
+
+    /// Whether the capture ended without being stopped; the share has nothing left to send.
+    pub fn ended(&self) -> bool {
+        self.ended.load(Ordering::Relaxed)
     }
 
     /// A track for the share's sound, if it has any.
@@ -442,12 +526,16 @@ impl Drop for ScreenCapture {
     }
 }
 
+/// The sound the choice asks for, as far as this computer has it: none rather than a silent
+/// track where it has no way to take it.
 fn loopback_for(c: &ScreenChoice) -> Option<loopback::Mode> {
     let me = std::process::id();
+    let can = loopback::support();
     match (c.sound, c.source.kind) {
         (Sound::Off, _) => None,
-        (Sound::App, SourceKind::Window) => loopback::window_process(c.source.id).map(loopback::Mode::Only),
-        _ => Some(loopback::Mode::Excluding(me)),
+        (Sound::App, SourceKind::Window) if can.app => loopback::window_process(c.source.id).map(loopback::Mode::Only),
+        _ if can.system => Some(loopback::Mode::Excluding(me)),
+        _ => None,
     }
 }
 
@@ -465,13 +553,21 @@ pub(super) fn fit(sw: u32, sh: u32, r: Resolution) -> (u32, u32) {
     (w.max(2) & !1, h.max(2) & !1)
 }
 
+/// Whether to make NV12 frames for the encoder of the connection the share goes out on. Only
+/// Windows' Media Foundation encoders take NV12 as it is; libwebrtc's VideoToolbox and VAAPI
+/// encoders convert whatever comes, so elsewhere I420, which costs as little to make, is sent.
+fn nv12_for(encoder: &Encoder) -> bool {
+    cfg!(windows) && encoder.lock().load(Ordering::Relaxed)
+}
+
 fn run(
     mut choice: ScreenChoice,
     control: mpsc::Receiver<Control>,
     source: NativeVideoSource,
     preview: Arc<FrameSlot>,
-    stop: Arc<AtomicBool>,
+    stop: &AtomicBool,
     encoder: Encoder,
+    ended: &AtomicBool,
 ) {
     let mut waiting = false;
     let mut replay_scratch = Vec::new();
@@ -484,8 +580,8 @@ fn run(
                 &mut || control.try_recv().ok().map(|Control::Switch(c)| c),
                 &source,
                 &preview,
-                &stop,
-                &|| encoder.lock().load(Ordering::Relaxed),
+                stop,
+                &|| nv12_for(&encoder),
             );
             match switched {
                 Some(next) => {
@@ -499,7 +595,7 @@ fn run(
             log::warn!("screen capture is unavailable");
             return;
         };
-        let Some(target) = c.get_source_list().into_iter().find(|s| s.id() == choice.source.id) else {
+        let Some(target) = target(&c, choice.source.id) else {
             // Closed, or unplugged, since it was picked. Capturing with no source would send the
             // whole desktop, which nobody chose to show: nothing goes out until it's back or
             // another is picked.
@@ -515,17 +611,27 @@ fn run(
         waiting = false;
         let target = Some(target);
         let staging: Arc<Mutex<Staging>> = Default::default();
-        let s = staging.clone();
+        let failed = Arc::new(AtomicBool::new(false));
+        let (s, f) = (staging.clone(), failed.clone());
         c.start_capture(target, move |frame| {
-            if let Ok(f) = frame {
-                s.lock().take(&f);
-            }
+            guarded(&f, || match frame {
+                Ok(frame) => s.lock().take(&frame),
+                // Through the portal, its dialog cancelled or its stream gone: nothing more will
+                // come. Elsewhere the capturers recover from these by themselves.
+                Err(CaptureError::Permanent) if portal() => f.store(true, Ordering::Relaxed),
+                Err(_) => {}
+            })
         });
         let started = Instant::now();
         let mut preview_at = Instant::now() - Duration::from_secs(1);
         loop {
             let tick = Instant::now();
             if stop.load(Ordering::Relaxed) {
+                break 'outer;
+            }
+            if failed.load(Ordering::Relaxed) {
+                log::warn!("the screen capture failed; the share ends");
+                ended.store(true, Ordering::Relaxed);
                 break 'outer;
             }
             if let Ok(Control::Switch(next)) = control.try_recv() {
@@ -539,7 +645,7 @@ fn run(
                 let mut st = staging.lock();
                 st.resolution = Some(choice.resolution);
                 st.preview_id = preview.id;
-                st.nv12 = encoder.lock().load(Ordering::Relaxed);
+                st.nv12 = nv12_for(&encoder);
                 // Your own preview at a few frames a second is enough, and none while nobody sees it.
                 if !video::window_hidden() && preview_at.elapsed() > Duration::from_millis(200) {
                     preview_at = Instant::now();

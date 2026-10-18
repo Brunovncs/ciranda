@@ -3,8 +3,8 @@
 
 use super::{Center, ServerView};
 use crate::core::types::*;
-use crate::prefs::{prefs, set_prefs};
 use crate::dm::KeyState;
+use crate::prefs::{prefs, set_prefs};
 use crate::session::Session;
 use crate::theme::{Theme, px, radius};
 use crate::ui::overlay::{self, Ask, Dismiss, Field, menu_card, menu_item};

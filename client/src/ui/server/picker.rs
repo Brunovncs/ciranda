@@ -3,6 +3,7 @@
 
 use crate::media::camera;
 use crate::media::composite::{self, Composition, Layout};
+use crate::media::loopback;
 use crate::media::screen::{self, Resolution, ScreenChoice, ScreenSource, Sound, SourceKind};
 use crate::prefs::{prefs, set_prefs};
 use crate::theme::{current, px, radius};
@@ -20,6 +21,8 @@ use std::sync::Arc;
 type OnPick = Rc<dyn Fn(ScreenChoice, &mut Window, &mut App)>;
 /// A source to put on a composition already running, with its name and program.
 type OnAdd = Rc<dyn Fn(composite::Source, String, String, &mut Window, &mut App)>;
+/// A composition already being shared, and the size of the screen it took its shape from.
+type Running = (Arc<Composition>, Option<(u32, u32)>);
 
 pub struct Picker {
     focus: FocusHandle,
@@ -39,7 +42,7 @@ pub struct Picker {
     /// The ticks were set from the saved layout or the running composition, once.
     restored: bool,
     /// The composition being shared now, when that is what is being changed.
-    composition: Option<(Arc<Composition>, Option<(u32, u32)>)>,
+    composition: Option<Running>,
     resolution: Resolution,
     fps: u32,
     sharp: bool,
@@ -86,7 +89,10 @@ impl Picker {
             saved: Vec::new(),
             restored: false,
             composition: current.as_ref().and_then(|c| c.composition.clone().map(|comp| (comp, c.source.size))),
-            resolution: current.as_ref().map(|c| c.resolution).unwrap_or_else(|| Resolution::from_setting(&p.resolution)),
+            // Until one is chosen, what suits this computer's encoder.
+            resolution: current.as_ref().map(|c| c.resolution).unwrap_or_else(|| {
+                if p.resolution.is_empty() { Resolution::default_for_this_computer() } else { Resolution::from_setting(&p.resolution) }
+            }),
             fps: current.as_ref().map(|c| c.fps).unwrap_or(if p.framerate == 0 { 30 } else { p.framerate }),
             sharp: current.as_ref().map(|c| c.sharp).unwrap_or(p.priority != "smooth"),
             sound: current.as_ref().map(|c| c.sound).unwrap_or(match p.share_sound.as_str() {
@@ -130,6 +136,17 @@ impl Picker {
 
     fn composite(&self) -> bool {
         self.kind == SourceKind::Composite
+    }
+
+    /// The sound picked, as far as this computer can share it for `kind`: one application's alone
+    /// only for a window, where the system allows it; else the whole computer's; else none.
+    fn sound_for(&self, kind: SourceKind) -> Sound {
+        let can = loopback::support();
+        match self.sound {
+            Sound::App if kind == SourceKind::Window && can.app => Sound::App,
+            Sound::App | Sound::System if can.system => Sound::System,
+            _ => Sound::Off,
+        }
     }
 
     /// The list first, by title; then the stills, in parallel, each drawn as it lands. A
@@ -240,7 +257,9 @@ impl Picker {
                 let title = self.sources.iter().flatten().find(|x| x.id == *id).map(|x| x.title.clone()).unwrap_or_default();
                 (title, self.apps.get(id).cloned().unwrap_or_default())
             }
-            composite::Source::Camera(d) => (self.cameras.iter().find(|c| &c.id == d).map(|c| c.name.clone()).unwrap_or(d.clone()), String::new()),
+            composite::Source::Camera(d) => {
+                (self.cameras.iter().find(|c| &c.id == d).map(|c| c.name.clone()).unwrap_or(d.clone()), String::new())
+            }
         }
     }
 
@@ -297,15 +316,22 @@ impl Picker {
     fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let choice = if self.composite() {
             let (comp, size) = self.composition(cx);
-            let source = ScreenSource { id: 0, kind: SourceKind::Composite, title: tr!("Composition", "Composição").into(), size: Some(size) };
-            let sound = if self.sound == Sound::Off { Sound::Off } else { Sound::System };
-            let choice =
-                ScreenChoice { source, resolution: self.resolution, fps: self.fps, sharp: self.sharp, sound, composition: Some(comp.clone()) };
+            let source =
+                ScreenSource { id: 0, kind: SourceKind::Composite, title: tr!("Composition", "Composição").into(), size: Some(size) };
+            let sound = self.sound_for(SourceKind::Composite);
+            let choice = ScreenChoice {
+                source,
+                resolution: self.resolution,
+                fps: self.fps,
+                sharp: self.sharp,
+                sound,
+                composition: Some(comp.clone()),
+            };
             comp.edit(|l| l.canvas = composite::canvas_size(&choice));
             choice
         } else {
             let Some(source) = self.sources.as_ref().and_then(|l| l.iter().find(|s| Some(s.id) == self.picked)).cloned() else { return };
-            let sound = if self.sound == Sound::App && source.kind == SourceKind::Screen { Sound::System } else { self.sound };
+            let sound = self.sound_for(source.kind);
             ScreenChoice { source, resolution: self.resolution, fps: self.fps, sharp: self.sharp, sound, composition: None }
         };
         let (res, fps, sharp, kind, sound) = (self.resolution, self.fps, self.sharp, self.kind, self.sound);
@@ -422,7 +448,8 @@ impl Render for Picker {
                     let id = s.id;
                     let glyph = if s.kind == SourceKind::Screen { "monitor" } else { "image" };
                     if composite {
-                        let source = if s.kind == SourceKind::Screen { composite::Source::Screen(id) } else { composite::Source::Window(id) };
+                        let source =
+                            if s.kind == SourceKind::Screen { composite::Source::Screen(id) } else { composite::Source::Window(id) };
                         let on = self.ticked.iter().position(|x| *x == source);
                         grid = grid.child(
                             self.card((s.kind, id), s.title.clone(), s.size, glyph, on)
@@ -432,15 +459,15 @@ impl Render for Picker {
                         continue;
                     }
                     let on = (Some(id) == self.picked).then_some(0);
-                    grid = grid.child(self.card((s.kind, id), s.title.clone(), s.size, glyph, on).id(("source", id)).on_click(cx.listener(
-                        move |this, e: &gpui::ClickEvent, window, cx| {
+                    grid = grid.child(self.card((s.kind, id), s.title.clone(), s.size, glyph, on).id(("source", id)).on_click(
+                        cx.listener(move |this, e: &gpui::ClickEvent, window, cx| {
                             this.picked = Some(id);
                             if e.click_count() == 2 {
                                 this.start(window, cx);
                             }
                             cx.notify();
-                        },
-                    )));
+                        }),
+                    ));
                 }
                 if composite {
                     for (i, c) in self.cameras.clone().into_iter().enumerate() {
@@ -455,23 +482,33 @@ impl Render for Picker {
                 }
             }
         }
-        let window_kind = self.kind == SourceKind::Window;
-        let sound_choices = if window_kind {
-            vec![
-                (Sound::App, tr!("This app only", "Só este app").into()),
-                (Sound::System, tr!("Everything", "Tudo").into()),
-                (Sound::Off, tr!("No sound", "Sem som").into()),
-            ]
-        } else {
-            vec![(Sound::System, tr!("Computer sound", "Som do computador").into()), (Sound::Off, tr!("No sound", "Sem som").into())]
-        };
-        let sound = if !window_kind && self.sound == Sound::App { Sound::System } else { self.sound };
+        // Only the sounds this computer can share: no silent track offered as "Computer sound".
+        let can = loopback::support();
+        let one_app = self.kind == SourceKind::Window && can.app;
+        let mut sound_choices: Vec<(Sound, gpui::SharedString)> = Vec::new();
+        if one_app {
+            sound_choices.push((Sound::App, tr!("This app only", "Só este app").into()));
+        }
+        if can.system {
+            let name = if one_app { tr!("Everything", "Tudo") } else { tr!("Computer sound", "Som do computador") };
+            sound_choices.push((Sound::System, name.into()));
+        }
+        sound_choices.push((Sound::Off, tr!("No sound", "Sem som").into()));
+        let sound_offered = sound_choices.len() > 1;
+        let sound = self.sound_for(self.kind);
         let note = match sound {
-            Sound::System => tr!(
+            Sound::System if can.without_call => tr!(
                 "Viewers hear what your computer plays, but not the call.",
                 "Quem assiste ouve o que o computador toca, mas não a chamada."
             ),
+            Sound::System => tr!(
+                "Viewers hear everything your computer plays, the call included.",
+                "Quem assiste ouve tudo o que o computador toca, inclusive a chamada."
+            ),
             Sound::App => tr!("Viewers hear only this app.", "Quem assiste ouve só este app."),
+            Sound::Off if !sound_offered => {
+                tr!("Sound can't be shared from this computer.", "Não dá para compartilhar o som deste computador.")
+            }
             Sound::Off => tr!("Viewers see the picture without sound.", "Quem assiste vê a imagem sem som."),
         };
         let adding = self.adding.is_some();
@@ -603,13 +640,15 @@ impl Render for Picker {
                                         },
                                     ),
                                 )))
-                                .child(div().flex_1().child(field(
-                                    tr!("Sound", "Som"),
-                                    segmented("sound", sound_choices, sound, &t, cx, |this, s, _, cx| {
-                                        this.sound = s;
-                                        cx.notify();
-                                    }),
-                                ))),
+                                .when(sound_offered, |d| {
+                                    d.child(div().flex_1().child(field(
+                                        tr!("Sound", "Som"),
+                                        segmented("sound", sound_choices, sound, &t, cx, |this, s, _, cx| {
+                                            this.sound = s;
+                                            cx.notify();
+                                        }),
+                                    )))
+                                }),
                         )
                     }),
             )

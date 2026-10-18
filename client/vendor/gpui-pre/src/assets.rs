@@ -104,6 +104,11 @@ impl RenderImage {
     pub fn frame_count(&self) -> usize {
         self.data.len()
     }
+
+    /// The image's frames, taken back (to reuse their buffers) once nothing else holds it.
+    pub fn into_frames(self) -> SmallVec<[Frame; 1]> {
+        self.data
+    }
 }
 
 impl fmt::Debug for RenderImage {

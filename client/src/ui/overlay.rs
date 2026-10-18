@@ -25,8 +25,15 @@ pub struct Dismiss;
 enum Layer {
     /// `dismiss` tells the dialog it was closed from outside (Escape, a click on the scrim), as
     /// if it had closed itself, so what it stands for ends too: a call stops ringing.
-    Dialog { view: AnyView, dismiss: Rc<dyn Fn(&mut App)> },
-    Menu { at: Point<Pixels>, anchor: gpui::Anchor, view: AnyView },
+    Dialog {
+        view: AnyView,
+        dismiss: Rc<dyn Fn(&mut App)>,
+    },
+    Menu {
+        at: Point<Pixels>,
+        anchor: gpui::Anchor,
+        view: AnyView,
+    },
 }
 
 impl Layer {

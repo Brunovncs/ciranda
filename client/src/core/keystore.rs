@@ -22,7 +22,10 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use zeroize::Zeroizing;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::Sender;
+use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
@@ -33,7 +36,9 @@ struct Data {
     key_id: i64,
     /// The identity key's private half, hex, sealed.
     secret: String,
-    /// The recovery key as shown, sealed, so it can be shown again from the settings.
+    /// The recovery key as shown, sealed, so it can be shown again from the settings: only until
+    /// the person says they kept it. Empty after that, so a copy of this folder can't open the
+    /// account's key elsewhere (the server's wrapped copy opens only with it).
     recovery: String,
     /// The person said they put the recovery key somewhere safe.
     recovery_saved: bool,
@@ -80,6 +85,8 @@ impl KeyFile {
     }
 
     pub fn open_at(path: PathBuf) -> KeyFile {
+        // A save of this file may still be on its way from a session just closed.
+        flush();
         let mut data: Data = read(&path).unwrap_or_default();
         let kept = read::<Kept>(&kept_path(&path));
         let fresh = kept.is_none();
@@ -100,14 +107,41 @@ impl KeyFile {
             moved = true;
         }
         moved |= data.extra.remove("newer").is_some();
+        // Kept by a version that held on to it after it was saved somewhere else.
+        let spent = data.recovery_saved && !data.recovery.is_empty();
+        if spent {
+            data.recovery.zeroize();
+        }
+        // Written before this system could seal (macOS and Linux before 4.6): sealed now.
+        let mut resealed = false;
+        if secret::seals() {
+            for value in [&mut data.secret, &mut data.recovery] {
+                if !value.is_empty() && !secret::is_sealed(value) {
+                    *value = secret::seal(&Zeroizing::new(std::mem::take(value)));
+                    resealed = true;
+                }
+            }
+            for value in kept.archived.values_mut() {
+                if !value.is_empty() && !secret::is_sealed(value) {
+                    *value = secret::seal(&Zeroizing::new(std::mem::take(value)));
+                    moved = true;
+                }
+            }
+        }
         let file = KeyFile { path, data, kept };
         if fresh || moved {
             file.save_kept();
         }
-        if moved {
+        if moved || spent || resealed {
             file.save();
         }
         file
+    }
+
+    /// The identity key is here but sealed under a keychain key this run does not have: the
+    /// keychain did not answer. Not a reason to ask for the recovery key, nor to make a new one.
+    pub fn identity_locked(&self) -> bool {
+        self.data.key_id != 0 && secret::locked(&self.data.secret)
     }
 
     /// The identity key and its id on the server, if this computer has it and it opens.
@@ -128,10 +162,12 @@ impl KeyFile {
         if self.data.key_id != 0 && !self.data.secret.is_empty() {
             self.kept.archived.insert(self.data.key_id, self.data.secret.clone());
             self.save_kept();
+            flush();
         }
     }
 
-    /// The account's key from now on. One it replaces is archived, not dropped.
+    /// The account's key from now on. One it replaces is archived, not dropped. On disk before
+    /// this returns: the server already has its public half, and lost here it is lost for good.
     pub fn set_identity(&mut self, key_id: i64, identity: &Identity) {
         if self.data.key_id != key_id {
             self.archive_current();
@@ -139,6 +175,7 @@ impl KeyFile {
         self.data.key_id = key_id;
         self.data.secret = secret::seal(&Zeroizing::new(hex::encode(identity.secret_bytes().as_slice())));
         self.save();
+        flush();
     }
 
     /// Stops using the identity key here, as when the server says this account has none. It is
@@ -148,27 +185,42 @@ impl KeyFile {
         self.archive_current();
         self.data.key_id = 0;
         self.data.secret.clear();
-        self.data.recovery.clear();
+        self.data.recovery.zeroize();
         self.data.recovery_saved = false;
         self.save();
+        flush();
     }
 
     pub fn recovery(&self) -> Option<RecoveryKey> {
         RecoveryKey::parse(&Zeroizing::new(secret::open(&self.data.recovery)?))
     }
 
+    /// Whether a recovery key is kept here to show, without unsealing it.
+    pub fn has_recovery(&self) -> bool {
+        !self.data.recovery.is_empty()
+    }
+
+    /// A recovery key the server now holds a wrapping for. One already kept somewhere (typed in to
+    /// unlock this computer) is not written down here at all; a new one is, and on disk before
+    /// this returns, since it is the only way to the wrapping on the server until it is copied.
     pub fn set_recovery(&mut self, recovery: &RecoveryKey, saved: bool) {
-        self.data.recovery = secret::seal(&Zeroizing::new(recovery.display()));
+        self.data.recovery.zeroize();
+        if !saved {
+            self.data.recovery = secret::seal(&Zeroizing::new(recovery.display()));
+        }
         self.data.recovery_saved = saved;
         self.save();
+        flush();
     }
 
     pub fn recovery_saved(&self) -> bool {
         self.data.recovery_saved || self.data.recovery.is_empty()
     }
 
+    /// The person kept it somewhere: this computer's copy goes, from memory and from the file.
     pub fn mark_recovery_saved(&mut self) {
         self.data.recovery_saved = true;
+        self.data.recovery.zeroize();
         self.save();
     }
 
@@ -219,14 +271,13 @@ impl KeyFile {
         self.save();
     }
 
-    /// Written whole to a file beside it, then moved over it, so a crash halfway never leaves a
-    /// key file that does not read.
+    /// Queued for the writer (see `queue`).
     fn save(&self) {
-        write(&self.path, &self.data);
+        queue(&self.path, &self.data);
     }
 
     fn save_kept(&self) {
-        write(&kept_path(&self.path), &self.kept);
+        queue(&kept_path(&self.path), &self.kept);
     }
 }
 
@@ -238,11 +289,105 @@ fn read<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
     serde_json::from_slice(&std::fs::read(path).ok()?).ok()
 }
 
-fn write(path: &Path, value: &impl Serialize) {
-    let Ok(json) = serde_json::to_vec_pretty(value) else { return };
-    if let Err(e) = super::settings::write_durably(path, &json) {
+// Writing.
+//
+// Every save is written whole to a file beside it and moved over it, so a crash halfway never
+// leaves a key file that does not read, and flushed to the disk; that wait is a writer thread's,
+// not the window's, which saves on first contact with someone (`Vault::pin`) as it draws their
+// conversation. Saves are queued as they happen and written at once, in order; several of one file
+// queued together are written once, as the last of them.
+//
+// What a crash can still lose is the last few milliseconds' saves, and none of those fails open: a
+// pin lost is taken again on the next contact, an accepted change is asked about again (and nothing
+// is sealed to the key meanwhile), a "kept it" is asked again. What can't be lost waits for the
+// disk before going on (`flush`): a new identity key, the one it replaces, and a new recovery key.
+
+enum Job {
+    Write(PathBuf, Vec<u8>),
+    /// Answered once everything queued before it is on the disk.
+    Flush(std::sync::mpsc::SyncSender<()>),
+}
+
+/// Writes queued and not yet done, so a `flush` with none costs nothing.
+static PENDING: AtomicUsize = AtomicUsize::new(0);
+
+fn writer() -> Option<&'static Sender<Job>> {
+    static WRITER: OnceLock<Option<Sender<Job>>> = OnceLock::new();
+    WRITER
+        .get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::channel::<Job>();
+            let spawned = std::thread::Builder::new().name("ciranda-keys".into()).spawn(move || {
+                while let Ok(first) = rx.recv() {
+                    let mut batch = vec![first];
+                    batch.extend(rx.try_iter());
+                    write_batch(batch);
+                }
+            });
+            spawned.is_ok().then_some(tx)
+        })
+        .as_ref()
+}
+
+/// Writes a batch in order, each file once per stretch between two flushes, as the last save of it.
+fn write_batch(batch: Vec<Job>) {
+    let mut stretch: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+    let write_stretch = |stretch: &mut Vec<(PathBuf, Vec<u8>)>| {
+        let all = std::mem::take(stretch);
+        for (i, (path, json)) in all.iter().enumerate() {
+            if !all[i + 1..].iter().any(|(later, _)| later == path) {
+                write_now(path, json);
+            }
+            PENDING.fetch_sub(1, Ordering::SeqCst);
+        }
+    };
+    for job in batch {
+        match job {
+            Job::Write(path, json) => stretch.push((path, json)),
+            Job::Flush(done) => {
+                write_stretch(&mut stretch);
+                let _ = done.send(());
+            }
+        }
+    }
+    write_stretch(&mut stretch);
+}
+
+fn write_now(path: &Path, json: &[u8]) {
+    if let Err(e) = super::settings::write_durably(path, json) {
         log::warn!("could not save the private-message keys: {e}");
     }
+}
+
+/// Queues `value` to be written to `path`. Without a writer thread, written here and now.
+fn queue(path: &Path, value: &impl Serialize) {
+    let Ok(json) = serde_json::to_vec_pretty(value) else { return };
+    PENDING.fetch_add(1, Ordering::SeqCst);
+    let job = Job::Write(path.to_path_buf(), json);
+    let unsent = match writer() {
+        Some(w) => w.send(job).err().map(|e| e.0),
+        None => Some(job),
+    };
+    if let Some(Job::Write(path, json)) = unsent {
+        write_now(&path, &json);
+        PENDING.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Waits until every key file saved so far is on the disk: before quitting, and before anything
+/// that can't be lost goes on.
+pub fn flush() {
+    if PENDING.load(Ordering::SeqCst) == 0 {
+        return;
+    }
+    let (done, wait) = std::sync::mpsc::sync_channel(1);
+    if writer().is_some_and(|w| w.send(Job::Flush(done)).is_ok()) {
+        let _ = wait.recv();
+    }
+}
+
+#[cfg(test)]
+fn write(path: &Path, value: &impl Serialize) {
+    write_now(path, &serde_json::to_vec_pretty(value).unwrap());
 }
 
 fn unseal_identity(sealed: &str) -> Option<Identity> {
@@ -337,6 +482,7 @@ mod tests {
         f.set_pin(7, "second");
         f.data.extra.insert("later".into(), Value::from(5));
         f.save();
+        flush();
 
         // 4.3.6 opens the file and saves it as it knows it.
         let old: Old = read(&path).unwrap();
@@ -358,6 +504,60 @@ mod tests {
     }
 
     #[test]
+    fn the_recovery_key_is_kept_only_until_it_is_saved_somewhere() {
+        let path = temp_file();
+        let r = RecoveryKey::generate();
+        let mut f = KeyFile::open_at(path.clone());
+        f.set_recovery(&r, false);
+        assert!(f.has_recovery() && !f.recovery_saved());
+        assert_eq!(f.recovery().unwrap().display(), r.display());
+        f.mark_recovery_saved();
+        assert!(!f.has_recovery() && f.recovery().is_none() && f.recovery_saved());
+        let f = KeyFile::open_at(path.clone());
+        assert!(f.data.recovery.is_empty() && f.recovery_saved(), "gone from the file too");
+        drop(f);
+
+        // Typed in to unlock: already kept, so never written down.
+        let mut f = KeyFile::open_at(path.clone());
+        f.set_recovery(&r, true);
+        assert!(!f.has_recovery());
+        flush();
+        assert!(read::<Data>(&path).unwrap().recovery.is_empty());
+
+        // A file from before this, which kept it after it was saved.
+        let mut data: Data = read(&path).unwrap();
+        data.recovery = secret::seal(&Zeroizing::new(r.display()));
+        data.recovery_saved = true;
+        write(&path, &data);
+        let f = KeyFile::open_at(path.clone());
+        assert!(!f.has_recovery());
+        flush();
+        assert!(read::<Data>(&path).unwrap().recovery.is_empty());
+        remove(&path);
+    }
+
+    #[test]
+    fn saves_are_written_off_the_caller_in_order_and_the_last_one_wins() {
+        let (p, q) = (temp_file(), temp_file());
+        let job = |path: &PathBuf, n: u32| Job::Write(path.clone(), n.to_string().into_bytes());
+        let (done, flushed) = std::sync::mpsc::sync_channel(1);
+        PENDING.fetch_add(5, Ordering::SeqCst);
+        write_batch(vec![job(&p, 1), Job::Flush(done), job(&p, 2), job(&q, 3), job(&p, 4)]);
+        assert!(flushed.try_recv().is_ok());
+        assert_eq!((std::fs::read_to_string(&p).unwrap(), std::fs::read_to_string(&q).unwrap()), ("4".into(), "3".into()));
+
+        // Through the writer: many saves of one file, and `flush` waits for them all.
+        let mut f = KeyFile::open_at(p.clone());
+        for user in 0..200 {
+            f.set_pin(user, "k");
+        }
+        flush();
+        assert_eq!(read::<Data>(&p).unwrap().pins.len(), 200);
+        remove(&p);
+        remove(&q);
+    }
+
+    #[test]
     fn a_4_3_6_file_is_read_and_moved_on() {
         let path = temp_file();
         let old = Old { key_id: 3, pins: BTreeMap::from([(7, "theirs".to_string())]), ..Default::default() };
@@ -372,6 +572,7 @@ mod tests {
         assert!(f.accepted(7, "older"));
         assert!(f.kept.archived.contains_key(&1));
         assert!(f.data.extra.is_empty());
+        flush();
         let on_disk = std::fs::read_to_string(&path).unwrap();
         assert!(!on_disk.contains("archived") && !on_disk.contains("newer"));
         assert_eq!(KeyFile::open_at(path.clone()).upgraded_pin(7), Some("theirs"), "decided once, on the first open");

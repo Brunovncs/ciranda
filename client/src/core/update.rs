@@ -1,7 +1,9 @@
 //! Whether a newer Ciranda is out, asked of GitHub's API, and putting it in place of the running
-//! copy. A release carries `ciranda-<version>-windows-x64.exe` and that file's SHA-256; the new
-//! program is downloaded next to the running one, checked, and swapped in: Windows lets a running
-//! program be renamed though not overwritten, so the running copy steps aside to `ciranda.exe.old`.
+//! copy. A release carries `ciranda-<version>-windows-x64.exe` (and `-windows-arm64.exe`) with
+//! each file's SHA-256; the new program is downloaded next to the running one, checked, and
+//! swapped in: Windows lets a running program be renamed though not overwritten, so the running
+//! copy steps aside to `ciranda.exe.old`. On macOS and Linux nothing is swapped: the disk image or
+//! the AppImage is offered for download.
 //!
 //! That copy is the way back if the new version is broken, so it stays until the new one has
 //! proved itself (see `Start`): a version that keeps dying as it starts is put back by its own
@@ -19,7 +21,8 @@ use std::time::Duration;
 pub const RELEASES_API: &str = "https://api.github.com/repos/Brunovncs/ciranda/releases/latest";
 pub const RELEASES_PAGE: &str = "https://github.com/Brunovncs/ciranda/releases/latest";
 
-/// Where to ask instead of GitHub: a local server, to try an update end to end.
+/// Where to ask instead of GitHub: a local server, to try an update end to end. Development builds
+/// only: in a release it would let whatever set the variable hand Ciranda a program to run.
 const URL_VAR: &str = "CIRANDA_UPDATE_URL";
 /// The version to claim instead of this one, to try updating from an older one.
 const PRETEND_VAR: &str = "CIRANDA_PRETEND_VERSION";
@@ -33,8 +36,26 @@ pub fn relaunched() -> bool {
     std::env::var_os(RELAUNCH_VAR).is_some() || std::env::var_os(LEGACY_RELAUNCH_VAR).is_some()
 }
 
-/// The program for this build's processor: an Arm build must not update itself to the x64 one.
-const ASSET_SUFFIX: &str = if cfg!(target_arch = "aarch64") { "-windows-arm64.exe" } else { "-windows-x64.exe" };
+/// The Windows program for a processor.
+fn exe_suffix(arm64: bool) -> &'static str {
+    if arm64 { "-windows-arm64.exe" } else { "-windows-x64.exe" }
+}
+
+/// Whether this Windows runs on Arm, the x64 build included: Windows on Arm runs it emulated, and
+/// it updates to the Arm build, which runs natively. An Arm build must never go to the x64 one.
+#[cfg(windows)]
+fn arm64_windows() -> bool {
+    use windows_sys::Win32::System::SystemInformation::{IMAGE_FILE_MACHINE, IMAGE_FILE_MACHINE_ARM64};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, IsWow64Process2};
+    if cfg!(target_arch = "aarch64") {
+        return true;
+    }
+    let (mut process, mut native): (IMAGE_FILE_MACHINE, IMAGE_FILE_MACHINE) = (0, 0);
+    // SAFETY: the pseudo-handle of this process, and two out values that live through the call.
+    // The machine it reports is the computer's own, whatever this program was built for.
+    let ok = unsafe { IsWow64Process2(GetCurrentProcess(), &mut process, &mut native) };
+    ok != 0 && native == IMAGE_FILE_MACHINE_ARM64
+}
 
 /// The latest release, as far as an update needs to know.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,10 +66,17 @@ pub struct Release {
     pub notes: String,
     /// The Windows program and the file holding its SHA-256, when the release has them.
     pub exe: Option<(String, String)>,
+    /// What to download by hand where Ciranda does not replace itself: the Mac's disk image or
+    /// Linux's AppImage, when the release has one.
+    pub download: Option<String>,
 }
 
 pub fn api_url() -> String {
-    std::env::var(URL_VAR).unwrap_or_else(|_| RELEASES_API.to_string())
+    api_url_from(std::env::var(URL_VAR).ok(), cfg!(debug_assertions))
+}
+
+fn api_url_from(var: Option<String>, development: bool) -> String {
+    var.filter(|_| development).unwrap_or_else(|| RELEASES_API.to_string())
 }
 
 pub fn current() -> String {
@@ -66,7 +94,46 @@ pub fn is_newer(candidate: &str, current: &str) -> bool {
     !a.is_empty() && a > b
 }
 
+/// The system this copy runs on, as far as choosing a download goes. Each platform only ever
+/// makes its own; the tests make them all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+enum Host {
+    /// Whether the computer is Arm, and whether this build is.
+    Windows {
+        arm64: bool,
+        arm64_build: bool,
+    },
+    Mac,
+    Linux {
+        x64: bool,
+    },
+    Other,
+}
+
+impl Host {
+    #[cfg(windows)]
+    fn this() -> Host {
+        Host::Windows { arm64: arm64_windows(), arm64_build: cfg!(target_arch = "aarch64") }
+    }
+
+    #[cfg(not(windows))]
+    fn this() -> Host {
+        if cfg!(target_os = "macos") {
+            Host::Mac
+        } else if cfg!(target_os = "linux") {
+            Host::Linux { x64: cfg!(target_arch = "x86_64") }
+        } else {
+            Host::Other
+        }
+    }
+}
+
 pub fn parse(json: &[u8]) -> Result<Release, String> {
+    parse_for(json, Host::this())
+}
+
+fn parse_for(json: &[u8], host: Host) -> Result<Release, String> {
     let v: serde_json::Value = serde_json::from_slice(json).map_err(|e| e.to_string())?;
     let tag = v["tag_name"].as_str().ok_or(tr!("the release has no tag", "a versão não tem tag"))?;
     let assets = v["assets"].as_array().cloned().unwrap_or_default();
@@ -77,16 +144,30 @@ pub fn parse(json: &[u8]) -> Result<Release, String> {
             .and_then(|a| a["browser_download_url"].as_str())
             .map(String::from)
     };
-    let exe = if cfg!(windows) { url_of(ASSET_SUFFIX).zip(url_of(&format!("{ASSET_SUFFIX}.sha256"))) } else { None };
+    let exe_for = |arm64: bool| {
+        let suffix = exe_suffix(arm64);
+        url_of(suffix).zip(url_of(&format!("{suffix}.sha256")))
+    };
+    let (exe, download) = match host {
+        // The x64 build on an Arm computer moves to the Arm one, or stays x64 while a release
+        // has none (as before 4.5.0).
+        Host::Windows { arm64: true, arm64_build: false } => (exe_for(true).or_else(|| exe_for(false)), None),
+        Host::Windows { arm64, arm64_build } => (exe_for(arm64 || arm64_build), None),
+        Host::Mac => (None, url_of("-macos-universal.dmg")),
+        Host::Linux { x64: true } => (None, url_of("-linux-x64.AppImage")),
+        Host::Linux { x64: false } | Host::Other => (None, None),
+    };
     Ok(Release {
         version: tag.trim_start_matches('v').to_string(),
         page: v["html_url"].as_str().unwrap_or(RELEASES_PAGE).to_string(),
         notes: v["body"].as_str().unwrap_or_default().trim().to_string(),
         exe,
+        download,
     })
 }
 
 fn client() -> Result<reqwest::Client, String> {
+    super::api::install_tls();
     reqwest::Client::builder()
         .user_agent(concat!("Ciranda/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(15))
@@ -325,13 +406,12 @@ mod tests {
         let json = br#"{"tag_name":"v4.1.0","html_url":"https://example/v4.1.0","body":" Faster joins. ","assets":[
             {"name":"ciranda-4.1.0-windows-x64.exe","browser_download_url":"https://example/exe"},
             {"name":"ciranda-4.1.0-windows-x64.exe.sha256","browser_download_url":"https://example/sha"}]}"#;
-        let r = parse(json).unwrap();
+        let x64 = Host::Windows { arm64: false, arm64_build: false };
+        let r = parse_for(json, x64).unwrap();
         assert_eq!(r.version, "4.1.0");
         assert_eq!(r.page, "https://example/v4.1.0");
         assert_eq!(r.notes, "Faster joins.");
-        if cfg!(all(windows, target_arch = "x86_64")) {
-            assert_eq!(r.exe, Some(("https://example/exe".into(), "https://example/sha".into())));
-        }
+        assert_eq!(r.exe, Some(("https://example/exe".into(), "https://example/sha".into())));
         // The installer sits beside the program in a release, listed first or not; the updater
         // still takes the program.
         let with_installer = br#"{"tag_name":"v4.2.1","assets":[
@@ -339,31 +419,52 @@ mod tests {
             {"name":"ciranda-4.2.1-windows-x64-setup.exe.sha256","browser_download_url":"https://example/setup-sha"},
             {"name":"ciranda-4.2.1-windows-x64.exe","browser_download_url":"https://example/exe"},
             {"name":"ciranda-4.2.1-windows-x64.exe.sha256","browser_download_url":"https://example/sha"}]}"#;
-        if cfg!(all(windows, target_arch = "x86_64")) {
-            assert_eq!(parse(with_installer).unwrap().exe, Some(("https://example/exe".into(), "https://example/sha".into())));
-        }
+        assert_eq!(parse_for(with_installer, x64).unwrap().exe, Some(("https://example/exe".into(), "https://example/sha".into())));
         let without = parse(br#"{"tag_name":"v4.0.1","assets":[]}"#).unwrap();
         assert_eq!(without.exe, None);
         assert_eq!(without.page, RELEASES_PAGE);
     }
 
-    /// A release has the program for each processor; a build takes its own.
+    /// A release has the program for each processor; a build takes the computer's, so the x64
+    /// build emulated on Windows on Arm moves to the Arm one, and an Arm build never goes back.
     #[test]
     fn takes_the_program_for_this_processor() {
         let json = br#"{"tag_name":"v4.5.0","assets":[
             {"name":"ciranda-4.5.0-windows-arm64.exe","browser_download_url":"https://example/arm"},
             {"name":"ciranda-4.5.0-windows-arm64.exe.sha256","browser_download_url":"https://example/arm-sha"},
             {"name":"ciranda-4.5.0-windows-x64.exe","browser_download_url":"https://example/x64"},
-            {"name":"ciranda-4.5.0-windows-x64.exe.sha256","browser_download_url":"https://example/x64-sha"}]}"#;
-        let ours = |exe: &str, sha: &str| Some((format!("https://example/{exe}"), format!("https://example/{sha}")));
-        let want = if !cfg!(windows) {
-            None
-        } else if cfg!(target_arch = "aarch64") {
-            ours("arm", "arm-sha")
-        } else {
-            ours("x64", "x64-sha")
-        };
-        assert_eq!(parse(json).unwrap().exe, want);
+            {"name":"ciranda-4.5.0-windows-x64.exe.sha256","browser_download_url":"https://example/x64-sha"},
+            {"name":"ciranda-4.5.0-linux-x64.AppImage","browser_download_url":"https://example/appimage"},
+            {"name":"ciranda-4.5.0-macos-universal.dmg","browser_download_url":"https://example/dmg"}]}"#;
+        let ours = |exe: &str| Some((format!("https://example/{exe}"), format!("https://example/{exe}-sha")));
+        let on = |host| parse_for(json, host).unwrap();
+        let windows = |arm64, arm64_build| on(Host::Windows { arm64, arm64_build });
+        assert_eq!(windows(false, false).exe, ours("x64"));
+        assert_eq!(windows(true, false).exe, ours("arm"), "x64 emulated on Arm goes native");
+        assert_eq!(windows(true, true).exe, ours("arm"));
+        assert_eq!(windows(false, false).download, None);
+
+        // A release from before Arm builds: x64 on Arm stays x64; an Arm build gets nothing.
+        let x64_only = br#"{"tag_name":"v4.4.0","assets":[
+            {"name":"ciranda-4.4.0-windows-x64.exe","browser_download_url":"https://example/x64"},
+            {"name":"ciranda-4.4.0-windows-x64.exe.sha256","browser_download_url":"https://example/x64-sha"}]}"#;
+        assert_eq!(parse_for(x64_only, Host::Windows { arm64: true, arm64_build: false }).unwrap().exe, ours("x64"));
+        assert_eq!(parse_for(x64_only, Host::Windows { arm64: true, arm64_build: true }).unwrap().exe, None);
+
+        // Elsewhere there is nothing to swap in, only a file to download by hand.
+        assert_eq!((on(Host::Mac).exe, on(Host::Mac).download.as_deref()), (None, Some("https://example/dmg")));
+        assert_eq!(on(Host::Linux { x64: true }).download.as_deref(), Some("https://example/appimage"));
+        assert_eq!(on(Host::Linux { x64: false }).download, None);
+        assert_eq!((on(Host::Other).exe, on(Host::Other).download), (None, None));
+        assert_eq!(parse(json).unwrap(), parse_for(json, Host::this()).unwrap());
+    }
+
+    #[test]
+    fn release_builds_ask_github_whatever_the_environment_says() {
+        let local = Some("http://127.0.0.1:9000/latest".to_string());
+        assert_eq!(api_url_from(local.clone(), true), "http://127.0.0.1:9000/latest");
+        assert_eq!(api_url_from(local, false), RELEASES_API);
+        assert_eq!(api_url_from(None, true), RELEASES_API);
     }
 
     fn scratch(name: &str) -> PathBuf {

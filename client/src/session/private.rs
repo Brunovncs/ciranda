@@ -9,7 +9,7 @@ use crate::core::{self, crypto};
 use crate::dm::{KeyState, Next, Payload, SealError, Vault};
 use gpui::{Context, Task};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -86,6 +86,7 @@ impl Session {
                         s.vault.adopt(key, identity, &recovery, false);
                         // Whatever was sealed to the old key shows as unreadable now; draw it again.
                         s.chats.retain(|room, _| matches!(room, Room::Channel(_)));
+                        s.prune_vault();
                         s.load_dms(cx);
                     }
                     Err(e) => s.vault.state = KeyState::Failed(e.message),
@@ -103,6 +104,7 @@ impl Session {
             return false;
         }
         self.chats.retain(|room, _| matches!(room, Room::Channel(_)));
+        self.prune_vault();
         self.load_dms(cx);
         cx.notify();
         true
@@ -291,7 +293,9 @@ impl Session {
     // Writing.
 
     /// Seals with the current keys and sends; if a key changed meanwhile, learns the new one from
-    /// the refusal and seals again, once.
+    /// the refusal and seals again, once. Only to a key accepted here, as every sealing is (see
+    /// `Vault::seal_message`): the keys in a refusal are the server's word, and a changed one
+    /// nobody here accepted comes back as `KeyNotConfirmed`, with nothing sent.
     fn send_sealed<T: Send + 'static>(
         &mut self,
         seal: impl Fn(&mut Vault) -> Result<Sealed, SealError> + 'static,
@@ -371,7 +375,8 @@ impl Session {
         let private = message.private.clone().unwrap_or_default();
         // The message's own id, one more edit, and which message it is: an edit the server put on
         // another message, or an earlier one it put back, then doesn't open as this one.
-        let payload = Payload { body, file: private.file, reply: message.reply.clone(), mid: private.mid, rev: private.rev + 1, of: Some(id) };
+        let payload =
+            Payload { body, file: private.file, reply: message.reply.clone(), mid: private.mid, rev: private.rev + 1, of: Some(id) };
         self.send_sealed(
             move |v| v.seal_message(conversation, peer, &payload),
             move |api, sealed| Box::pin(async move { api.edit_dm(id, &sealed).await.map(|_| ()) }),
@@ -446,6 +451,24 @@ impl Session {
         if self.open_room == Some(room) {
             self.open_room = None;
         }
+        self.prune_vault();
+    }
+
+    /// The vault forgets what it saw of messages no longer in any history kept here, nor the last
+    /// of a conversation: otherwise a session left running for weeks keeps every text it ever
+    /// opened. Replays and swaps are still told among everything loaded, which is all that is shown.
+    pub(super) fn prune_vault(&mut self) {
+        let mut keep: HashSet<MessageId> = self.dms.values().filter_map(|d| d.info.last.as_ref().map(|m| m.id)).collect();
+        for (room, log) in &self.chats {
+            if let Room::Dm(_) = room {
+                keep.extend(log.messages.iter().map(|m| m.id));
+                keep.extend(log.pending.iter().filter_map(|op| match op {
+                    LogOp::Added(m) | LogOp::Updated(m) => Some(m.id),
+                    _ => None,
+                }));
+            }
+        }
+        self.vault.forget_all_but(&keep);
     }
 
     pub fn set_blocked(&mut self, user: UserId, blocked: bool, cx: &mut Context<Self>) {
@@ -508,7 +531,10 @@ impl Session {
                 }
             }
             "dm:message" => {
-                let (Ok(m), Ok(info)) = (serde_json::from_value::<SealedMessage>(field("message")), serde_json::from_value::<Conversation>(field("conversation"))) else {
+                let (Ok(m), Ok(info)) = (
+                    serde_json::from_value::<SealedMessage>(field("message")),
+                    serde_json::from_value::<Conversation>(field("conversation")),
+                ) else {
                     return true;
                 };
                 let unknown = self.vault.unknown(m.sender_key.into_iter().chain(m.recipient_key));
@@ -625,6 +651,9 @@ impl Session {
         let away = self.viewing != Some(room);
         self.active_at = std::time::Instant::now();
         let mut dm = self.dms.remove(&id).unwrap_or(Dm { peer, preview: String::new(), preview_mine: false, info: info.clone() });
+        // Heard twice: while a background server comes on screen its old socket and the new one
+        // both hear what is sent until the old one closes (`Session::connect`).
+        let again = dm.info.last.as_ref().is_some_and(|l| l.id == m.id) || self.chats.get(&room).is_some_and(|l| l.find(m.id).is_ok());
         dm.info.last_at = dm.info.last_at.max(info.last_at);
         self.vault.pin(peer);
         // A message that waited for its key can arrive after a newer one: it is not the last.
@@ -634,18 +663,22 @@ impl Session {
         }
         // A call both of you were on is not news to either; a missed one is.
         let answered = m.meta.as_ref().is_some_and(|c| c.outcome == "ended");
-        if !mine && away && !answered {
+        if !mine && away && !answered && !again {
             dm.info.unread += 1;
         }
         self.dms.insert(id, dm);
         let opened = self.vault.open_message(&m, peer);
-        if let Some(log) = self.chats.get_mut(&room) {
-            log.push(LogOp::Added(opened.clone()));
+        if let Some(log) = self.chats.get_mut(&room)
+            && log.push(LogOp::Added(opened.clone()))
+        {
+            self.prune_vault();
         }
         if !mine && !away {
             self.mark_read(id, cx);
         }
-        cx.emit(SessionEvent::Message(room, Box::new(opened)));
+        if !again {
+            cx.emit(SessionEvent::Message(room, Box::new(opened)));
+        }
         cx.notify();
     }
 }
@@ -658,7 +691,8 @@ pub fn preview_of(m: &Message, sender: &str, mine: bool) -> String {
     } else if p.out_of_place {
         tr!("Message refused: it isn't where it was sent", "Mensagem recusada: ela não está onde foi enviada").into()
     } else if p.unreadable {
-        tr!("Message protected with a key this computer doesn't have", "Mensagem protegida com uma chave que este computador não tem").into()
+        tr!("Message protected with a key this computer doesn't have", "Mensagem protegida com uma chave que este computador não tem")
+            .into()
     } else if m.body.trim().is_empty() {
         p.file.map(|f| format!("📎 {}", f.name)).unwrap_or_default()
     } else {

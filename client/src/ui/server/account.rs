@@ -105,25 +105,18 @@ impl ServerView {
                 server
             )
         };
-        Ask::confirm_action(
-            tr!("Sign out?", "Sair da conta?"),
-            text,
-            tr!("Sign out", "Sair da conta"),
-            window,
-            cx,
-            move |window, cx| {
-                let api = session.read(cx).api.clone();
-                cx.background_executor()
-                    .spawn(async move {
-                        let _ = core::run(async move { api.logout().await }).await;
-                    })
-                    .detach();
-                set_prefs(cx, |p| p.session_token.clear());
-                if let Some(root) = root.upgrade() {
-                    root.update(cx, |r, cx| r.show_connect(None, window, cx));
-                }
-            },
-        );
+        Ask::confirm_action(tr!("Sign out?", "Sair da conta?"), text, tr!("Sign out", "Sair da conta"), window, cx, move |window, cx| {
+            let api = session.read(cx).api.clone();
+            cx.background_executor()
+                .spawn(async move {
+                    let _ = core::run(async move { api.logout().await }).await;
+                })
+                .detach();
+            set_prefs(cx, |p| p.session_token.clear());
+            if let Some(root) = root.upgrade() {
+                root.update(cx, |r, cx| r.show_connect(None, window, cx));
+            }
+        });
     }
 }
 

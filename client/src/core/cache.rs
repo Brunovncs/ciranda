@@ -87,7 +87,7 @@ impl Cache {
     }
 
     fn load(dir: PathBuf, budget_mb: u64) -> Cache {
-        let _ = std::fs::create_dir_all(&dir);
+        let _ = super::settings::create_private_dir(&dir);
         let index = match std::fs::read_to_string(dir.join("index.json")) {
             Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
                 log::warn!("cache index did not parse, rebuilding it from the files: {e}");
@@ -122,7 +122,13 @@ impl Cache {
     /// same files would have two indexes overwriting each other. Later calls only move the budget.
     pub fn shared(budget_mb: u64) -> Cache {
         static SHARED: OnceLock<Cache> = OnceLock::new();
-        let cache = SHARED.get_or_init(|| Cache::open(super::settings::data_dir().join("media"), budget_mb));
+        let cache = SHARED.get_or_init(|| {
+            let (dir, old) = place();
+            if let Some(old) = old {
+                move_out(&old, &dir);
+            }
+            Cache::open(dir, budget_mb)
+        });
         cache.inner.lock().budget = budget(budget_mb);
         cache.clone()
     }
@@ -293,6 +299,49 @@ impl Cache {
     }
 }
 
+/// Where the cache lives: the system's place for caches, which backups know to skip and which
+/// does not roam with a Windows profile (`%LOCALAPPDATA%\Ciranda\media`,
+/// `~/Library/Caches/Ciranda/media`, `~/.cache/Ciranda/media`); and where versions before this one
+/// kept it, beside the settings. A copy with a `CIRANDA_DATA_DIR` of its own keeps its cache in
+/// there, apart from every other copy's.
+fn place() -> (PathBuf, Option<PathBuf>) {
+    let old = super::settings::data_dir().join("media");
+    if std::env::var_os("CIRANDA_DATA_DIR").is_some() {
+        return (old, None);
+    }
+    match dirs::cache_dir().map(|base| base.join("Ciranda").join("media")) {
+        Some(dir) if dir != old => (dir, Some(old)),
+        _ => (old, None),
+    }
+}
+
+/// The cache where an older version kept it goes to `dir`, once: moved whole when it can be (on
+/// the same disk, a rename), and otherwise deleted, so it does not sit there taking space.
+fn move_out(old: &Path, dir: &Path) {
+    if !old.is_dir() {
+        return;
+    }
+    if !dir.exists() {
+        if let Some(parent) = dir.parent() {
+            let _ = super::settings::create_private_dir(parent);
+        }
+        match std::fs::rename(old, dir) {
+            Ok(()) => return log::info!("media cache moved to {}", dir.display()),
+            Err(e) => log::info!("media cache not moved to {} ({e}): it starts over there", dir.display()),
+        }
+    }
+    let old = old.to_path_buf();
+    // Thousands of files, perhaps: not for the thread that is starting the window.
+    let spawned = std::thread::Builder::new().name("ciranda-cache-cleanup".into()).spawn(move || {
+        if let Err(e) = std::fs::remove_dir_all(&old) {
+            log::warn!("the old media cache in {} was not deleted: {e}", old.display());
+        }
+    });
+    if let Err(e) = spawned {
+        log::warn!("the old media cache stays: {e}");
+    }
+}
+
 /// Every cached file under `dir` (`ab/cd/abcd…`), as (hash, size, modified), deleting the
 /// `.part` files interrupted writes leave behind.
 fn scan(dir: &Path) -> Vec<(String, u64, u64)> {
@@ -390,6 +439,29 @@ mod tests {
         assert!(!inner.index.contains_key(&a) && inner.index.contains_key(&b));
         drop(inner);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_old_cache_moves_out_once_and_is_cleared_if_it_cannot() {
+        let base = temp_dir("move");
+        let (old, dir) = (base.join("config").join("media"), base.join("cache").join("Ciranda").join("media"));
+        let first = Cache::load(old.clone(), 64);
+        let hash = first.insert(b"kept", "image/png");
+        first.flush();
+        move_out(&old, &dir);
+        assert!(!old.exists());
+        assert_eq!(Cache::load(dir.clone(), 64).read(&hash).map(|(b, _)| b.to_vec()), Some(b"kept".to_vec()));
+
+        // A cache already in the new place stays; one made since in the old place goes.
+        Cache::load(old.clone(), 64).insert(b"stray", "image/png");
+        move_out(&old, &dir);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while old.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(!old.exists());
+        assert!(Cache::load(dir.clone(), 64).read(&hash).is_some(), "the new place is left alone");
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]

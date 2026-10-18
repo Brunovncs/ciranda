@@ -54,8 +54,12 @@ version = "0.3"
 [build-dependencies.pkg-config]
 version = "0.3.22"
 
-[build-dependencies.webrtc-sys-build]
-version = "0.3.19"
+# In place of webrtc-sys-build, whose few helpers build.rs now carries (VENDORED.md).
+[build-dependencies.regex]
+version = "1"
+
+[build-dependencies.scratch]
+version = "1"
 
 [target.'cfg(target_os = "linux")'.build-dependencies.pkg-config]
 version = "0.3.22"

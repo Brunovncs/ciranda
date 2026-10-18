@@ -12,7 +12,8 @@ impl Settings {
     pub(super) fn privacy_section(&mut self, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let s = self.session.read(cx);
         let state = s.vault.state.clone();
-        let has_recovery = s.vault.recovery().is_some();
+        // Not `recovery()`: that unseals it, and this runs on every redraw.
+        let has_recovery = s.vault.has_recovery();
         let mut blocked: Vec<(i64, String)> = s.blocked.iter().map(|u| (*u, s.display_name(Some(*u), None))).collect();
         blocked.sort_by_key(|(_, n)| n.to_lowercase());
         let (status, color, glyph) = match &state {
@@ -64,6 +65,14 @@ impl Settings {
                         button("privacy-show", tr!("Show my recovery key", "Mostrar minha chave"), Kind::Standard, t)
                             .on_click(move |_, window, cx| private::backup(&s1, window, cx)),
                     );
+                } else {
+                    key = key.child(caption(
+                        tr!(
+                            "Once you said it was somewhere safe, this computer stopped keeping it, so it can't be shown again. Lost it? Make a new one: the old one stops working.",
+                            "Depois que você confirmou que guardou, este computador deixou de mantê-la, então ela não pode ser mostrada de novo. Perdeu? Gere uma nova: a antiga para de funcionar."
+                        ),
+                        t.text3,
+                    ));
                 }
                 let s2 = session.clone();
                 buttons = buttons.child(

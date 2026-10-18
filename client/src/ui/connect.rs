@@ -63,8 +63,12 @@ pub struct ConnectView {
     resuming: Option<String>,
     /// When the loading screen came up, so it stays long enough to be seen rather than blink.
     resuming_since: std::time::Instant,
-    /// Asks the server about itself while the address and its password are typed.
+    /// Asks the server about itself while the address is typed, and checks its password once
+    /// its box is left.
     probe: Task<()>,
+    /// The address and server password last checked together, so leaving the box again with
+    /// the same in it costs no attempt.
+    door_checked: Option<(String, String)>,
 }
 
 impl EventEmitter<ConnectEvent> for ConnectView {}
@@ -77,6 +81,9 @@ impl Focusable for ConnectView {
 
 impl ConnectView {
     pub fn new(error: Option<String>, window: &mut Window, cx: &mut Context<Self>) -> ConnectView {
+        // The first screen, made with the window: before the updater's first look for a release,
+        // whose client takes the TLS provider installed here.
+        crate::core::api::install_tls();
         let p = prefs(cx).clone();
         let field = |placeholder: &str, value: &str, cx: &mut Context<Self>| {
             let (placeholder, value) = (placeholder.to_string(), value.to_string());
@@ -89,7 +96,9 @@ impl ConnectView {
                 TextFieldEvent::Submit => this.connect(cx),
                 TextFieldEvent::Changed => {
                     this.error = None;
-                    if f == this.server || f == this.door {
+                    // Never the server password as it is typed: the server counts every wrong
+                    // one it is sent, and a few half-typed ones would lock this computer out.
+                    if f == this.server {
                         this.probe(cx);
                     }
                     // Another server or name: the password kept for that one, if any.
@@ -129,7 +138,10 @@ impl ConnectView {
             resuming: None,
             resuming_since: std::time::Instant::now(),
             probe: Task::ready(()),
+            door_checked: None,
         };
+        let door_focus = this.door.focus_handle(cx);
+        cx.on_blur(&door_focus, window, |this: &mut ConnectView, _, cx| this.check_door(false, cx)).detach();
         let first = if p.server_url.is_empty() {
             this.server.clone()
         } else if p.username.is_empty() || saved_token {
@@ -138,7 +150,6 @@ impl ConnectView {
             this.password.clone()
         };
         first.focus_handle(cx).focus(window, cx);
-        this.probe(cx);
         // After signing out, or a kept sign-in the server let expire.
         this.restore_password(cx);
         // Remembered on this computer: go straight in, as a chat app does.
@@ -148,24 +159,58 @@ impl ConnectView {
             this.resuming = Some(name.or_else(|| saved.map(|s| s.host())).unwrap_or_else(|| p.server_url.clone()));
             cx.defer_in(window, |this: &mut ConnectView, _, cx| this.connect(cx));
         }
+        // A server password kept from last time is checked once, with the address; going straight
+        // in checks it anyway, so then the address alone is asked about.
+        if this.resuming.is_none() && !this.door.read(cx).text().is_empty() {
+            this.check_door(true, cx);
+        } else {
+            this.probe(cx);
+        }
         this
     }
 
     /// Whether the server has accounts and an owner decides which fields the form shows, so it is
-    /// asked as soon as the address (and its password) are in, not only after a failed attempt.
+    /// asked as soon as the address is in, not only after a failed attempt. Without the server
+    /// password: a server that has one says only that until it is checked (`check_door`).
     fn probe(&mut self, cx: &mut Context<Self>) {
         let server = self.text(&self.server, cx);
-        let door = self.door.read(cx).text();
         if server.is_empty() {
             self.health = None;
             self.probe = Task::ready(());
             return;
         }
-        self.probe = probe(server, door, cx, |this: &mut ConnectView, health, cx| {
+        self.probe = probe(server, None, TYPING_PAUSE, cx, |this: &mut ConnectView, got, cx| {
+            let health = got.ok();
             if no_accounts(&health) && this.mode == Mode::SignIn {
                 this.mode = Mode::Register;
             }
             this.health = health;
+            cx.notify();
+        });
+    }
+
+    /// The server password, checked once its box is left (or, with `kept`, as it was kept from
+    /// last time): one attempt, not one per pause in typing. Only where the server asks for one,
+    /// and not again for the same address and password.
+    fn check_door(&mut self, kept: bool, cx: &mut Context<Self>) {
+        let server = self.text(&self.server, cx);
+        let door = self.door.read(cx).text();
+        let wanted = kept || self.health.as_ref().is_some_and(|h| h.password_required);
+        let checked = (server.clone(), door.clone());
+        if server.is_empty() || door.is_empty() || !wanted || self.door_checked.as_ref() == Some(&checked) {
+            return;
+        }
+        self.door_checked = Some(checked);
+        self.probe = probe(server, Some(door), Duration::ZERO, cx, |this: &mut ConnectView, got, cx| {
+            if let Some(why) = door_said(&got) {
+                this.error = Some(why);
+            }
+            if let Ok(h) = got {
+                if no_accounts(&Some(h.clone())) && this.mode == Mode::SignIn {
+                    this.mode = Mode::Register;
+                }
+                this.health = Some(h);
+            }
             cx.notify();
         });
     }
@@ -271,7 +316,11 @@ impl ConnectView {
                 match result {
                     Ok(done) => {
                         let connected = finish(done, api, &server, &door, &nickname, &password, remember, cx);
-                        let wait = if this.resuming.is_some() { LOADING_AT_LEAST.saturating_sub(this.resuming_since.elapsed()) } else { Duration::ZERO };
+                        let wait = if this.resuming.is_some() {
+                            LOADING_AT_LEAST.saturating_sub(this.resuming_since.elapsed())
+                        } else {
+                            Duration::ZERO
+                        };
                         if wait.is_zero() {
                             cx.emit(ConnectEvent::Connected(connected));
                         } else {
@@ -323,20 +372,39 @@ impl ConnectView {
     }
 }
 
-/// Asks a server about itself once typing pauses, for which fields a form shows.
+/// How long typing in the address pauses before the server there is asked about.
+const TYPING_PAUSE: Duration = Duration::from_millis(400);
+
+/// Asks a server about itself after `wait`, for which fields a form shows. `door` is the server
+/// password to check with it, which the server counts towards its lockout when wrong: only ever
+/// one the person finished typing, never one on its way.
 fn probe<V: 'static>(
     server: String,
-    door: String,
+    door: Option<String>,
+    wait: Duration,
     cx: &mut Context<V>,
-    done: impl FnOnce(&mut V, Option<Health>, &mut Context<V>) + 'static,
+    done: impl FnOnce(&mut V, Result<Health, ApiError>, &mut Context<V>) + 'static,
 ) -> Task<()> {
     cx.spawn(async move |this, cx| {
-        cx.background_executor().timer(Duration::from_millis(400)).await;
+        if !wait.is_zero() {
+            cx.background_executor().timer(wait).await;
+        }
         let api = Api::new();
-        api.set_server(&server, &door);
-        let health = core::run(async move { api.health().await }).await.ok();
+        api.set_server(&server, door.as_deref().unwrap_or(""));
+        let health = core::run(async move { api.health().await }).await;
         let _ = this.update(cx, |this, cx| done(this, health, cx));
     })
+}
+
+/// What to say about a server password just checked: wrong, or too many wrong ones.
+fn door_said(got: &Result<Health, ApiError>) -> Option<String> {
+    match got {
+        Ok(h) if h.password_required && !h.authenticated => {
+            Some(tr!("That is not this server's password.", "Essa não é a senha do servidor.").into())
+        }
+        Err(e) if e.code == ErrorCode::LockedOut => Some(e.message.clone()),
+        _ => None,
+    }
 }
 
 /// A server with no accounts at all, where only creating one can work.
@@ -826,6 +894,8 @@ pub struct AddServer {
     /// A probe answered for the address as typed, so a silent one reads as "nothing there".
     probed: bool,
     probe: Task<()>,
+    /// As `ConnectView::door_checked`.
+    door_checked: Option<(String, String)>,
 }
 
 impl EventEmitter<ConnectEvent> for AddServer {}
@@ -858,7 +928,8 @@ impl AddServer {
                 TextFieldEvent::Submit => this.submit(cx),
                 TextFieldEvent::Changed => {
                     this.error = None;
-                    if *f == this.server || *f == this.door {
+                    // The address only: see `ConnectView::new`.
+                    if *f == this.server {
                         this.probe(cx);
                     }
                     cx.notify();
@@ -892,7 +963,10 @@ impl AddServer {
             health: None,
             probed: false,
             probe: Task::ready(()),
+            door_checked: None,
         };
+        let door_focus = this.door.focus_handle(cx);
+        cx.on_blur(&door_focus, window, |this: &mut AddServer, _, cx| this.check_door(cx)).detach();
         this.set_mode(if kind == Adding::NewAccount { Mode::Register } else { Mode::SignIn }, cx);
         // The account in use, with the password kept for it: nothing to type but the address.
         if let Some(me) = &this.me {
@@ -920,19 +994,44 @@ impl AddServer {
 
     fn probe(&mut self, cx: &mut Context<Self>) {
         let server = self.server.read(cx).text().trim().to_string();
-        let door = self.door.read(cx).text();
         self.probed = false;
         if server.is_empty() {
             self.health = None;
             self.probe = Task::ready(());
             return;
         }
-        self.probe = probe(server, door, cx, |this: &mut AddServer, health, cx| {
+        self.probe = probe(server, None, TYPING_PAUSE, cx, |this: &mut AddServer, got, cx| {
+            let health = got.ok();
             if no_accounts(&health) {
                 this.set_mode(Mode::Register, cx);
             }
             this.health = health;
             this.probed = true;
+            cx.notify();
+        });
+    }
+
+    /// As `ConnectView::check_door`: once the server password's box is left.
+    fn check_door(&mut self, cx: &mut Context<Self>) {
+        let server = self.server.read(cx).text().trim().to_string();
+        let door = self.door.read(cx).text();
+        let wanted = self.health.as_ref().is_some_and(|h| h.password_required);
+        let checked = (server.clone(), door.clone());
+        if server.is_empty() || door.is_empty() || !wanted || self.door_checked.as_ref() == Some(&checked) {
+            return;
+        }
+        self.door_checked = Some(checked);
+        self.probe = probe(server, Some(door), Duration::ZERO, cx, |this: &mut AddServer, got, cx| {
+            if let Some(why) = door_said(&got) {
+                this.error = Some(why);
+            }
+            if let Ok(h) = got {
+                if no_accounts(&Some(h.clone())) {
+                    this.set_mode(Mode::Register, cx);
+                }
+                this.health = Some(h);
+                this.probed = true;
+            }
             cx.notify();
         });
     }
@@ -1074,11 +1173,9 @@ impl AddServer {
                 let name = h.name.clone().filter(|n| !n.is_empty()).unwrap_or_else(|| "Harmony".into());
                 Some(row(t.success, name, t.text2))
             }
-            None if self.probed => Some(row(
-                t.text3,
-                tr!("No server answered there yet.", "Nenhum servidor respondeu aí ainda.").into(),
-                t.text3,
-            )),
+            None if self.probed => {
+                Some(row(t.text3, tr!("No server answered there yet.", "Nenhum servidor respondeu aí ainda.").into(), t.text3))
+            }
             None => None,
         }
     }
@@ -1212,5 +1309,28 @@ impl Render for AddServer {
                         .on_click(cx.listener(|this, _, _, cx| this.submit(cx))),
                 ),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn health(json: serde_json::Value) -> Result<Health, ApiError> {
+        Ok(serde_json::from_value(json).unwrap())
+    }
+
+    #[test]
+    fn a_checked_server_password_says_only_what_is_wrong() {
+        let wrong = health(serde_json::json!({ "passwordRequired": true, "authenticated": false }));
+        assert!(door_said(&wrong).is_some());
+        let right = health(serde_json::json!({ "passwordRequired": true, "authenticated": true, "hasAccounts": false }));
+        assert_eq!(door_said(&right), None);
+        assert!(no_accounts(&right.ok()), "and the form learns what only a right password shows");
+        assert_eq!(door_said(&health(serde_json::json!({ "passwordRequired": false, "authenticated": true }))), None);
+        let locked = Err(ApiError { status: 429, code: ErrorCode::LockedOut, message: "wait".into(), body: serde_json::Value::Null });
+        assert_eq!(door_said(&locked).as_deref(), Some("wait"));
+        let away = Err(ApiError { status: 0, code: ErrorCode::Unreachable, message: "gone".into(), body: serde_json::Value::Null });
+        assert_eq!(door_said(&away), None);
     }
 }

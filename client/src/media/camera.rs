@@ -15,11 +15,11 @@ use libwebrtc::video_source::VideoResolution;
 use libwebrtc::video_source::native::NativeVideoSource;
 use nokhwa::Camera;
 use nokhwa::pixel_format::RgbFormat;
-use nokhwa::utils::{ApiBackend, CameraFormat, FrameFormat, RequestedFormat, RequestedFormatType};
+use nokhwa::utils::{ApiBackend, CameraFormat, CameraIndex, FrameFormat, RequestedFormat, RequestedFormatType};
 use parking_lot::Mutex;
 use std::cmp::Reverse;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -60,11 +60,7 @@ fn query() -> Result<Vec<nokhwa::utils::CameraInfo>, nokhwa::NokhwaError> {
 }
 
 pub fn devices() -> Vec<Device> {
-    query()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|c| Device { id: c.human_name(), name: c.human_name() })
-        .collect()
+    query().unwrap_or_default().into_iter().map(|c| Device { id: c.human_name(), name: c.human_name() }).collect()
 }
 
 /// The pictures that ship with Ciranda, by the name settings store.
@@ -201,7 +197,12 @@ impl Capture {
         std::thread::Builder::new()
             .name("ciranda-camera".into())
             .spawn(move || {
-                let out = run(&device, src, prev, st, bg, &tp, lends.then_some(&give_up));
+                // A panic in here would otherwise leave the camera "in use" by a capture that is
+                // gone, with nothing said: it ends the capture like any other failure.
+                let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run(&device, src, prev, st, bg, &tp, lends.then_some(&give_up))
+                }))
+                .unwrap_or_else(|_| Err(anyhow::anyhow!(tr!("The camera stopped unexpectedly.", "A câmera parou de repente."))));
                 tp.ended.store(true, Ordering::Relaxed);
                 let mut holder = HOLDER.lock();
                 if holder.as_ref().is_some_and(|h| Arc::ptr_eq(&h.tap, &tp)) {
@@ -260,9 +261,17 @@ fn open(device: &str) -> anyhow::Result<Camera> {
         .find(|c| c.human_name() == device)
         .or_else(|| cams.first())
         .ok_or_else(|| anyhow::anyhow!(tr!("No camera found.", "Nenhuma câmera encontrada.")))?;
-    // nokhwa's own "closest" match gives up when the camera lacks the exact size asked for, and
-    // its fallback is the biggest picture there is; the mode is picked here instead.
-    let mut cam = Camera::new(info.index().clone(), RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate))?;
+    let (mut cam, mode) = open_mode(info.index())?;
+    log::info!("camera: {}x{} {:?} at {} fps", mode.width(), mode.height(), mode.format(), mode.frame_rate());
+    cam.open_stream()?;
+    Ok(cam)
+}
+
+/// The camera, set to the mode `best_format` picks. nokhwa's own "closest" match gives up when
+/// the camera lacks the exact size asked for, and its fallback is the biggest picture there is.
+#[cfg(not(target_os = "macos"))]
+fn open_mode(index: &CameraIndex) -> anyhow::Result<(Camera, CameraFormat)> {
+    let mut cam = Camera::new(index.clone(), RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate))?;
     let mut mode = cam.camera_format();
     if let Some(best) = cam.compatible_camera_formats().ok().and_then(|f| best_format(&f)) {
         match cam.set_camera_requset(RequestedFormat::new::<RgbFormat>(RequestedFormatType::Exact(best))) {
@@ -270,9 +279,35 @@ fn open(device: &str) -> anyhow::Result<Camera> {
             Err(e) => log::info!("camera: {best} refused: {e}"),
         }
     }
-    log::info!("camera: {}x{} {:?} at {} fps", mode.width(), mode.height(), mode.format(), mode.frame_rate());
-    cam.open_stream()?;
-    Ok(cam)
+    Ok((cam, mode))
+}
+
+/// On macOS nokhwa's list of modes is no use: it keeps the ones *not* of the format asked about,
+/// and calls the camera's NV12 modes ("420v", "420f") YUYV. Its frames then come in the format
+/// of the mode set, which for a JPEG mode is none a video output gives (an Objective-C exception),
+/// and for NV12 the 10-bit kind it maps NV12 to (garbage). So the modes are read from the device
+/// itself, and only the uncompressed ones (all labelled YUYV) are used: for those nokhwa asks
+/// AVFoundation for 'yuvs' frames, packed Y0 Cb Y1 Cr, which AVFoundation converts any of them to
+/// and the converter reads as YUY2.
+#[cfg(target_os = "macos")]
+fn open_mode(index: &CameraIndex) -> anyhow::Result<(Camera, CameraFormat)> {
+    let modes: Vec<CameraFormat> = nokhwa_bindings_macos::AVCaptureDevice::new(index)?
+        .supported_formats()?
+        .into_iter()
+        .filter(|f| f.format() == FrameFormat::YUYV)
+        .collect();
+    let best = best_format(&modes).ok_or_else(|| {
+        anyhow::anyhow!(tr!(
+            "The camera offers no picture Ciranda can use.",
+            "A câmera não oferece nenhuma imagem que Ciranda consiga usar."
+        ))
+    })?;
+    let mut cam = Camera::new(index.clone(), RequestedFormat::new::<RgbFormat>(RequestedFormatType::Exact(best)))?;
+    // nokhwa sets the mode by size and rate alone, so a JPEG one of the same size could have
+    // been taken instead: never streamed from.
+    let mode = cam.refresh_camera_format()?;
+    anyhow::ensure!(mode.format() == FrameFormat::YUYV, "camera: the {best} mode came out as {mode}");
+    Ok((cam, mode))
 }
 
 /// The centre of a w × h picture in the shape of the frame sent, as (x, y, width, height), on
@@ -511,6 +546,104 @@ impl Meter {
 /// the call, or a switch to another camera.
 static DEVICE: Mutex<()> = parking_lot::const_mutex(());
 
+/// No frame for this long and the camera counts as gone: unplugged, asleep, or taken by the
+/// system. nokhwa waits for a frame without a limit (on macOS for ever, once the device has
+/// gone), so the frames are read on a thread of their own and this one stops waiting for it.
+const FRAME_STALL: Duration = Duration::from_secs(3);
+/// Opening, and the first frame after, may take longer: some cameras need a couple of seconds.
+const OPEN_LIMIT: Duration = Duration::from_secs(10);
+/// How long a capture that stops waits for its reader to close the camera before leaving it.
+const CLOSE_LIMIT: Duration = Duration::from_secs(2);
+
+/// What the reading thread hands over.
+enum Read {
+    /// Open, under this name.
+    Opened(String),
+    Frame(nokhwa::Buffer),
+    /// A frame that failed; the camera may still recover.
+    Bad(anyhow::Error),
+    /// It would not open.
+    Failed(anyhow::Error),
+}
+
+/// The thread that owns the camera and reads it, one frame ahead. Dropped, it is told to stop and
+/// given a moment to close the camera; one stuck inside nokhwa is left behind, to close it if it
+/// ever comes back.
+struct Reader {
+    frames: Option<Receiver<Read>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Reader {
+    fn start(device: &str) -> anyhow::Result<Reader> {
+        let (tx, frames) = sync_channel(1);
+        let stop = Arc::new(AtomicBool::new(false));
+        let (st, device) = (stop.clone(), device.to_string());
+        let thread = std::thread::Builder::new().name("ciranda-camera-read".into()).spawn(move || {
+            let mut cam = match open(&device) {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(Read::Failed(e));
+                    return;
+                }
+            };
+            if tx.send(Read::Opened(cam.info().human_name())).is_err() {
+                return;
+            }
+            while !st.load(Ordering::Relaxed) {
+                let read = match cam.frame() {
+                    Ok(f) => Read::Frame(f),
+                    Err(e) => Read::Bad(e.into()),
+                };
+                let bad = matches!(read, Read::Bad(_));
+                // Gone once the capture stopped listening.
+                if tx.send(read).is_err() {
+                    break;
+                }
+                if bad {
+                    std::thread::sleep(Duration::from_millis(33));
+                }
+            }
+        })?;
+        Ok(Reader { frames: Some(frames), stop, thread: Some(thread) })
+    }
+
+    /// The next read within `limit`, checking `cancel` every few hundred milliseconds: `Ok(None)`
+    /// once it is set, an error if the camera went quiet or its thread ended.
+    fn next(&self, limit: Duration, cancel: impl Fn() -> bool) -> anyhow::Result<Option<Read>> {
+        let Some(frames) = &self.frames else { return Ok(None) };
+        let since = Instant::now();
+        loop {
+            match frames.recv_timeout(Duration::from_millis(200)) {
+                Ok(read) => return Ok(Some(read)),
+                Err(RecvTimeoutError::Timeout) if cancel() => return Ok(None),
+                Err(RecvTimeoutError::Timeout) if since.elapsed() >= limit => {
+                    anyhow::bail!(tr!("The camera stopped sending pictures.", "A câmera parou de enviar imagens."))
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => anyhow::bail!(tr!("The camera stopped.", "A câmera parou.")),
+            }
+        }
+    }
+}
+
+impl Drop for Reader {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        // No one listening: a reader waiting to hand over a frame gives up at once.
+        drop(self.frames.take());
+        let Some(thread) = self.thread.take() else { return };
+        let until = Instant::now() + CLOSE_LIMIT;
+        while !thread.is_finished() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !thread.is_finished() {
+            log::warn!("camera: the device did not let go; leaving it behind");
+        }
+    }
+}
+
 fn run(
     device: &str,
     source: NativeVideoSource,
@@ -535,10 +668,18 @@ fn run(
         }
         *holder = Some(Holder { device: device.to_string(), tap: tap.clone(), lends: true, give_up: give_up.clone() });
     }
-    let mut cam = open(device)?;
+    // Declared after the device's lock, so dropped (the camera closed) before it is let go.
+    let reader = Reader::start(device)?;
+    let cancel = || stop.load(Ordering::Relaxed) || given_up();
+    let name = match reader.next(OPEN_LIMIT, cancel)? {
+        Some(Read::Opened(name)) => name,
+        Some(Read::Failed(e)) => return Err(e),
+        Some(_) => anyhow::bail!("camera: a frame before the camera opened"),
+        None => return Ok(()),
+    };
     // Asked for by id or as "the first one": named now as opened, for a composition to match.
     if let Some(h) = HOLDER.lock().as_mut().filter(|h| Arc::ptr_eq(&h.tap, tap)) {
-        h.device = cam.info().human_name();
+        h.device = name;
     }
     let mut converter = Converter::default();
     let mut compositor = Compositor::new();
@@ -552,15 +693,19 @@ fn run(
     let mut meter = Meter::new();
     let started = Instant::now();
     let mut bad = 0u32;
-    while !stop.load(Ordering::Relaxed) && !given_up() {
-        let frame = match cam.frame() {
-            Ok(f) => f,
-            Err(e) => {
-                strike(&mut bad, e.into())?;
-                std::thread::sleep(pacer.interval);
+    // The first frame may be slow to come; after it, a gap this long means the camera is gone.
+    let mut limit = OPEN_LIMIT;
+    while !cancel() {
+        let frame = match reader.next(limit, cancel)? {
+            Some(Read::Frame(f)) => f,
+            Some(Read::Bad(e)) => {
+                strike(&mut bad, e)?;
                 continue;
             }
+            Some(Read::Opened(_) | Read::Failed(_)) => continue,
+            None => break,
         };
+        limit = FRAME_STALL;
         meter.got += 1;
         meter.tick();
         if !pacer.admit(started.elapsed()) {
@@ -811,6 +956,28 @@ mod tests {
         let (y, stride) = frame.plane(0);
         let at = |x: usize| y[stride * 10 + x];
         assert!(at(10) > 225 && at(WIDTH as usize - 10) < 30, "{} {}", at(10), at(WIDTH as usize - 10));
+    }
+
+    #[test]
+    fn a_camera_gone_quiet_is_given_up_on() {
+        let reader = |rx| Reader { frames: Some(rx), stop: Arc::default(), thread: None };
+        // Nothing comes: an error once the limit passes, not a wait for ever.
+        let (tx, rx) = sync_channel::<Read>(1);
+        let started = Instant::now();
+        assert!(reader(rx).next(Duration::from_millis(300), || false).is_err());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        // Stopped meanwhile: no error, just the end.
+        let (_tx2, rx) = sync_channel::<Read>(1);
+        assert!(matches!(reader(rx).next(Duration::from_secs(5), || true), Ok(None)));
+        // The reading thread gone: an error at once.
+        drop(tx);
+        let (tx, rx) = sync_channel::<Read>(1);
+        drop(tx);
+        assert!(reader(rx).next(Duration::from_secs(5), || false).is_err());
+        // A frame on time is handed over.
+        let (tx, rx) = sync_channel::<Read>(1);
+        tx.send(Read::Opened("cam".into())).unwrap();
+        assert!(matches!(reader(rx).next(Duration::from_secs(5), || false), Ok(Some(Read::Opened(n))) if n == "cam"));
     }
 
     /// Frames at `fps` with a few milliseconds of jitter, through a pacer at `FPS`, for 10 s.

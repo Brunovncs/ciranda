@@ -316,7 +316,8 @@ mod platform {
         /// when `--quit` asks Ciranda to go.
         pub fn on_show(&self, events: async_channel::Sender<Event>) {
             // Each event, and whether it is the one asking to quit.
-            let events_of: Vec<(isize, bool)> = [(self.show, false), (self.quit, true)].into_iter().filter_map(|(h, q)| Some((h?, q))).collect();
+            let events_of: Vec<(isize, bool)> =
+                [(self.show, false), (self.quit, true)].into_iter().filter_map(|(h, q)| Some((h?, q))).collect();
             if events_of.is_empty() {
                 return;
             }
@@ -893,13 +894,19 @@ mod platform {
         true
     }
 
-    /// One Ciranda per settings folder, as on Windows, through a socket in that folder: a start
-    /// that can connect to it finds a copy running, asks it to show its window and exits.
+    /// One Ciranda per settings folder, as on Windows: the copy that holds the lock on a file in
+    /// that folder is the one, and listens on a socket beside it; a start that can't take the
+    /// lock asks that copy, through the socket, to show its window and exits. The lock goes with
+    /// the process however it ends, so a crash leaves nothing to clear up, and two starts at the
+    /// same moment can't both take it.
     pub struct Instance {
         listener: Option<std::os::unix::net::UnixListener>,
+        /// Held until Ciranda exits.
+        _lock: Option<std::fs::File>,
     }
 
     const SOCKET: &str = "instance.sock";
+    const LOCK: &str = "instance.lock";
 
     /// Says `what` to the copy listening on `dir`; false when none is.
     fn tell(dir: &Path, what: &[u8]) -> bool {
@@ -912,30 +919,55 @@ mod platform {
         /// window and this one should exit. After an update restarts Ciranda (`wait`), the copy
         /// being replaced is given time to finish quitting first.
         pub fn claim(data_dir: &Path, wait: bool) -> Option<Instance> {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(if wait { 15 } else { 0 });
+            use std::fs::TryLockError;
+            use std::os::unix::fs::OpenOptionsExt;
+            use std::time::{Duration, Instant};
+            let _ = crate::core::settings::create_private_dir(data_dir);
+            let path = data_dir.join(LOCK);
+            let lock = match std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).mode(0o600).open(&path) {
+                Ok(lock) => lock,
+                Err(e) => {
+                    log::warn!("single instance: {}: {e}, running anyway", path.display());
+                    return Some(Instance::listen(data_dir, None));
+                }
+            };
+            // A copy holding the lock binds its socket straight after taking it; one that does
+            // not answer within this is stuck, and this start runs rather than never starting.
+            let deadline = Instant::now() + Duration::from_secs(if wait { 15 } else { 5 });
             loop {
-                match std::os::unix::net::UnixStream::connect(data_dir.join(SOCKET)) {
-                    Ok(_) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(200)),
-                    Ok(_) => return (!tell(data_dir, b"open")).then(|| Instance::listen(data_dir)),
-                    Err(_) => return Some(Instance::listen(data_dir)),
+                match lock.try_lock() {
+                    Ok(()) => return Some(Instance::listen(data_dir, Some(lock))),
+                    // A copy being replaced by an update is left to quit, not asked to show.
+                    Err(TryLockError::WouldBlock) if !wait && tell(data_dir, b"open") => return None,
+                    Err(TryLockError::WouldBlock) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
+                    Err(TryLockError::WouldBlock) if tell(data_dir, b"open") => return None,
+                    Err(TryLockError::WouldBlock) => {
+                        log::warn!("single instance: the copy holding {} does not answer, running anyway", path.display());
+                        return Some(Instance::listen(data_dir, None));
+                    }
+                    // A file system without locks.
+                    Err(TryLockError::Error(e)) => {
+                        log::warn!("single instance: {}: {e}, running anyway", path.display());
+                        return Some(Instance::listen(data_dir, None));
+                    }
                 }
             }
         }
 
         /// Harmony never ran here: there is nothing to wait for.
         pub fn claim_legacy(_: &Path, _: bool) -> Option<Instance> {
-            Some(Instance { listener: None })
+            Some(Instance { listener: None, _lock: None })
         }
 
-        /// Listens on the folder's socket, replacing one left by a copy that did not exit cleanly.
-        fn listen(data_dir: &Path) -> Instance {
+        /// Listens on the folder's socket, replacing one left by a copy that did not exit cleanly
+        /// (only the lock's holder gets here, so it is never a running copy's).
+        fn listen(data_dir: &Path, lock: Option<std::fs::File>) -> Instance {
             let path = data_dir.join(SOCKET);
-            let _ = std::fs::create_dir_all(data_dir);
             let _ = std::fs::remove_file(&path);
             let listener = std::os::unix::net::UnixListener::bind(&path)
                 .inspect_err(|e| log::warn!("single instance: {}: {e}, running anyway", path.display()))
                 .ok();
-            Instance { listener }
+            Instance { listener, _lock: lock }
         }
 
         /// Sends `Event::Open` each time another start asks for the window, and `Event::Quit`

@@ -155,7 +155,13 @@ impl Root {
     /// After going to a server: a call still ringing anywhere rings again, on the server now on
     /// screen or on one in the background. The dialog that rang went with the screen before.
     pub(super) fn resume_rings(&mut self, window: &mut Window, cx: &mut Context<Root>) {
-        let me = |s: &Session| s.calls.values().filter(|c| c.state == CallPhase::Ringing && c.callee_id == s.me.id).map(|c| c.conversation_id).collect::<Vec<_>>();
+        let me = |s: &Session| {
+            s.calls
+                .values()
+                .filter(|c| c.state == CallPhase::Ringing && c.callee_id == s.me.id)
+                .map(|c| c.conversation_id)
+                .collect::<Vec<_>>()
+        };
         if let super::Screen::Server(v) = &self.screen {
             let answering = match self.then {
                 Some(Then::Answer(id)) => Some(id),
@@ -169,7 +175,8 @@ impl Root {
             }
         }
         if self.away_ringing.is_none() {
-            let away: Vec<Entity<Session>> = elsewhere::elsewhere(cx).map(|e| e.away.iter().map(|a| a.session.clone()).collect()).unwrap_or_default();
+            let away: Vec<Entity<Session>> =
+                elsewhere::elsewhere(cx).map(|e| e.away.iter().map(|a| a.session.clone()).collect()).unwrap_or_default();
             if let Some((session, id)) = away.into_iter().find_map(|s| me(s.read(cx)).first().copied().map(|id| (s, id))) {
                 self.away_ringing(&session, id, window, cx);
             }
@@ -198,9 +205,7 @@ impl Root {
             SessionEvent::Ringing(conversation) => self.away_ringing(session, *conversation, window, cx),
             SessionEvent::CallChanged(conversation) => {
                 let still = session.read(cx).calls.get(conversation).is_some_and(|c| c.state == CallPhase::Ringing);
-                if !still
-                    && let Some((id, view)) = self.away_ringing.take()
-                {
+                if !still && let Some((id, view)) = self.away_ringing.take() {
                     if id == session.entity_id() && view.read(cx).conversation == *conversation {
                         view.update(cx, |v, cx| v.close(cx));
                     } else {

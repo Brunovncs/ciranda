@@ -92,6 +92,9 @@ pub enum ErrorCode {
     StaleKey,
     NoKey,
     PeerHasNoKey,
+    /// The client's own: their key changed and the new one is not accepted on this computer, so
+    /// nothing was sealed to it.
+    KeyNotConfirmed,
     BadKey,
     BadMessage,
     Blocked,
@@ -953,7 +956,8 @@ mod tests {
         .unwrap();
         assert_eq!(c.state, CallPhase::Ringing);
         let t: VoiceTokens =
-            serde_json::from_str(r#"{"conversationId":2,"token":"t","publish":{"voice":"a","cam":"b","screen":"c"},"whepBase":"w"}"#).unwrap();
+            serde_json::from_str(r#"{"conversationId":2,"token":"t","publish":{"voice":"a","cam":"b","screen":"c"},"whepBase":"w"}"#)
+                .unwrap();
         assert_eq!(t.channel_id, None);
     }
 

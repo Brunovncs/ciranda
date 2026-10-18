@@ -3,7 +3,8 @@
 //! version back if the new one keeps dying as it starts: see `core::update`). In a voice call it
 //! waits: the new version is put in place at once, and the restart happens when the call ends,
 //! or now if the person says so. A development build only opens the release's page, so it never
-//! replaces the program cargo built.
+//! replaces the program cargo built. On macOS and Linux the button says "Download" and fetches
+//! the release's disk image or AppImage, to be put in place by hand.
 
 use crate::core::update::{self, Release};
 use crate::prefs::{prefs, set_prefs};
@@ -221,7 +222,7 @@ impl Updater {
 
     fn update_now(&mut self, r: Release, cx: &mut Context<Self>) {
         let Some(exe) = self.exe.clone().filter(|_| SELF_UPDATE && r.exe.is_some()) else {
-            cx.open_url(&r.page);
+            cx.open_url(r.download.as_deref().unwrap_or(&r.page));
             return;
         };
         self.state = State::Downloading(r.clone(), 0.);
@@ -342,6 +343,28 @@ fn about(r: &Release) -> String {
     }
 }
 
+/// What a click does where Ciranda does not replace itself: macOS and Linux, where it downloads
+/// the disk image or the AppImage to be put in place by hand, and a development build.
+fn by_hand(r: &Release) -> &'static str {
+    match r.download {
+        Some(_) if cfg!(target_os = "macos") => tr!(
+            "Click to download it. Open the disk image and drag Ciranda to Applications, replacing this one; settings and sign-ins stay.",
+            "Clique para baixar. Abra a imagem de disco e arraste Ciranda para Aplicativos, substituindo esta; configurações e logins continuam."
+        ),
+        Some(_) => tr!(
+            "Click to download the new AppImage, then run it in place of this one; settings and sign-ins stay.",
+            "Clique para baixar o novo AppImage e depois abra-o no lugar deste; configurações e logins continuam."
+        ),
+        None if cfg!(windows) => {
+            tr!(
+                "This build can't replace itself; the click opens the release's page.",
+                "Esta cópia não se atualiza sozinha; clicar abre a página da versão."
+            )
+        }
+        None => tr!("Click to open the release's page and download it there.", "Clique para abrir a página da versão e baixar por lá."),
+    }
+}
+
 fn pill(
     id: &'static str,
     glyph: &'static str,
@@ -386,18 +409,18 @@ pub fn button(cx: &App) -> Option<AnyElement> {
     let el = match &u.state {
         State::Available(r) => {
             let installs = SELF_UPDATE && r.exe.is_some();
-            let hint = if installs {
-                tr!(
-                    "Click to update. Ciranda restarts by itself, after your call if you're in one.",
-                    "Clique para atualizar. Ciranda reinicia automaticamente, depois da sua chamada se você estiver em uma."
+            let (label, hint) = if installs {
+                (
+                    tr!("Update", "Atualizar"),
+                    tr!(
+                        "Click to update. Ciranda restarts by itself, after your call if you're in one.",
+                        "Clique para atualizar. Ciranda reinicia automaticamente, depois da sua chamada se você estiver em uma."
+                    ),
                 )
             } else {
-                tr!(
-                    "This build can't replace itself; the click opens the release's page.",
-                    "Esta cópia não se atualiza sozinha; clicar abre a página da versão."
-                )
+                (tr!("Download", "Baixar"), by_hand(r))
             };
-            clickable(pill("update-available", "download", tr!("Update", "Atualizar"), t.on_accent, t.accent, t.accent))
+            clickable(pill("update-available", "download", label, t.on_accent, t.accent, t.accent))
                 .tooltip(tip(format!("{}\n\n{hint}", about(r)), &t))
                 .into_any_element()
         }

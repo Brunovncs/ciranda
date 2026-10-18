@@ -771,7 +771,7 @@ pub struct PaintSurface {
     pub content_mask: ContentMask<ScaledPixels>,
     #[cfg(target_os = "macos")]
     pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub corner_radii: Corners<ScaledPixels>,
     #[cfg(target_os = "windows")]
     pub frame: SurfaceFrame,

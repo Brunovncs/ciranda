@@ -49,7 +49,9 @@ impl FrameKey {
 
     fn cryptor_for(&self, kind: Side) -> FrameCryptor {
         let fc = match kind {
-            Side::Send(sender) => FrameCryptor::new_for_rtp_sender(factory(), "harmony".into(), EncryptionAlgorithm::AesGcm, self.0.clone(), sender),
+            Side::Send(sender) => {
+                FrameCryptor::new_for_rtp_sender(factory(), "harmony".into(), EncryptionAlgorithm::AesGcm, self.0.clone(), sender)
+            }
             Side::Receive(receiver) => {
                 FrameCryptor::new_for_rtp_receiver(factory(), "harmony".into(), EncryptionAlgorithm::AesGcm, self.0.clone(), receiver)
             }
@@ -335,8 +337,10 @@ impl Link {
             for s in &stats {
                 let RtcStats::InboundRtp(i) = s else { continue };
                 let (r, d) = (&i.received, &i.inbound);
-                let buffer = if d.jitter_buffer_emitted_count > 0 { d.jitter_buffer_delay / d.jitter_buffer_emitted_count as f64 } else { 0. };
-                let concealed = if d.total_samples_received > 0 { d.concealed_samples as f64 / d.total_samples_received as f64 } else { 0. };
+                let buffer =
+                    if d.jitter_buffer_emitted_count > 0 { d.jitter_buffer_delay / d.jitter_buffer_emitted_count as f64 } else { 0. };
+                let concealed =
+                    if d.total_samples_received > 0 { d.concealed_samples as f64 / d.total_samples_received as f64 } else { 0. };
                 log::debug!(
                     "inbound {}: {} packets, {} lost, jitter {:.0} ms, buffer {:.0} ms, concealed {:.1}%, rtt {rtt:?} ms",
                     i.stream.kind,
@@ -492,6 +496,47 @@ pub fn with_candidates(sdp: &str, candidates: &[(usize, String)]) -> String {
     out
 }
 
+/// The SDP with `params` on the format line of every Opus payload type: replacing what the line
+/// has of them, adding the rest, and adding the line where there is none. The Opus encoder sends
+/// what the far end's description asks for, and MediaMTX's answer asks for its defaults.
+pub fn with_opus_params(sdp: &str, params: &[(&str, String)]) -> String {
+    let lines: Vec<&str> = sdp.split("\r\n").flat_map(|l| l.split('\n')).filter(|l| !l.is_empty()).collect();
+    let opus: Vec<&str> = lines
+        .iter()
+        .filter_map(|l| {
+            let (pt, codec) = l.strip_prefix("a=rtpmap:")?.split_once(' ')?;
+            codec.to_ascii_lowercase().starts_with("opus/").then_some(pt)
+        })
+        .collect();
+    let fmtp_of = |l: &str| l.strip_prefix("a=fmtp:").and_then(|r| r.split_once(' ')).map(|(pt, rest)| (pt.to_string(), rest.to_string()));
+    let has_fmtp: Vec<String> = lines.iter().filter_map(|l| fmtp_of(l).map(|(pt, _)| pt)).collect();
+    let merged = |existing: &str| {
+        let mut kept: Vec<String> = existing
+            .split(';')
+            .map(str::trim)
+            .filter(|kv| !kv.is_empty() && !params.iter().any(|(k, _)| kv.split('=').next() == Some(k)))
+            .map(str::to_string)
+            .collect();
+        kept.extend(params.iter().map(|(k, v)| format!("{k}={v}")));
+        kept.join(";")
+    };
+    let mut out = String::with_capacity(sdp.len() + 64);
+    for line in lines {
+        match fmtp_of(line) {
+            Some((pt, rest)) if opus.contains(&pt.as_str()) => out.push_str(&format!("a=fmtp:{pt} {}", merged(&rest))),
+            _ => out.push_str(line),
+        }
+        out.push_str("\r\n");
+        if let Some((pt, _)) = line.strip_prefix("a=rtpmap:").and_then(|r| r.split_once(' '))
+            && opus.contains(&pt)
+            && !has_fmtp.iter().any(|p| p == pt)
+        {
+            out.push_str(&format!("a=fmtp:{pt} {}\r\n", merged("")));
+        }
+    }
+    out
+}
+
 async fn negotiate(
     api: &Api,
     pc: PeerConnection,
@@ -499,6 +544,7 @@ async fn negotiate(
     gathering: Gathering,
     receive: bool,
     cryptors: Vec<FrameCryptor>,
+    opus: &[(&str, String)],
 ) -> Result<Link, ApiError> {
     let fail = |m: String| ApiError { status: 0, code: ErrorCode::MediaError, message: m, body: Default::default() };
     // The bindings always pass the legacy offerToReceive options, and `false` turns receiving
@@ -516,6 +562,7 @@ async fn negotiate(
             return Err(e);
         }
     };
+    let answer = if opus.is_empty() { answer } else { with_opus_params(&answer, opus) };
     if std::env::var_os("CIRANDA_SDP_DEBUG").is_some() {
         log::info!("offer to {url}:\n{sdp}\nanswer:\n{answer}");
     }
@@ -582,6 +629,16 @@ pub async fn publish(
         send_encodings: Vec::new(),
     };
     let fail = |m: String| ApiError { status: 0, code: ErrorCode::MediaError, message: m, body: Default::default() };
+    // A share's sound goes with its picture, in stereo (music, games) at its own bitrate. A
+    // microphone goes alone, with DTX: through silence a packet every 400 ms instead of 50 a
+    // second, still often enough for a listener's 8 s stall check.
+    let opus: Vec<(&str, String)> = match &audio {
+        Some((_, bitrate)) if video.is_some() => {
+            vec![("stereo", "1".into()), ("sprop-stereo", "1".into()), ("maxaveragebitrate", bitrate.to_string())]
+        }
+        Some(_) => vec![("usedtx", "1".into())],
+        None => Vec::new(),
+    };
     let mut cryptors = Vec::new();
     let mut audio_bitrate = None;
     if let Some((track, bitrate)) = audio {
@@ -598,7 +655,7 @@ pub async fn publish(
         cryptors.extend(key.map(|k| k.cryptor_for(Side::Send(t.sender()))));
         video_params = Some(params);
     }
-    let link = negotiate(api, pc, url, gathered, false, cryptors).await?;
+    let link = negotiate(api, pc, url, gathered, false, cryptors, &opus).await?;
     if video_params.is_some() {
         watch_encoder(link.pc.clone(), link.hardware_encoder.clone());
     }
@@ -721,7 +778,7 @@ pub async fn watch(
     }
     let t = pc.add_transceiver_for_media(MediaType::Audio, init()).map_err(|e| fail(e.message))?;
     cryptors.extend(key.map(|k| k.cryptor_for(Side::Receive(t.receiver()))));
-    let link = negotiate(api, pc, url, gathered, true, cryptors).await?;
+    let link = negotiate(api, pc, url, gathered, true, cryptors, &[]).await?;
     // Each receiving transceiver has its track from the start; hand them over once connected.
     let mut on_track = on_track;
     log::debug!("{} transceivers", link.pc.transceivers().len());
@@ -972,6 +1029,20 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].urls, vec!["turn:relay.example:3478?transport=udp".to_string()]);
         assert_eq!(out[0].username, "u");
+    }
+
+    #[test]
+    fn opus_gets_the_parameters_asked_for_and_nothing_else_changes() {
+        let answer = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111 0\r\na=rtpmap:111 opus/48000/2\r\na=fmtp:111 minptime=10;useinbandfec=1;stereo=0\r\na=rtpmap:0 PCMU/8000\r\na=fmtp:0 x=1\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=rtpmap:96 H264/90000\r\na=fmtp:96 packetization-mode=1\r\n";
+        let stereo = [("stereo", "1".to_string()), ("maxaveragebitrate", "128000".to_string())];
+        let out = with_opus_params(answer, &stereo);
+        assert!(out.contains("a=fmtp:111 minptime=10;useinbandfec=1;stereo=1;maxaveragebitrate=128000\r\n"), "{out}");
+        assert!(out.contains("a=fmtp:0 x=1\r\n") && out.contains("a=fmtp:96 packetization-mode=1\r\n"), "{out}");
+        assert_eq!(out.matches("a=fmtp:111").count(), 1);
+        // An answer with no format line for Opus gets one, right after its rtpmap.
+        let bare = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=rtpmap:111 OPUS/48000/2\r\na=mid:0\r\n";
+        let out = with_opus_params(bare, &[("usedtx", "1".to_string())]);
+        assert!(out.contains("a=rtpmap:111 OPUS/48000/2\r\na=fmtp:111 usedtx=1\r\na=mid:0\r\n"), "{out}");
     }
 
     #[test]

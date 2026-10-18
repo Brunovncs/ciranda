@@ -24,6 +24,20 @@ impl From<CVPixelBuffer> for SurfaceSource {
     }
 }
 
+#[cfg(target_os = "macos")]
+impl SurfaceSource {
+    /// The CoreVideo pixel buffer at `buffer`, taking over one reference to it (as from a
+    /// `Create` or `Retain` call), for callers without core-video's bindings of their own.
+    ///
+    /// # Safety
+    ///
+    /// `buffer` must be a valid `CVPixelBufferRef` the caller owns a reference to.
+    pub unsafe fn from_cv_pixel_buffer(buffer: *mut std::ffi::c_void) -> Self {
+        use core_foundation::base::TCFType;
+        SurfaceSource::Surface(unsafe { CVPixelBuffer::wrap_under_create_rule(buffer.cast()) })
+    }
+}
+
 #[cfg(target_os = "windows")]
 impl From<crate::SurfaceFrame> for SurfaceSource {
     fn from(value: crate::SurfaceFrame) -> Self {
@@ -115,8 +129,10 @@ impl Element for Surface {
             SurfaceSource::Surface(surface) => {
                 let size = crate::size(surface.get_width().into(), surface.get_height().into());
                 let new_bounds = self.object_fit.get_bounds(bounds, size);
-                // TODO: Add support for corner_radii
-                window.paint_surface(new_bounds, surface.clone());
+                let mut style = Style::default();
+                style.refine(&self.style);
+                let corner_radii = style.corner_radii.to_pixels(window.rem_size());
+                window.paint_surface(new_bounds, corner_radii, surface.clone());
             }
             #[cfg(target_os = "windows")]
             SurfaceSource::Frame(frame) => {

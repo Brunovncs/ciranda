@@ -87,7 +87,9 @@ pub fn sync(cx: &mut App) {
     let base = server.as_ref().map(|s| s.0.as_str()).unwrap_or("");
     let mut wanted: Vec<(HotkeyAction, Combo)> =
         [HotkeyAction::Mute, HotkeyAction::Deafen, HotkeyAction::Overlay, HotkeyAction::Replay, HotkeyAction::Ink]
-            .into_iter().filter_map(|a| Some((a, Combo::parse(p.hotkey(base, a))?))).collect();
+            .into_iter()
+            .filter_map(|a| Some((a, Combo::parse(p.hotkey(base, a))?)))
+            .collect();
     // Clips that still exist only: a deleted one's binding stays in the file but holds no key.
     if let Some((base, clips)) = &server
         && let Some(bound) = p.server_clip_hotkeys(base)
@@ -110,6 +112,18 @@ pub fn set_server(server: Option<(String, Vec<i64>)>, cx: &mut App) {
         cx.global_mut::<Hotkeys>().server = server;
         sync(cx);
     }
+}
+
+/// Why global hotkeys don't work here, or `None` when they do: Settings says so instead of taking
+/// bindings that would do nothing.
+pub fn unavailable(cx: &App) -> Option<&'static str> {
+    if cx.try_global::<Hotkeys>().is_some_and(|h| h.registrar.is_some()) {
+        return None;
+    }
+    Some(
+        crate::hotkeys::unavailable()
+            .unwrap_or(tr!("Global hotkeys could not be set up on this system.", "Não foi possível ativar atalhos globais neste sistema.")),
+    )
 }
 
 pub fn failure(action: HotkeyAction, cx: &App) -> Option<Failure> {

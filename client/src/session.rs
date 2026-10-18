@@ -18,7 +18,7 @@ use crate::core::realtime::{self, Realtime, Scope};
 use crate::core::types::*;
 use crate::core::{self};
 use crate::dm::Vault;
-use gpui::{App, AppContext, Context, Entity, EventEmitter, RenderImage, Task};
+use gpui::{App, AppContext, Context, Entity, EventEmitter, RenderImage, Subscription, Task};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -60,6 +60,10 @@ pub enum Link {
 /// How many rooms keep their history here: the one open and those opened just before it. Leaving
 /// one further back lets its history go; opening it again loads it anew.
 const KEEP_LOGS: usize = 6;
+/// The most messages a room keeps, and what it goes back down to (see `ChatLog::trim`): forty
+/// pages, then twenty. Far more than a screen, so only a room left open a long while gets there.
+const LOG_MOST: usize = 2000;
+const LOG_KEEP: usize = 1000;
 
 pub struct ChatLog {
     pub messages: Vec<Message>,
@@ -120,7 +124,8 @@ enum LogOp {
 }
 
 impl ChatLog {
-    fn push(&mut self, op: LogOp) {
+    /// True when older messages were let go to make room (`trim`).
+    fn push(&mut self, op: LogOp) -> bool {
         if self.fetching {
             self.pending.push(op);
         } else if self.stale && matches!(op, LogOp::Added(_)) {
@@ -129,7 +134,24 @@ impl ChatLog {
             // in between would never be fetched; the page brings it anyway.
         } else if self.loaded {
             self.apply(op);
+            return self.trim();
         }
+        false
+    }
+
+    /// A room left open for days (in the tray, say) gets every message said in it: past
+    /// `LOG_MOST`, the oldest go down to `LOG_KEEP`, and scrolling up pages them back in as for any
+    /// room opened anew. An older page asked for before then would not join up, so it is dropped.
+    fn trim(&mut self) -> bool {
+        if self.messages.len() <= LOG_MOST {
+            return false;
+        }
+        let over = self.messages.len() - LOG_KEEP;
+        self.messages.drain(..over);
+        self.more_before = true;
+        self.generation = next_generation();
+        self.loading_older = false;
+        true
     }
 
     fn apply(&mut self, op: LogOp) {
@@ -193,6 +215,7 @@ impl ChatLog {
         for op in std::mem::take(&mut self.pending) {
             self.apply(op);
         }
+        self.trim();
     }
 
     fn fetch_failed(&mut self, message: String) {
@@ -415,6 +438,14 @@ pub struct Session {
     /// The socket being replaced, kept until the new one is up: closing it first would leave the
     /// server a moment with no socket of yours, and a call ringing for you would end.
     retiring: Option<Realtime>,
+    /// What reads the retiring socket's events: it keeps taking its pushes until the new socket is
+    /// up, or a message sent meanwhile would reach neither.
+    retiring_pump: Option<Task<()>>,
+    /// Which socket is the current one: events from an older one are only its pushes.
+    socket: u64,
+    /// Just brought on screen: what happened while it was in the background is fetched again once
+    /// the full socket is up, as after a reconnect.
+    promoted: bool,
     /// Stopped for good: nothing is asked or opened any more, whoever still holds it.
     stopped: bool,
     /// The full socket has been up at least once, so the next time it comes up is a reconnect.
@@ -424,6 +455,7 @@ pub struct Session {
     /// A new identity key is on its way to the server.
     creating_key: bool,
     _pump: Task<()>,
+    _quit: Subscription,
 }
 
 impl EventEmitter<SessionEvent> for Session {}
@@ -450,7 +482,14 @@ impl Session {
 
     /// A server you are signed in to but not looking at, for its private messages: its people,
     /// keys and conversations now, and from then on a look at its inbox every so often.
-    pub fn start_background(api: Api, cache: Cache, me: User, server_name: String, server_icon: Option<String>, cx: &mut App) -> Entity<Session> {
+    pub fn start_background(
+        api: Api,
+        cache: Cache,
+        me: User,
+        server_name: String,
+        server_icon: Option<String>,
+        cx: &mut App,
+    ) -> Entity<Session> {
         cx.new(|cx| {
             let mut s = Session::new(api, cache, me, server_name, server_icon, Vec::new(), true, cx);
             s.refresh_lists(cx);
@@ -531,6 +570,9 @@ impl Session {
             active_at: Instant::now(),
             polled_at: None,
             retiring: None,
+            retiring_pump: None,
+            socket: 0,
+            promoted: false,
             stopped: false,
             ever_up: false,
             keep_owner: {
@@ -539,6 +581,12 @@ impl Session {
             },
             creating_key: false,
             _pump: Task::ready(()),
+            // Keys accepted or pinned are written in the background (see `keystore`); quitting
+            // waits for them.
+            _quit: cx.on_app_quit(|_: &mut Session, _| {
+                crate::core::keystore::flush();
+                async {}
+            }),
         }
     }
 
@@ -547,19 +595,35 @@ impl Session {
     fn connect(&mut self, scope: Scope, cx: &mut Context<Self>) {
         let (tx, rx) = async_channel::unbounded();
         let rt = Realtime::start(core::runtime().handle(), self.api.clone(), scope, tx);
-        self._pump = cx.spawn(async move |this, cx| {
+        self.socket += 1;
+        let socket = self.socket;
+        let pump = cx.spawn(async move |this, cx| {
             while let Ok(ev) = rx.recv().await {
-                if this.update(cx, |s: &mut Session, cx| s.on_realtime(ev, cx)).is_err() {
+                if this.update(cx, |s: &mut Session, cx| s.on_socket(socket, ev, cx)).is_err() {
                     break;
                 }
             }
         });
-        if let Some(old) = self.realtime.replace(rt)
-            && let Some(older) = self.retiring.replace(old)
-        {
-            older.stop();
+        let old_pump = std::mem::replace(&mut self._pump, pump);
+        if let Some(old) = self.realtime.replace(rt) {
+            if let Some(older) = self.retiring.replace(old) {
+                older.stop();
+            }
+            self.retiring_pump = Some(old_pump);
         }
         self.link = Link::Reconnecting;
+    }
+
+    /// An event from socket number `socket`. One that is being replaced still has its pushes
+    /// taken; whether it is up or down is no longer this session's state.
+    fn on_socket(&mut self, socket: u64, ev: realtime::Event, cx: &mut Context<Self>) {
+        if socket == self.socket {
+            self.on_realtime(ev, cx);
+        } else if let realtime::Event::Push(v) = ev
+            && self.on_push(v, cx)
+        {
+            cx.notify();
+        }
     }
 
     pub fn stop(&mut self) {
@@ -583,6 +647,7 @@ impl Session {
         self.users.insert(me.id, me.clone());
         self.me = me;
         self.ice_servers = ice_servers;
+        self.promoted = true;
         self.connect(Scope::Full, cx);
         self.refresh_lists(cx);
         cx.notify();
@@ -712,6 +777,10 @@ impl Session {
             && let Some(old) = self.retiring.take()
         {
             old.stop();
+            // Left to read what the old socket had already heard; it ends when the socket does.
+            if let Some(pump) = self.retiring_pump.take() {
+                pump.detach();
+            }
         }
         match ev {
             realtime::Event::Up(snap) if self.background => {
@@ -741,6 +810,10 @@ impl Session {
                 if was_down {
                     cx.emit(SessionEvent::Reconnected);
                     self.refresh_lists(cx);
+                }
+                // Brought on screen: whatever arrived while it was asleep, or between the
+                // inbox's last answer and now, is asked for as after a reconnect.
+                if was_down || std::mem::take(&mut self.promoted) {
                     self.start_private(cx);
                     self.catch_up(cx);
                 }
@@ -978,7 +1051,7 @@ impl Session {
         let (api, cache, h) = (self.api.clone(), self.cache.clone(), hash.to_string());
         cx.spawn(async move |this, cx| {
             let key = h.clone();
-            let got = core::run(fetch_attachment(api, cache, h, how)).await;
+            let got = core::run(fetch_attachment(api, cache, h, how, true)).await;
             let (slot, cost) = match got {
                 Ok((bytes, ct)) => match cx.background_executor().spawn(async move { decode_frames(&bytes, &ct, THUMBNAIL) }).await {
                     Ok((frames, cost)) => (Slot::Ready(Arc::new(frames)), cost),
@@ -987,7 +1060,7 @@ impl Session {
                         (Slot::Failed { retry_at: None, tries }, 0)
                     }
                 },
-                Err(e) if e.code == ErrorCode::NoSuchFile => (Slot::Failed { retry_at: None, tries }, 0),
+                Err(e) if matches!(e.code, ErrorCode::NoSuchFile | ErrorCode::FileTooLarge) => (Slot::Failed { retry_at: None, tries }, 0),
                 Err(e) => {
                     log::info!("picture {key} did not load: {e}");
                     (Slot::Failed { retry_at: Some(Instant::now() + retry_after(tries)), tries: tries + 1 }, 0)
@@ -1030,7 +1103,7 @@ impl Session {
     pub fn full_picture(&self, hash: &str, how: Fetch, cx: &mut Context<Self>) -> Task<Option<Arc<RenderImage>>> {
         let (api, cache, h) = (self.api.clone(), self.cache.clone(), hash.to_string());
         cx.spawn(async move |_, cx| {
-            let (bytes, ct) = core::run(fetch_attachment(api, cache, h, how)).await.ok()?;
+            let (bytes, ct) = core::run(fetch_attachment(api, cache, h, how, true)).await.ok()?;
             cx.background_executor().spawn(async move { decode_picture(&bytes, &ct, FULL) }).await.ok().map(|(img, _)| img)
         })
     }
@@ -1038,7 +1111,7 @@ impl Session {
     /// An attachment's bytes as they were sent (opened, if it was sealed), to save to disk.
     pub fn attachment(&self, hash: &str, how: Fetch) -> impl Future<Output = Result<Arc<Vec<u8>>, ApiError>> + use<> {
         let (api, cache, h) = (self.api.clone(), self.cache.clone(), hash.to_string());
-        async move { core::run(fetch_attachment(api, cache, h, how)).await.map(|(bytes, _)| bytes) }
+        async move { core::run(fetch_attachment(api, cache, h, how, false)).await.map(|(bytes, _)| bytes) }
     }
 
     pub fn avatar(&mut self, user: UserId, cx: &mut Context<Self>) -> Option<Arc<RenderImage>> {
@@ -1059,6 +1132,7 @@ impl Session {
 
     /// The server's settings as a reply or a push gives them.
     pub fn set_server_info(&mut self, info: ServerInfo, cx: &mut Context<Self>) {
+        self.api.note_file_limits(&info);
         self.server_name = info.name.clone();
         self.server_icon = info.icon_hash.clone();
         self.server_info = Some(info);
@@ -1111,9 +1185,12 @@ impl Session {
     /// `room` was just opened: the histories of rooms opened longer ago than the last `KEEP_LOGS`
     /// go, so what is kept does not grow with every room visited.
     fn keep_recent(&mut self, room: Room) {
-        touch_recent(&mut self.recent, room, KEEP_LOGS);
+        let gone = touch_recent(&mut self.recent, room, KEEP_LOGS);
         let recent = &self.recent;
         self.chats.retain(|r, _| recent.contains(r));
+        if gone.iter().any(|r| matches!(r, Room::Dm(_))) {
+            self.prune_vault();
+        }
     }
 
     /// No chat is on screen any more: the stage took its place.
@@ -1175,10 +1252,12 @@ impl Session {
                     Ok(h) => log.land(h),
                     Err(e) => log.fetch_failed(e.message),
                 }
-                if let Room::Dm(id) = room
-                    && s.viewing == Some(room)
-                {
-                    s.mark_read(id, cx);
+                if let Room::Dm(id) = room {
+                    // Messages the new page replaced are let go by the vault too.
+                    s.prune_vault();
+                    if s.viewing == Some(room) {
+                        s.mark_read(id, cx);
+                    }
                 }
                 cx.notify();
             });
@@ -1240,12 +1319,18 @@ impl Session {
 }
 
 /// An attachment's bytes and type: from the cache or the server, and opened when sealed. Sealed
-/// files are cached as they came, so what this computer keeps on disk is ciphertext too.
-async fn fetch_attachment(api: Api, cache: Cache, hash: String, how: Fetch) -> Result<(Arc<Vec<u8>>, String), ApiError> {
+/// files are cached as they came, so what this computer keeps on disk is ciphertext too. A
+/// `picture`, to be drawn, is refused past `api::PICTURE_BYTES` instead of being held whole.
+async fn fetch_attachment(api: Api, cache: Cache, hash: String, how: Fetch, picture: bool) -> Result<(Arc<Vec<u8>>, String), ApiError> {
     match how {
+        Fetch::Public if picture => cache.fetch(&hash, || api.download_picture(&hash)).await,
         Fetch::Public => cache.get(&api, &hash).await,
         Fetch::Sealed { conversation, file } => {
-            let (sealed, _) = cache.fetch(&hash, || api.download_sealed(conversation, &hash)).await?;
+            let (sealed, _) = if picture {
+                cache.fetch(&hash, || api.download_sealed_picture(conversation, &hash)).await?
+            } else {
+                cache.fetch(&hash, || api.download_sealed(conversation, &hash)).await?
+            };
             let opened = crate::core::crypto::unb64(&file.key)
                 .and_then(|k| <[u8; 32]>::try_from(k).ok())
                 .and_then(|k| crate::core::crypto::open_file(&k, &sealed));
@@ -1527,6 +1612,23 @@ mod tests {
         log.fetching = true;
         log.land(page(951..=1000));
         assert_eq!(ids(&log), (951..=1000).collect::<Vec<_>>(), "a gap: the kept ones go, not a silent hole");
+    }
+
+    #[test]
+    fn a_room_left_open_keeps_its_newest_messages_and_pages_the_rest_back() {
+        let mut log = ChatLog::default();
+        log.land(page(1..=50));
+        let (_, asked_in) = log.begin_older().unwrap();
+        let most = LOG_MOST as MessageId;
+        for i in 51..=most {
+            assert!(!log.push(LogOp::Added(msg(i, ""))));
+        }
+        assert!(log.push(LogOp::Added(msg(most + 1, ""))), "one past the most: the oldest go");
+        assert_eq!(log.messages.len(), LOG_KEEP);
+        assert_eq!(log.messages.last().map(|m| m.id), Some(most + 1));
+        assert!(log.more_before);
+        assert!(!log.older_landed(asked_in, Some(page(1..50))), "asked for before the trim, it would not join up");
+        assert_eq!(log.begin_older().map(|(first, _)| first), Some(most + 2 - LOG_KEEP as MessageId), "scrolling up pages them back in");
     }
 
     #[test]

@@ -105,7 +105,7 @@ fn main() {
         builder.file("src/desktop_capturer.cpp");
     }
 
-    let webrtc_dir = webrtc_sys_build::webrtc_dir();
+    let webrtc_dir = webrtc_build::webrtc_dir();
     let webrtc_include = webrtc_dir.join("include");
     let webrtc_lib = webrtc_dir.join("lib");
 
@@ -129,7 +129,7 @@ fn main() {
 
     println!("cargo:rustc-link-search=native={}", webrtc_lib.to_str().unwrap());
 
-    for (key, value) in webrtc_sys_build::webrtc_defines() {
+    for (key, value) in webrtc_build::webrtc_defines() {
         let value = value.as_deref();
         builder.define(key.as_str(), value);
     }
@@ -387,22 +387,9 @@ fn main() {
                 .file("src/objc_video_frame_buffer.mm")
                 .flag("-std=c++20");
         }
-        "android" => {
-            webrtc_sys_build::configure_jni_symbols().unwrap();
-
-            println!("cargo:rustc-link-lib=EGL");
-            println!("cargo:rustc-link-lib=OpenSLES");
-            println!("cargo:rustc-link-lib=c++_static");
-            println!("cargo:rustc-link-lib=c++abi");
-
-            configure_android_sysroot(&mut builder);
-            builder
-                .file("src/android.cpp")
-                // Provides a weak stub for std::__ndk1::__hash_memory, which
-                // was removed from libc++_static.a exports in NDK r28.
-                .file("src/ndk_compat.cpp")
-                .flag("-std=c++20");
-        }
+        // Upstream's Android setup lives in webrtc-sys-build, which this copy no longer uses
+        // (see webrtc_build below); Ciranda is not built for Android.
+        "android" => panic!("this copy of webrtc-sys does not build for Android (vendor/webrtc-sys/VENDORED.md)"),
         _ => {
             panic!("Unsupported target, {}", target_os);
         }
@@ -423,33 +410,10 @@ fn main() {
     for entry in glob::glob("./include/**/*.h").unwrap() {
         println!("cargo:rerun-if-changed={}", entry.unwrap().display());
     }
-
-    if target_os.as_str() == "android" {
-        copy_libwebrtc_jar(&PathBuf::from(Path::new(&webrtc_dir)));
-    }
-}
-
-fn copy_libwebrtc_jar(webrtc_dir: &PathBuf) {
-    let jar_path = webrtc_dir.join("libwebrtc.jar");
-    let output_path = get_output_path();
-    let output_jar_path = output_path.join("libwebrtc.jar");
-    let res = std::fs::copy(jar_path, output_jar_path);
-    if let Err(e) = res {
-        println!("Failed to copy libwebrtc.jar: {}", e);
-    }
-}
-
-fn get_output_path() -> PathBuf {
-    let manifest_dir_string = env::var("CARGO_MANIFEST_DIR").unwrap();
-    let build_type = env::var("PROFILE").unwrap();
-    let build_target = env::var("TARGET").unwrap();
-    let path =
-        Path::new(&manifest_dir_string).join("../target").join(build_target).join(build_type);
-    return PathBuf::from(path);
 }
 
 fn configure_darwin_sysroot(builder: &mut cc::Build) {
-    let target_os = webrtc_sys_build::target_os();
+    let target_os = webrtc_build::target_os();
 
     let sdk = match target_os.as_str() {
         "mac" => "macosx",
@@ -487,14 +451,8 @@ fn configure_darwin_sysroot(builder: &mut cc::Build) {
     builder.flag(format!("-isysroot{}", sysroot).as_str());
 }
 
-fn configure_android_sysroot(builder: &mut cc::Build) {
-    let toolchain = webrtc_sys_build::android_ndk_toolchain().unwrap();
-    let sysroot = toolchain.join("sysroot").canonicalize().unwrap();
-    builder.flag(format!("-isysroot{}", sysroot.display()).as_str());
-}
-
 fn add_lazy_load_so(builder: &mut cc::Build, name: &str, libraries: Vec<String>) {
-    let target_arch = webrtc_sys_build::target_arch();
+    let target_arch = webrtc_build::target_arch();
     for lib_name in libraries {
         let mut arch_dir = "x86_64-linux-gnu";
         if target_arch.contains("arm64") {
@@ -646,12 +604,12 @@ fn libcxx_min_clang_major(libcxx: &path::Path) -> u32 {
 }
 
 /// libwebrtc is linked statically into the program Ciranda ships, so the archive it comes from
-/// must be the one that was reviewed. webrtc_sys_build::download_webrtc extracts whatever the
+/// must be the one that was reviewed. webrtc-sys-build's download_webrtc extracts whatever the
 /// URL returns, with no check, so the download is done here instead: fetched, compared with a
 /// pinned SHA-256, and only then extracted, the same way and to the same place. The hashes are
 /// GitHub's digests of the release assets, confirmed by downloading the x64 one. Moving
-/// webrtc-sys-build to another WEBRTC_TAG changes the URL, and the build stops here until the
-/// new archive's hash is added.
+/// WEBRTC_TAG in webrtc_build below changes the URL, and the build stops here until the new
+/// archive's hash is added.
 const WEBRTC_SHA256: &[(&str, &str)] = &[
     (
         "https://github.com/livekit/rust-sdks/releases/download/webrtc-89d790b/webrtc-win-x64-release.zip",
@@ -676,7 +634,7 @@ const WEBRTC_SHA256: &[(&str, &str)] = &[
 ];
 
 fn download_verified_webrtc(webrtc_dir: &Path) {
-    let url = webrtc_sys_build::download_url();
+    let url = webrtc_build::download_url();
     let Some(&(_, expected)) = WEBRTC_SHA256.iter().find(|(pinned, _)| *pinned == url) else {
         panic!("no pinned SHA-256 for {url}: download it, check it, and add it to WEBRTC_SHA256 in build.rs");
     };
@@ -699,7 +657,7 @@ fn download_verified_webrtc(webrtc_dir: &Path) {
 
     // Extracted beside its final place and renamed into it, so a build that dies halfway
     // leaves no directory that the next one would take for a complete libwebrtc.
-    let triple = webrtc_sys_build::webrtc_triple();
+    let triple = webrtc_build::webrtc_triple();
     let tmp = webrtc_dir.parent().unwrap().join(format!(".{triple}.verified.tmp"));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
@@ -755,8 +713,8 @@ fn sha256(file: &Path) -> String {
 }
 
 fn add_gio_headers(builder: &mut cc::Build) {
-    let webrtc_dir = webrtc_sys_build::webrtc_dir();
-    let target_arch = webrtc_sys_build::target_arch();
+    let webrtc_dir = webrtc_build::webrtc_dir();
+    let target_arch = webrtc_build::target_arch();
     let target_arch_sysroot = match target_arch.as_str() {
         "arm64" => "arm64",
         "x64" => "amd64",
@@ -778,4 +736,89 @@ fn add_gio_headers(builder: &mut cc::Build) {
     let glib_path_config = glib_path_config.join(arch_specific_path);
     let glib_path_config = glib_path_config.join("glib-2.0/include");
     builder.include(&glib_path_config);
+}
+
+/// The parts of LiveKit's `webrtc-sys-build` 0.3.19 this build uses, copied with their behaviour
+/// unchanged: where libwebrtc lives (the same `scratch` directory, so an extracted copy is still
+/// found), its URL and its preprocessor defines. The crate itself also downloads and unzips
+/// libwebrtc through reqwest and zip, which this build never calls (`download_verified_webrtc`
+/// does that with a pinned hash), yet depending on it compiled an HTTP client, a TLS stack and a
+/// zip reader for every build script run.
+mod webrtc_build {
+    use std::collections::HashSet;
+    use std::io::{BufRead, BufReader};
+    use std::path::PathBuf;
+    use std::{env, fs};
+
+    const SCRATCH_PATH: &str = "livekit_webrtc";
+    const WEBRTC_TAG: &str = "webrtc-89d790b";
+    const IGNORE_DEFINES: [&str; 2] = ["CR_CLANG_REVISION", "CR_XCODE_VERSION"];
+
+    pub fn target_os() -> String {
+        let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
+        let is_simulator = env::var("TARGET").unwrap().ends_with("-sim");
+        match target_os.as_str() {
+            "windows" => "win",
+            "macos" => "mac",
+            "ios" if is_simulator => "ios-simulator",
+            "ios" => "ios-device",
+            _ => &target_os,
+        }
+        .to_string()
+    }
+
+    pub fn target_arch() -> String {
+        let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+        match target_arch.as_str() {
+            "aarch64" => "arm64",
+            "x86_64" => "x64",
+            _ => &target_arch,
+        }
+        .to_string()
+    }
+
+    /// e.g. mac-x64-release, the name of the archive on LiveKit's releases.
+    pub fn webrtc_triple() -> String {
+        // Debug builds of libwebrtc are experimental upstream; release unless asked.
+        let profile = if env::var("LK_DEBUG_WEBRTC").is_ok_and(|v| v == "true") { "debug" } else { "release" };
+        format!("{}-{}-{}", target_os(), target_arch(), profile)
+    }
+
+    pub fn download_url() -> String {
+        format!("https://github.com/livekit/rust-sdks/releases/download/{WEBRTC_TAG}/webrtc-{}.zip", webrtc_triple())
+    }
+
+    /// LK_CUSTOM_WEBRTC when set, else the shared scratch directory webrtc-sys-build used.
+    pub fn webrtc_dir() -> PathBuf {
+        if let Ok(path) = env::var("LK_CUSTOM_WEBRTC") {
+            return PathBuf::from(path);
+        }
+        let triple = webrtc_triple();
+        scratch::path(SCRATCH_PATH).join(format!("livekit/{triple}-{WEBRTC_TAG}/{triple}"))
+    }
+
+    /// The preprocessor definitions libwebrtc was built with, from the first line of
+    /// webrtc.ninja, and of desktop_capture.ninja for DesktopCaptureOptions' layout.
+    pub fn webrtc_defines() -> Vec<(String, Option<String>)> {
+        let defines_re = regex::Regex::new(r"-D(\w+)(?:=([^\s]+))?").unwrap();
+        let mut seen = HashSet::new();
+        let mut defines = Vec::new();
+        for name in ["webrtc.ninja", "desktop_capture.ninja"] {
+            let path = webrtc_dir().join(name);
+            let file = fs::File::open(&path).unwrap_or_else(|e| panic!("Could not open ninja file: {path:?}\n{e:?}"));
+            let mut line = String::new();
+            BufReader::new(file).read_line(&mut line).unwrap();
+            for cap in defines_re.captures_iter(&line) {
+                let name = &cap[1];
+                if IGNORE_DEFINES.contains(&name) {
+                    continue;
+                }
+                let define = (name.to_owned(), cap.get(2).map(|m| m.as_str().to_owned()));
+                if seen.insert(define.clone()) {
+                    defines.push(define);
+                }
+            }
+        }
+        defines
+    }
 }

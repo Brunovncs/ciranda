@@ -78,9 +78,17 @@ impl Voice {
         if self.composition().is_some_and(|c| c.gone()) {
             self.stop_screen(cx);
             crate::ui::overlay::toast(
-                tr!("Everything in your composition has closed, so the share ended.", "Tudo o que estava na sua composição fechou, então o compartilhamento terminou."),
+                tr!(
+                    "Everything in your composition has closed, so the share ended.",
+                    "Tudo o que estava na sua composição fechou, então o compartilhamento terminou."
+                ),
                 cx,
             );
+        } else if self.shares.screen.as_ref().is_some_and(|s| s.capture.ended()) {
+            // The system's dialog was cancelled, or the capture failed for good: nothing is left
+            // to send, so the share doesn't stay up showing nothing.
+            self.stop_screen(cx);
+            crate::ui::overlay::toast(tr!("Your screen share ended.", "Seu compartilhamento de tela terminou."), cx);
         }
     }
 

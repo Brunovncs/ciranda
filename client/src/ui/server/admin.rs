@@ -234,14 +234,7 @@ impl ServerAdmin {
         let typed = self.max_file.read(cx).text().trim().replace(',', ".");
         let bytes = typed.parse::<f64>().ok().filter(|mb| mb.is_finite()).map(|mb| (mb * (1u64 << 20) as f64).round() as u64);
         let Some(bytes) = bytes.filter(|b| (1 << 20..=limit).contains(b)) else {
-            toast(
-                trf!(
-                    "Type a size in MB, from 1 to {}.",
-                    "Digite um tamanho em MB, de 1 a {}.",
-                    limit >> 20
-                ),
-                cx,
-            );
+            toast(trf!("Type a size in MB, from 1 to {}.", "Digite um tamanho em MB, de 1 a {}.", limit >> 20), cx);
             return;
         };
         self.session.update(cx, |s, cx| {
@@ -1357,7 +1350,7 @@ fn readonly(value: String, t: &Theme) -> gpui::Div {
 /// A size the way people read one: 820 KB, 12.4 MB, 9.8 GB.
 /// The largest file as the field shows it: whole megabytes, or one decimal when it isn't.
 fn megabytes(bytes: u64) -> String {
-    if bytes % (1 << 20) == 0 { (bytes >> 20).to_string() } else { format!("{:.1}", bytes as f64 / (1u64 << 20) as f64) }
+    if bytes.is_multiple_of(1 << 20) { (bytes >> 20).to_string() } else { format!("{:.1}", bytes as f64 / (1u64 << 20) as f64) }
 }
 
 fn byte_size(n: u64) -> String {

@@ -23,8 +23,8 @@ use crate::widgets::*;
 use connect::{ConnectEvent, ConnectView, Connected};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    Animation, AnimationExt, AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent, ParentElement,
-    Render, RenderImage, SharedString, Styled, Subscription, Window, div,
+    Animation, AnimationExt, AnyElement, App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
+    KeyDownEvent, ParentElement, Render, RenderImage, SharedString, Styled, Subscription, Window, div,
 };
 use overlay::{Overlay, Toast};
 use server::{ServerView, Then};
@@ -117,7 +117,7 @@ impl Root {
             };
             crate::prefs::set_prefs(cx, |s| s.window = Some(place));
         }));
-        let view =cx.new(|cx| ConnectView::new(None, window, cx));
+        let view = cx.new(|cx| ConnectView::new(None, window, cx));
         // The ring of a call from a server in the background, and every minute or so, the
         // background servers matched against the rail again.
         let handle = window.window_handle();
@@ -284,17 +284,19 @@ impl Render for Root {
             .flex()
             .children(rail)
             .child(div().flex_1().min_w(px(0.)).h_full().child(screen))
-            .when(!theater, |d| d.child(
-                div()
-                    .absolute()
-                    .bottom_0()
-                    .right(px(12.))
-                    .text_size(px(10.))
-                    .line_height(px(10.))
-                    .text_color(t.text3)
-                    .opacity(0.6)
-                    .child(concat!("v", env!("CARGO_PKG_VERSION"))),
-            ))
+            .when(!theater, |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .bottom_0()
+                        .right(px(12.))
+                        .text_size(px(10.))
+                        .line_height(px(10.))
+                        .text_color(t.text3)
+                        .opacity(0.6)
+                        .child(concat!("v", env!("CARGO_PKG_VERSION"))),
+                )
+            })
             .children(self.render_overlay(&t, cx))
             .when(!self.toasts.is_empty(), |d| {
                 d.child(div().absolute().bottom(px(24.)).left_0().right_0().flex().flex_col().items_center().gap(px(8.)).children(

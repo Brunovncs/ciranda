@@ -752,6 +752,9 @@ impl Settings {
     }
 
     fn hotkeys_section(&mut self, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        if let Some(why) = hotkeys::unavailable(cx) {
+            return div().flex().flex_col().gap(px(18.)).child(body(why, t.text2)).into_any_element();
+        }
         let server = self.session.read(cx).api.base();
         let mut list = div().flex().flex_col().gap(px(10.));
         let rows = [
@@ -807,12 +810,20 @@ impl Settings {
             .flex_col()
             .gap(px(18.))
             .child(body(
-                tr!(
-                    "These work anywhere, even while a game has focus, and only while you are in a call. A combination bound here is taken from every other program while Ciranda is open, so use Ctrl or Alt, or an F-key.",
-                    "Funcionam em qualquer lugar, até com um jogo em primeiro plano, e só enquanto você está em uma chamada. Uma combinação definida aqui deixa de funcionar nos outros programas enquanto Ciranda estiver rodando, então use Ctrl ou Alt, ou uma tecla F."
-                ),
+                if cfg!(target_os = "macos") {
+                    tr!(
+                        "These work anywhere, even while a game has focus, and only while you are in a call. A combination bound here is taken from every other app while Ciranda is open, so use Cmd, Option or Ctrl, or an F-key.",
+                        "Funcionam em qualquer lugar, até com um jogo em primeiro plano, e só enquanto você está em uma chamada. Uma combinação definida aqui deixa de funcionar nos outros apps enquanto Ciranda estiver rodando, então use Cmd, Option ou Ctrl, ou uma tecla F."
+                    )
+                } else {
+                    tr!(
+                        "These work anywhere, even while a game has focus, and only while you are in a call. A combination bound here is taken from every other program while Ciranda is open, so use Ctrl or Alt, or an F-key.",
+                        "Funcionam em qualquer lugar, até com um jogo em primeiro plano, e só enquanto você está em uma chamada. Uma combinação definida aqui deixa de funcionar nos outros programas enquanto Ciranda estiver rodando, então use Ctrl ou Alt, ou uma tecla F."
+                    )
+                },
                 t.text2,
             ))
+            .when_some(crate::hotkeys::caveat(), |d, c| d.child(caption(c, t.caution)))
             .child(list)
             .child(caption(
                 tr!(

@@ -76,7 +76,13 @@ impl Call {
 
     /// Rings the other person of a private conversation, and takes a slot in the call straight
     /// away, so the media is ready the moment they answer.
-    pub fn dial(session: Entity<Session>, conversation: ConversationId, muted: bool, deafened: bool, cx: &mut App) -> Result<Entity<Call>, ApiError> {
+    pub fn dial(
+        session: Entity<Session>,
+        conversation: ConversationId,
+        muted: bool,
+        deafened: bool,
+        cx: &mut App,
+    ) -> Result<Entity<Call>, ApiError> {
         let (key, sealed) = session.update(cx, |s, _| s.new_call_key(conversation))?;
         let rt = session.read(cx).realtime.clone();
         let ring = Session::request(
@@ -120,7 +126,13 @@ impl Call {
     }
 
     /// Picks up a call you are being rung for.
-    pub fn answer(session: Entity<Session>, conversation: ConversationId, muted: bool, deafened: bool, cx: &mut App) -> Option<Entity<Call>> {
+    pub fn answer(
+        session: Entity<Session>,
+        conversation: ConversationId,
+        muted: bool,
+        deafened: bool,
+        cx: &mut App,
+    ) -> Option<Entity<Call>> {
         let key = session.update(cx, |s, _| s.call_key(conversation))?;
         let rt = session.read(cx).realtime.clone();
         let answer = Session::request(rt, "call:answer", json!({ "conversationId": conversation }));

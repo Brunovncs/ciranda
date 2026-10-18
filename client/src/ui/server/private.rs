@@ -32,9 +32,11 @@ fn key_block(text: &str, t: &Theme) -> gpui::Div {
         .bg(t.well)
         .border_1()
         .border_color(t.stroke)
-        .children(text.split('-').map(|g| {
-            div().font_family(MONO).text_size(px(17.)).font_weight(FontWeight::SEMIBOLD).text_color(t.text).child(g.to_string())
-        }))
+        .children(
+            text.split('-').map(|g| {
+                div().font_family(MONO).text_size(px(17.)).font_weight(FontWeight::SEMIBOLD).text_color(t.text).child(g.to_string())
+            }),
+        )
 }
 
 fn step(n: &str, text: impl Into<SharedString>, t: &Theme) -> gpui::Div {
@@ -70,7 +72,7 @@ pub fn backup(session: &Entity<Session>, window: &mut Window, cx: &mut App) {
 
 struct Backup {
     session: Entity<Session>,
-    key: String,
+    key: zeroize::Zeroizing<String>,
     kept: bool,
     focus: FocusHandle,
 }
@@ -90,7 +92,7 @@ impl Backup {
         let text = format!(
             "{}\r\n\r\n{}\r\n\r\n{}\r\n",
             tr!("Ciranda recovery key", "Chave de recuperação de Ciranda"),
-            self.key,
+            self.key.as_str(),
             tr!(
                 "It opens your private messages on another computer. Keep it to yourself.",
                 "Ela abre suas mensagens privadas em outro computador. Não mostre a ninguém."
@@ -141,7 +143,7 @@ impl Render for Backup {
                             .flex()
                             .gap(px(8.))
                             .child(button("backup-copy", tr!("Copy", "Copiar"), Kind::Standard, &t).on_click(cx.listener(|this, _, _, cx| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(this.key.clone()));
+                                cx.write_to_clipboard(ClipboardItem::new_string(this.key.to_string()));
                                 overlay::toast(tr!("Copied.", "Copiado."), cx);
                             })))
                             .child(
@@ -174,7 +176,14 @@ impl Render for Backup {
                                 this.kept = !this.kept;
                                 cx.notify();
                             })),
-                    ),
+                    )
+                    .child(caption(
+                        tr!(
+                            "Once you say so, this computer forgets it: it can't be shown again, only replaced by a new one.",
+                            "Depois disso, este computador a esquece: ela não pode ser mostrada de novo, só trocada por uma nova."
+                        ),
+                        t.text3,
+                    )),
             )
             .child(
                 footer(&t)
@@ -258,7 +267,10 @@ impl Unlock {
     fn confirm(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         let typed = self.field.read(cx).text();
         if self.session.update(cx, |s, cx| s.unlock(&typed, cx)) {
-            overlay::toast(tr!("Unlocked. Your private messages are here now.", "Desbloqueado. Suas mensagens privadas estão aqui agora."), cx);
+            overlay::toast(
+                tr!("Unlocked. Your private messages are here now.", "Desbloqueado. Suas mensagens privadas estão aqui agora."),
+                cx,
+            );
             cx.emit(Dismiss);
         } else {
             self.error = true;
@@ -593,7 +605,17 @@ impl People {
             .cursor_pointer()
             .hover(move |s| s.bg(hover))
             .child(div().relative().child(avatar(u.name(), img, 28., None)).when(online, |d| {
-                d.child(div().absolute().right(px(-2.)).bottom(px(-2.)).size(px(10.)).rounded_full().border_2().border_color(t.pane).bg(t.success))
+                d.child(
+                    div()
+                        .absolute()
+                        .right(px(-2.))
+                        .bottom(px(-2.))
+                        .size(px(10.))
+                        .rounded_full()
+                        .border_2()
+                        .border_color(t.pane)
+                        .bg(t.success),
+                )
             }))
             .child(
                 div()
@@ -641,12 +663,17 @@ impl Render for People {
         }
         if self.shown.0.as_deref() != Some(q.as_str()) {
             let all = self.everyone.as_ref().map(|(_, all)| all.as_slice()).unwrap_or_default();
-            let found = all.iter().filter(|p| q.is_empty() || p.name.contains(&q) || p.nickname.contains(&q)).map(|p| (p.id, p.online)).collect();
+            let found =
+                all.iter().filter(|p| q.is_empty() || p.name.contains(&q) || p.nickname.contains(&q)).map(|p| (p.id, p.online)).collect();
             self.shown = (Some(q), std::rc::Rc::new(found));
         }
         let shown = self.shown.1.clone();
         let list = if shown.is_empty() {
-            div().px(px(8.)).pb(px(8.)).child(div().p(px(14.)).child(caption(tr!("Nobody by that name.", "Ninguém com esse nome."), t.text3))).into_any_element()
+            div()
+                .px(px(8.))
+                .pb(px(8.))
+                .child(div().p(px(14.)).child(caption(tr!("Nobody by that name.", "Ninguém com esse nome."), t.text3)))
+                .into_any_element()
         } else {
             // Only the rows in view are made, so only their pictures are asked for. A list that
             // makes only some of its rows has no height of its own to grow to: it's given the
@@ -747,21 +774,19 @@ impl Render for Incoming {
                         .gap(px(14.))
                         .pt(px(10.))
                         .child(
-                            round_button("call-decline", "phone-off", t.critical, &t)
-                                .tooltip(tip(tr!("Decline", "Recusar"), &t))
-                                .on_click(cx.listener(move |this, _, _, cx| {
+                            round_button("call-decline", "phone-off", t.critical, &t).tooltip(tip(tr!("Decline", "Recusar"), &t)).on_click(
+                                cx.listener(move |this, _, _, cx| {
                                     (this.on_decline)(conversation, cx);
                                     cx.emit(Dismiss);
-                                })),
+                                }),
+                            ),
                         )
-                        .child(
-                            round_button("call-answer", "phone", t.success, &t)
-                                .tooltip(tip(tr!("Answer", "Atender"), &t))
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    (this.on_answer)(conversation, window, cx);
-                                    cx.emit(Dismiss);
-                                })),
-                        ),
+                        .child(round_button("call-answer", "phone", t.success, &t).tooltip(tip(tr!("Answer", "Atender"), &t)).on_click(
+                            cx.listener(move |this, _, window, cx| {
+                                (this.on_answer)(conversation, window, cx);
+                                cx.emit(Dismiss);
+                            }),
+                        )),
                 ),
         )
     }

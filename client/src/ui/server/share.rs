@@ -50,11 +50,16 @@ impl ServerView {
                 Composer::open(voice.clone(), window, cx);
             }));
         }
-        items.push(MenuEntry::item("screen-share", tr!("Change what you share", "Trocar o que você compartilha"), false, move |window, cx| {
-            if let Some(this) = this.upgrade() {
-                this.update(cx, |this, cx| this.pick_screen(window, cx));
-            }
-        }));
+        items.push(MenuEntry::item(
+            "screen-share",
+            tr!("Change what you share", "Trocar o que você compartilha"),
+            false,
+            move |window, cx| {
+                if let Some(this) = this.upgrade() {
+                    this.update(cx, |this, cx| this.pick_screen(window, cx));
+                }
+            },
+        ));
         items.push(MenuEntry::item("screen-share-off", tr!("Stop sharing", "Parar de compartilhar"), true, move |_, cx| {
             voice.update(cx, |v, cx| v.stop_screen(cx));
         }));

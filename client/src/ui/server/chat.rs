@@ -114,6 +114,9 @@ pub struct ChatView {
     saving: HashMap<String, Arc<Progress>>,
     save_tick: Task<()>,
     sending: bool,
+    /// What is in the box was not sent because their key changed and the new one isn't accepted:
+    /// the notice above offers to accept it and send.
+    held: bool,
     mode: Option<Mode>,
     /// What was in the box when an edit took it over, put back when the edit is done.
     draft: Option<String>,
@@ -144,7 +147,9 @@ impl EventEmitter<ChatEvent> for ChatView {}
 
 impl ChatView {
     pub fn new(session: Entity<Session>, room: Room, window: &mut Window, cx: &mut Context<Self>) -> ChatView {
-        let composer = cx.new(|cx| TextField::new(cx, true, 4000).lines(1, 10).enter_submits().bare().placeholder(composer_hint(room, session.read(cx))));
+        let composer = cx.new(|cx| {
+            TextField::new(cx, true, 4000).lines(1, 10).enter_submits().bare().placeholder(composer_hint(room, session.read(cx)))
+        });
         let search = cx.new(|cx| TextField::new(cx, false, 200).bare().placeholder(tr!("Search this channel", "Buscar neste canal")));
         let list = ListState::new(0, ListAlignment::Bottom, gpui::px(600.));
         list.set_follow_mode(gpui::FollowMode::Tail);
@@ -196,6 +201,7 @@ impl ChatView {
             saving: HashMap::new(),
             save_tick: Task::ready(()),
             sending: false,
+            held: false,
             mode: None,
             draft: None,
             flash: None,
@@ -232,7 +238,11 @@ impl ChatView {
         let s = self.session.read(cx);
         let name = s.display_name(Some(peer), None);
         if s.blocked.contains(&peer) {
-            Some(trf!("You blocked {}. Unblock them to write here again.", "Você bloqueou {}. Desbloqueie para voltar a escrever aqui.", name))
+            Some(trf!(
+                "You blocked {}. Unblock them to write here again.",
+                "Você bloqueou {}. Desbloqueie para voltar a escrever aqui.",
+                name
+            ))
         } else if !s.vault.ready() {
             Some(tr!("Private messages are locked on this computer.", "As mensagens privadas estão trancadas neste computador.").into())
         } else if !s.vault.peer_has_key(peer) {
@@ -318,7 +328,12 @@ impl ChatView {
                 // Only a file kept in memory is ever attached here (`max_file`), but should one on
                 // disk get this far, it is put back rather than sent without its file.
                 Some((None, _)) => {
-                    self.sent(Some((tr!("Files can be up to 25 MB.", "Os arquivos podem ter até 25 MB.").into(), text)), answering, pending, cx);
+                    self.sent(
+                        Some((tr!("Files can be up to 25 MB.", "Os arquivos podem ter até 25 MB.").into(), text)),
+                        answering,
+                        pending,
+                        cx,
+                    );
                     return;
                 }
                 None => None,
@@ -328,7 +343,12 @@ impl ChatView {
             let task = self.session.update(cx, |s, cx| s.send_dm(conversation, text.clone(), file, reply, cx));
             cx.spawn(async move |this, cx| {
                 let result = task.await;
-                let _ = this.update(cx, |this, cx| this.sent(result.err().map(|e| (e.message, text)), answering, pending, cx));
+                let _ = this.update(cx, |this, cx| {
+                    // Held for their changed key: it goes back in the box like any failure, and
+                    // the notice above says why and sends it once the key is accepted.
+                    this.held = result.as_ref().is_err_and(|e| e.code == ErrorCode::KeyNotConfirmed);
+                    this.sent(result.err().map(|e| (e.message, text)), answering, pending, cx)
+                });
             })
             .detach();
             return;
@@ -529,8 +549,24 @@ impl ChatView {
             return;
         }
         if self.room.conversation().is_some() {
-            let task = self.session.update(cx, |s, cx| s.edit_dm(m, body, cx));
-            toast_failure(task, cx);
+            let task = self.session.update(cx, |s, cx| s.edit_dm(m, body.clone(), cx));
+            let m = m.clone();
+            cx.spawn(async move |this, cx| {
+                let Err(e) = task.await else { return };
+                let _ = this.update(cx, |this, cx| {
+                    // Held for their changed key: the edit goes back in the box, to be saved once
+                    // the key is accepted, unless something else took the box meanwhile.
+                    if e.code == ErrorCode::KeyNotConfirmed && this.mode.is_none() {
+                        this.held = true;
+                        this.draft = Some(this.composer.read(cx).text());
+                        this.mode = Some(Mode::Edit(m));
+                        this.composer.update(cx, |f, cx| f.set_text(&body, cx));
+                    }
+                    overlay::toast(e.message, cx);
+                    cx.notify();
+                });
+            })
+            .detach();
             return;
         }
         let id = m.id;
@@ -632,7 +668,10 @@ impl ChatView {
         let size = match std::fs::metadata(path) {
             Ok(m) if m.is_dir() => {
                 overlay::toast(
-                    tr!("Folders can't be sent. Pick the files inside it instead.", "Pastas não podem ser enviadas. Escolha os arquivos dentro dela."),
+                    tr!(
+                        "Folders can't be sent. Pick the files inside it instead.",
+                        "Pastas não podem ser enviadas. Escolha os arquivos dentro dela."
+                    ),
                     cx,
                 );
                 return;
@@ -652,7 +691,13 @@ impl ChatView {
             return;
         }
         if size > MAX_UPLOAD as u64 {
-            self.pending = Some(Pending { source: Source::Disk(path.to_path_buf()), size, content_type: content_type_for(&name), name, preview: None });
+            self.pending = Some(Pending {
+                source: Source::Disk(path.to_path_buf()),
+                size,
+                content_type: content_type_for(&name),
+                name,
+                preview: None,
+            });
             cx.notify();
             return;
         }
@@ -1476,7 +1521,10 @@ impl ChatView {
                 .when(!private, |d| {
                     d.child(
                         tool_button(("pin", m.id as u64), "pin", m.pinned, if m.pinned { t.accent } else { t.text2 }, &t)
-                            .tooltip(tip(if m.pinned { tr!("Unpin", "Desafixar") } else { tr!("Pin to the channel", "Fixar no canal") }, &t))
+                            .tooltip(tip(
+                                if m.pinned { tr!("Unpin", "Desafixar") } else { tr!("Pin to the channel", "Fixar no canal") },
+                                &t,
+                            ))
                             .on_click(cx.listener(move |this, _, _, cx| this.pin(&m2, cx))),
                     )
                 })
@@ -1722,9 +1770,9 @@ impl ChatView {
                         .border_color(t.stroke)
                         .cursor_pointer()
                         .child(img(image).size_full().object_fit(gpui::ObjectFit::Cover))
-                        .on_click(
-                            cx.listener(move |this, _, window, cx| this.open_image(img2.clone(), h2.clone(), n2.clone(), f2.clone(), window, cx)),
-                        )
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_image(img2.clone(), h2.clone(), n2.clone(), f2.clone(), window, cx)
+                        }))
                         .into_any_element()
                 }
                 Picture::Loading => div().w(px(240.)).h(px(160.)).rounded(px(radius::CARD)).bg(t.layer).into_any_element(),
@@ -1985,30 +2033,53 @@ impl ChatView {
     fn render_dm_notice(&mut self, peer: UserId, t: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         let s = self.session.read(cx);
         let name = s.display_name(Some(peer), None);
-        if s.vault.ready() && s.vault.key_changed_for(peer) {
-            let (session, s2) = (self.session.clone(), self.session.clone());
+        let changed = s.vault.ready() && s.vault.key_changed_for(peer);
+        if !changed {
+            // Accepted elsewhere (the safety number's "They match"): sending works again.
+            self.held = false;
+        }
+        if changed {
+            // Nothing is sealed to their new key until it is accepted here (`Vault::seal_message`),
+            // so this is also what stands between a message and its sending.
+            let held = self.held;
+            let s2 = self.session.clone();
+            let text = if held {
+                trf!(
+                    "{}'s security key changed, so your message wasn't sent: it's still in the box. It happens when someone sets Ciranda up again without their recovery key; if you weren't expecting it, compare your safety number with them before sending.",
+                    "A chave de segurança de {} mudou, então sua mensagem não foi enviada: ela continua na caixa. Isso acontece quando alguém configura Ciranda de novo sem a chave de recuperação; se você não esperava por isso, comparem o código de segurança antes de enviar.",
+                    name
+                )
+            } else {
+                trf!(
+                    "{}'s security key changed. It happens when someone sets Ciranda up again without their recovery key; if you weren't expecting it, compare your safety number with them. Nothing is sent to the new key until you accept it.",
+                    "A chave de segurança de {} mudou. Isso acontece quando alguém configura Ciranda de novo sem a chave de recuperação; se você não esperava por isso, comparem o código de segurança. Nada é enviado para a nova chave até você aceitá-la.",
+                    name
+                )
+            };
             return Some(
-                notice(
-                    "shield-alert",
-                    trf!(
-                        "{}'s security key changed. It happens when someone sets Ciranda up again without their recovery key; if you weren't expecting it, compare your safety number with them.",
-                        "A chave de segurança de {} mudou. Isso acontece quando alguém configura Ciranda de novo sem a chave de recuperação; se você não esperava por isso, comparem o código de segurança.",
-                        name
-                    ),
-                    t.caution,
-                    t,
-                )
-                .child(
-                    button("key-compare", tr!("Compare", "Comparar"), Kind::Standard, t)
-                        .on_click(move |_, window, cx| super::private::safety_number(&s2, peer, window, cx)),
-                )
-                .child(button("key-ok", tr!("Got it", "Entendi"), Kind::Primary, t).on_click(move |_, _, cx| {
-                    session.update(cx, |s, cx| {
-                        s.vault.accept_key(peer);
-                        cx.notify();
-                    })
-                }))
-                .into_any_element(),
+                notice("shield-alert", text, t.caution, t)
+                    .child(
+                        button("key-compare", tr!("Compare", "Comparar"), Kind::Standard, t)
+                            .on_click(move |_, window, cx| super::private::safety_number(&s2, peer, window, cx)),
+                    )
+                    .child(
+                        button(
+                            "key-ok",
+                            if held { tr!("Accept and send", "Aceitar e enviar") } else { tr!("Accept new key", "Aceitar nova chave") },
+                            Kind::Primary,
+                            t,
+                        )
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.session.update(cx, |s, cx| {
+                                s.vault.accept_key(peer);
+                                cx.notify();
+                            });
+                            if std::mem::take(&mut this.held) {
+                                this.send(window, cx);
+                            }
+                        })),
+                    )
+                    .into_any_element(),
             );
         }
         let why = self.blocked_reason(cx)?;
@@ -2019,9 +2090,10 @@ impl ChatView {
         Some(
             notice(if blocked { "ban" } else { "lock" }, why, t.text2, t)
                 .when(blocked, |d| {
-                    d.child(button("unblock", tr!("Unblock", "Desbloquear"), Kind::Standard, t).on_click(move |_, _, cx| {
-                        session.update(cx, |s, cx| s.set_blocked(peer, false, cx))
-                    }))
+                    d.child(
+                        button("unblock", tr!("Unblock", "Desbloquear"), Kind::Standard, t)
+                            .on_click(move |_, _, cx| session.update(cx, |s, cx| s.set_blocked(peer, false, cx))),
+                    )
                 })
                 .when(locked, |d| {
                     let session = self.session.clone();
@@ -2537,7 +2609,10 @@ fn file_card(card: FileCard, name: &str, hash: &str, how: Fetch, t: &Theme, cx: 
                 .flex()
                 .items_center()
                 .gap(px(4.))
-                .child(mono(if stopping { tr!("Cancelling…", "Cancelando…").to_string() } else { format!("{}%", (f * 100.).floor() as u32) }, t.text3))
+                .child(mono(
+                    if stopping { tr!("Cancelling…", "Cancelando…").to_string() } else { format!("{}%", (f * 100.).floor() as u32) },
+                    t.text3,
+                ))
                 .when(!stopping, |d| {
                     d.child(
                         icon_button(("cancel-save", id as u64), "close", t)

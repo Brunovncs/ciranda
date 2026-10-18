@@ -1,6 +1,8 @@
 //! Closing the window to the notification area (the icon itself is `crate::tray`), and what the
 //! icon and the taskbar's thumbnail ask for: the window back, mute, deafen and disconnect in a
-//! call, quitting. In a call both show how you are in it.
+//! call, quitting. In a call both show how you are in it. On macOS the Dock icon's menu offers
+//! mute, deafen and disconnect in a call instead; there and on Linux, what needs you while the
+//! window is in the background reaches you through the system's notifications.
 
 use super::Screen;
 use super::overlay::RootHandle;
@@ -72,6 +74,34 @@ pub fn init(window: AnyWindowHandle, instance: &Instance, cx: &mut App) {
         }
     })
     .detach();
+    // A click on one of `attention`'s notifications brings the window back.
+    #[cfg(not(windows))]
+    cx.on_system_notification_response(|_, cx| on_event(Event::Open, cx));
+    #[cfg(target_os = "macos")]
+    {
+        cx.on_action(|_: &DockMute, cx| on_event(Event::Mute, cx));
+        cx.on_action(|_: &DockDeafen, cx| on_event(Event::Deafen, cx));
+        cx.on_action(|_: &DockLeave, cx| on_event(Event::Leave, cx));
+    }
+}
+
+#[cfg(target_os = "macos")]
+gpui::actions!(ciranda_dock, [DockMute, DockDeafen, DockLeave]);
+
+/// The Dock icon's menu, above the system's own items: in a call, what the tray icon's menu offers
+/// on Windows.
+#[cfg(target_os = "macos")]
+fn dock_menu(call: Option<(bool, bool)>, cx: &mut App) {
+    use gpui::MenuItem;
+    let items = match call {
+        None => Vec::new(),
+        Some((muted, deafened)) => vec![
+            MenuItem::action(tr!("Mute", "Silenciar"), DockMute).checked(muted),
+            MenuItem::action(tr!("Deafen", "Desativar o som"), DockDeafen).checked(deafened),
+            MenuItem::action(tr!("Disconnect", "Desconectar"), DockLeave),
+        ],
+    };
+    cx.set_dock_menu(items);
 }
 
 pub(crate) fn hwnd(window: &Window) -> Option<isize> {
@@ -121,7 +151,10 @@ fn sync(cx: &mut App) {
         return;
     }
     state.thumbs = Some(thumbs);
-    let (Some(hwnd), dark) = (state.hwnd, state.dark) else { return };
+    let (hwnd, dark) = (state.hwnd, state.dark);
+    #[cfg(target_os = "macos")]
+    dock_menu(thumbs, cx);
+    let Some(hwnd) = hwnd else { return };
     // On the app's next turn, outside every update: the taskbar may call into the window.
     cx.spawn(async move |cx| {
         let thumbs = thumbs.map(|(muted, deafened)| Thumbs { muted, deafened, dark });
@@ -158,8 +191,10 @@ fn on_close(window: &mut Window, cx: &mut App) -> bool {
 }
 
 /// Something needs you while the window is in the background: a call, a private message. The
-/// taskbar button flashes and, from the tray, Windows shows a notification. Says only who, never
-/// what: a notification is on a screen anyone nearby can read.
+/// taskbar button flashes and, from the tray, Windows shows a notification. On macOS the Dock icon
+/// bounces once, on Linux the window is marked urgent (X11), and both post to the system's
+/// notifications (macOS asks the first time whether Ciranda may). Says only who, never what: a
+/// notification is on a screen anyone nearby can read.
 pub fn attention(window: &Window, title: &str, text: &str, cx: &App) {
     if window.is_window_active() {
         return;
@@ -169,6 +204,17 @@ pub fn attention(window: &Window, title: &str, text: &str, cx: &App) {
     }
     if let Some(tray) = cx.try_global::<TrayState>().and_then(|s| s.tray.as_ref()) {
         tray.notify(title, text);
+    }
+    #[cfg(not(windows))]
+    {
+        window.request_attention();
+        // One per person: a newer one from them replaces the last where the system can.
+        cx.show_system_notification(gpui::SystemNotification {
+            tag: format!("ciranda-{title}").into(),
+            title: title.to_string().into(),
+            body: text.to_string().into(),
+            actions: Vec::new(),
+        });
     }
 }
 

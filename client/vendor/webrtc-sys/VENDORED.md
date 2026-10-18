@@ -55,6 +55,17 @@ install beyond the Windows SDK.
    ending outside one), every voice received played nothing until the app restarted.
    `voice_plays_after_a_private_call` in `src/media/rtc.rs` covers it.
 
+5. **No `webrtc-sys-build`** (`build.rs`, `Cargo.toml`): the build script already downloads
+   libwebrtc itself (`download_verified_webrtc`, with a pinned SHA-256), and of
+   `webrtc-sys-build` 0.3.19 it used only where libwebrtc lives, its URL, its name for the
+   platform and the defines in `webrtc.ninja`. Those are copied into `build.rs` as
+   `mod webrtc_build`, unchanged (same `scratch` directory, so an extracted libwebrtc is still
+   found), and `regex` and `scratch` replace the dependency. That crate brought reqwest 0.12, a
+   rustls stack, quinn and zip 0.6 (with open advisories) into every build for code that never
+   ran. Android, whose setup lived in `webrtc-sys-build` and downloaded libwebrtc unverified, now
+   stops with a message; Ciranda is not built for it. When upgrading, compare
+   `webrtc-sys-build`'s `WEBRTC_TAG` and helpers with `mod webrtc_build`.
+
 Nothing else is changed; the upstream files keep their bytes.
 
 ## Environment variables
@@ -85,7 +96,9 @@ once decoded frames can stay on the GPU up to the screen. To wire it:
 1. Copy the new version from the registry over this directory, keeping `src/mf/` and this file.
 2. Re-apply the `build.rs` block, the three `video_encoder_factory.cpp` hunks and the
    `AdmProxy::Terminate` fix above, unless #1468 is fixed by then (run
-   `voice_plays_after_a_private_call` without it to see).
+   `voice_plays_after_a_private_call` without it to see), and change 5: `mod webrtc_build` in
+   place of `webrtc_sys_build::`, with its `WEBRTC_TAG` moved to the new one and the new archives'
+   hashes in `WEBRTC_SHA256`.
 3. Build and check what moved in the APIs used by `src/mf`: `VideoEncoder`/`EncoderInfo`,
    `CreateVideoEncoderSoftwareFallbackWrapper`, `H264::FindNaluIndices` and
    `H264BitstreamParser::ParseBitstream` (both take `std::span`), `NV12BufferInterface`.

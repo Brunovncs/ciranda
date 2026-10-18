@@ -8,6 +8,7 @@
 //! WebRTC source is listening. Everything inside runs at 48 kHz.
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{FromSample, Sample, SizedSample};
 use libwebrtc::native::apm::AudioProcessingModule;
 use parking_lot::{Condvar, Mutex};
 use rtrb::{Consumer, Producer, RingBuffer};
@@ -199,8 +200,10 @@ impl Source {
     }
 
     /// Adds this source's next `out.len() / 2` frames into `out`, at `gain`. On the output
-    /// callback; whatever it is done with goes to `retire` rather than being freed there.
-    fn mix_into(&self, out: &mut [f32], gain: f32, retire: &mut Producer<Retired>) {
+    /// callback; whatever it is done with goes to `retire` rather than being freed there. False
+    /// only for the cues' bus with nothing to play: every other source keeps the speakers open
+    /// for as long as it is in the mix.
+    fn mix_into(&self, out: &mut [f32], gain: f32, retire: &mut Producer<Retired>) -> bool {
         match &self.feed {
             Feed::Clip(samples, at) => {
                 let from = at.load(Ordering::Relaxed).min(samples.len());
@@ -232,7 +235,7 @@ impl Source {
                     }
                 }
                 if playing.is_empty() {
-                    return;
+                    return false;
                 }
                 let mut limiter = limiter.lock();
                 for (k, o) in out.chunks_exact_mut(2).enumerate() {
@@ -254,6 +257,7 @@ impl Source {
                 }
             }
         }
+        true
     }
 }
 
@@ -390,7 +394,13 @@ impl Playout {
             self.block.extend(a.chunks_exact(2).chain(b.chunks_exact(2)).map(|f| [f[0], f[1]]));
         }
         let peak = self.block.iter().take(want).fold(0f32, |p, f| p.max(f[0].abs()).max(f[1].abs()));
-        let room = if want < 16 { 0 } else if peak < QUIET { want / 8 } else { 1 };
+        let room = if want < 16 {
+            0
+        } else if peak < QUIET {
+            want / 8
+        } else {
+            1
+        };
         let (mut drop, mut repeat) = match self.skew {
             s if s > 0 => ((s as usize).min(room).min(avail.saturating_sub(want)), 0),
             s if s < 0 => (0, s.unsigned_abs().min(room)),
@@ -407,11 +417,7 @@ impl Playout {
         // Where a frame goes or doubles: the quietest one when only one does, else spread out.
         let marks = drop + repeat;
         let energy = |f: &[f32; 2]| f[0].abs() + f[1].abs();
-        let quietest = if marks == 1 {
-            (0..take).min_by(|&i, &j| energy(&self.block[i]).total_cmp(&energy(&self.block[j])))
-        } else {
-            None
-        };
+        let quietest = if marks == 1 { (0..take).min_by(|&i, &j| energy(&self.block[i]).total_cmp(&energy(&self.block[j]))) } else { None };
         let mark = |k: usize| quietest.unwrap_or(k * take / (marks + 1));
         let fade_out = if dry { FADE.min(played) } else { 0 };
         let (mut o, mut k) = (0, 0);
@@ -487,6 +493,13 @@ pub struct Mixer {
     pub deafened: AtomicBool,
     /// The mix, mono, for the echo canceller's reference.
     far: Mutex<VecDeque<f32>>,
+    /// Frames mixed since anything was there to play: nobody's voice or screen, no clip, the cues'
+    /// bus silent. The audio thread closes the speakers once this is long enough.
+    quiet: AtomicUsize,
+    /// The speakers were closed for having nothing to play, and open again for the next sound.
+    parked: AtomicBool,
+    /// The audio thread, to ask for the speakers back.
+    wake: OnceLock<mpsc::Sender<Command>>,
 }
 
 enum Change {
@@ -510,12 +523,31 @@ impl Mixer {
             retired: Mutex::new(retired),
             deafened: AtomicBool::new(false),
             far: Mutex::new(VecDeque::new()),
+            quiet: AtomicUsize::new(0),
+            parked: AtomicBool::new(false),
+            wake: OnceLock::new(),
         })
     }
 
     pub fn add(&self, s: Arc<Source>) {
         self.changes.lock().push(Change::Add(s));
         self.collect();
+        self.wake();
+    }
+
+    /// Something is about to play: the speakers come back if they were closed for the quiet.
+    fn wake(&self) {
+        if self.parked.load(Ordering::Acquire)
+            && let Some(tx) = self.wake.get()
+        {
+            let _ = tx.send(Command::Resume);
+        }
+    }
+
+    /// Whether anything waits to be played: a change not taken in yet, or a source with sound
+    /// queued. Off the output callback only (it takes the callback's locks).
+    fn pending(&self) -> bool {
+        !self.changes.lock().is_empty() || self.playing.lock().sources.iter().any(|s| !s.is_empty())
     }
 
     pub fn remove(&self, s: &Arc<Source>) {
@@ -570,9 +602,15 @@ impl Mixer {
                 }
             }
         }
+        let mut busy = false;
         for s in sources.iter() {
             let gain = if deaf && s.kind == SourceKind::Voice { 0. } else { s.gain.get() };
-            s.mix_into(out, gain, retire);
+            busy |= s.mix_into(out, gain, retire);
+        }
+        if busy {
+            self.quiet.store(0, Ordering::Relaxed);
+        } else {
+            self.quiet.fetch_add(out.len() / 2, Ordering::Relaxed);
         }
         let mut i = 0;
         while i < sources.len() {
@@ -655,7 +693,10 @@ impl Resampler {
                 break;
             }
             let frames_out = self.chunk.len() / ch;
-            let made = match (InterleavedSlice::new(&self.pending[..], ch, RESAMPLE_CHUNK), InterleavedSlice::new_mut(&mut self.chunk[..], ch, frames_out)) {
+            let made = match (
+                InterleavedSlice::new(&self.pending[..], ch, RESAMPLE_CHUNK),
+                InterleavedSlice::new_mut(&mut self.chunk[..], ch, frames_out),
+            ) {
                 (Ok(src), Ok(mut dst)) => sinc.process_into_buffer(&src, &mut dst, None).map_or(0, |(_, n)| n),
                 _ => 0,
             };
@@ -686,16 +727,44 @@ pub struct DeviceInfo {
     pub name: String,
 }
 
+/// The audio host, made once: PulseAudio's connects to the server, and devices are looked up
+/// every second while a chosen one is missing. Let go after something fails, so a server that
+/// restarted is connected to again.
+static HOST: Mutex<Option<cpal::Host>> = parking_lot::const_mutex(None);
+
+pub(super) fn with_host<T>(f: impl FnOnce(&cpal::Host) -> T) -> T {
+    let mut host = HOST.lock();
+    f(host.get_or_insert_with(cpal::default_host))
+}
+
+pub(super) fn forget_host() {
+    *HOST.lock() = None;
+}
+
 pub fn input_devices() -> Vec<DeviceInfo> {
-    list(cpal::default_host().input_devices().ok().map(|d| d.collect()).unwrap_or_default())
+    let devices = with_host(|h| h.input_devices().map(|d| d.collect::<Vec<_>>()));
+    list(devices).into_iter().filter(|d| !not_a_microphone(&d.id)).collect()
 }
 
 pub fn output_devices() -> Vec<DeviceInfo> {
-    list(cpal::default_host().output_devices().ok().map(|d| d.collect()).unwrap_or_default())
+    list(with_host(|h| h.output_devices().map(|d| d.collect::<Vec<_>>())))
 }
 
-fn list(devices: Vec<cpal::Device>) -> Vec<DeviceInfo> {
-    devices.iter().filter_map(info).collect()
+/// Inputs that are not microphones: PulseAudio's monitor of each output, and on macOS the device a
+/// share's sound is taken through while it runs.
+fn not_a_microphone(id: &str) -> bool {
+    id.ends_with(".monitor") || id.contains(super::loopback::TAP_DEVICE)
+}
+
+fn list(devices: Result<Vec<cpal::Device>, cpal::Error>) -> Vec<DeviceInfo> {
+    match devices {
+        Ok(d) => d.iter().filter_map(info).collect(),
+        Err(e) => {
+            log::warn!("audio devices: {e}");
+            forget_host();
+            Vec::new()
+        }
+    }
 }
 
 fn info(d: &cpal::Device) -> Option<DeviceInfo> {
@@ -703,19 +772,20 @@ fn info(d: &cpal::Device) -> Option<DeviceInfo> {
 }
 
 fn present(id: &str) -> bool {
-    id.parse::<cpal::DeviceId>().is_ok_and(|id| cpal::default_host().device_by_id(&id).is_some())
+    id.parse::<cpal::DeviceId>().is_ok_and(|id| with_host(|h| h.device_by_id(&id).is_some()))
 }
 
 fn find(id: &str, input: bool) -> Option<cpal::Device> {
-    let host = cpal::default_host();
-    if !id.is_empty()
-        && let Ok(parsed) = id.parse::<cpal::DeviceId>()
-        && let Some(d) = host.device_by_id(&parsed)
-    {
-        return Some(d);
-    }
-    // The saved device is gone (unplugged): use the default, without forgetting the choice.
-    if input { host.default_input_device() } else { host.default_output_device() }
+    with_host(|host| {
+        if !id.is_empty()
+            && let Ok(parsed) = id.parse::<cpal::DeviceId>()
+            && let Some(d) = host.device_by_id(&parsed)
+        {
+            return Some(d);
+        }
+        // The saved device is gone (unplugged): use the default, without forgetting the choice.
+        if input { host.default_input_device() } else { host.default_output_device() }
+    })
 }
 
 /// The microphone after processing: what the call publishes and what the meter shows.
@@ -738,8 +808,13 @@ pub struct Mic {
     frames: AtomicU64,
     /// Where processed 10 ms frames go: the voice publisher, when there is one.
     sink: Mutex<Option<MicSink>>,
+    /// Whether `sink` holds one, read without its lock.
+    has_sink: AtomicBool,
     users: AtomicU64,
 }
+
+/// Raw microphone audio at 48 kHz on its way to the processing thread, which waits on the condvar.
+type Near = Arc<(Mutex<VecDeque<f32>>, Condvar)>;
 
 /// Takes each processed 10 ms of microphone audio.
 pub type MicSink = Box<dyn FnMut(&[i16]) + Send>;
@@ -752,6 +827,8 @@ enum Command {
     InputLost,
     /// The same for the speakers.
     OutputLost,
+    /// Something to play while the speakers are closed for the quiet.
+    Resume,
 }
 
 /// The microphone changed under a capture without anyone choosing it: unplugged, Windows' default
@@ -804,6 +881,7 @@ pub struct Audio {
     pub mic: Arc<Mic>,
     commands: mpsc::Sender<Command>,
     input_id: Mutex<String>,
+    near: Near,
 }
 
 static AUDIO: OnceLock<Audio> = OnceLock::new();
@@ -827,10 +905,12 @@ impl Audio {
             capturing: AtomicBool::new(false),
             frames: AtomicU64::new(0),
             sink: Mutex::new(None),
+            has_sink: AtomicBool::new(false),
             users: AtomicU64::new(0),
         });
-        let near = Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
+        let near: Near = Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
         let (tx, rx) = mpsc::channel();
+        let _ = mixer.wake.set(tx.clone());
         {
             let (mixer, mic, near, tx) = (mixer.clone(), mic.clone(), near.clone(), tx.clone());
             std::thread::Builder::new().name("ciranda-audio".into()).spawn(move || device_thread(rx, tx, mixer, mic, near)).ok();
@@ -840,7 +920,7 @@ impl Audio {
             std::thread::Builder::new().name("ciranda-mic".into()).spawn(move || dsp_thread(mixer, mic, near)).ok();
         }
         let _ = tx.send(Command::Output(String::new()));
-        Audio { mixer, mic, commands: tx, input_id: Mutex::new(String::new()) }
+        Audio { mixer, mic, commands: tx, input_id: Mutex::new(String::new()), near }
     }
 
     pub fn set_output(&self, id: &str) {
@@ -871,7 +951,13 @@ impl Audio {
 
     /// Where processed microphone frames go (10 ms, mono, 48 kHz).
     pub fn set_mic_sink(&self, sink: Option<MicSink>) {
+        let some = sink.is_some();
         *self.mic.sink.lock() = sink;
+        self.mic.has_sink.store(some, Ordering::Release);
+        // Under the lock the processing thread checks before it waits, so it can't miss this.
+        let (buf, cv) = &*self.near;
+        let _held = buf.lock();
+        cv.notify_all();
     }
 }
 
@@ -891,14 +977,11 @@ impl Drop for MicGuard {
 const CAPTURE_STALL: Duration = Duration::from_secs(3);
 /// How often a microphone that would not open is tried again, for one plugged back in.
 const CAPTURE_RETRY: Duration = Duration::from_secs(10);
+/// Nothing to play for this long and the speakers are closed, so an idle Ciranda doesn't keep the
+/// sound device (and the processor) awake mixing silence. The next sound opens them again.
+const SPEAKERS_IDLE: Duration = Duration::from_secs(30);
 
-fn device_thread(
-    rx: mpsc::Receiver<Command>,
-    tx: mpsc::Sender<Command>,
-    mixer: Arc<Mixer>,
-    mic: Arc<Mic>,
-    near: Arc<(Mutex<VecDeque<f32>>, Condvar)>,
-) {
+fn device_thread(rx: mpsc::Receiver<Command>, tx: mpsc::Sender<Command>, mixer: Arc<Mixer>, mic: Arc<Mic>, near: Near) {
     let mut output: Option<cpal::Stream> = None;
     let mut input: Option<cpal::Stream> = None;
     // The microphone wanted, while one is; and the frame count last seen, and when it moved.
@@ -906,6 +989,7 @@ fn device_thread(
     let mut seen = (0, Instant::now());
     let mut using = Using::default();
     let mut speakers = Speakers { wanted: String::new(), on: None, tried: Instant::now() };
+    let idle_frames = SPEAKERS_IDLE.as_secs() as usize * RATE as usize;
     // Closed before opening again: some devices take one capture at a time.
     let reopen = |input: &mut Option<cpal::Stream>, wanted: Option<&str>, using: &mut Using, asked: bool| {
         drop(input.take());
@@ -919,8 +1003,10 @@ fn device_thread(
     loop {
         let command = rx.recv_timeout(Duration::from_secs(1));
         mixer.collect();
-        // No callback is running without an output stream: nothing would apply the mixer's changes.
-        if output.is_none() {
+        // No callback is running without an output stream: nothing would apply the mixer's
+        // changes. Closed for the quiet, though, what was just added is what opens them again.
+        let parked = mixer.parked.load(Ordering::Acquire);
+        if output.is_none() && !parked {
             mixer.idle();
         }
         match command {
@@ -931,6 +1017,11 @@ fn device_thread(
             Ok(Command::OutputLost) => {
                 log::warn!("the speakers went away; opening them again");
                 speakers.open(&mut output, &mixer, &tx);
+            }
+            Ok(Command::Resume) => {
+                if parked && output.is_none() {
+                    speakers.open(&mut output, &mixer, &tx);
+                }
             }
             Ok(Command::Input(id)) => {
                 wanted = id;
@@ -948,8 +1039,17 @@ fn device_thread(
                     && output.is_some()
                     && speakers.on.as_deref().is_some_and(|on| on != speakers.wanted)
                     && present(&speakers.wanted);
-                if back || (output.is_none() && speakers.tried.elapsed() >= CAPTURE_RETRY) {
+                if back || (output.is_none() && !parked && speakers.tried.elapsed() >= CAPTURE_RETRY) {
                     speakers.open(&mut output, &mixer, &tx);
+                } else if output.is_some() && mixer.quiet.load(Ordering::Relaxed) >= idle_frames {
+                    // Said first, so a sound that comes as they close asks for them back; and
+                    // one that slipped in before is looked for once they are closed.
+                    mixer.parked.store(true, Ordering::Release);
+                    drop(output.take());
+                    log::debug!("nothing to play for {}s: the speakers are closed until there is", SPEAKERS_IDLE.as_secs());
+                    if mixer.pending() {
+                        speakers.open(&mut output, &mixer, &tx);
+                    }
                 }
                 let Some(w) = wanted.as_deref() else { continue };
                 // On Windows' default because the chosen one was gone: back to it once it's in.
@@ -987,6 +1087,8 @@ impl Speakers {
     fn open(&mut self, output: &mut Option<cpal::Stream>, mixer: &Arc<Mixer>, lost: &mpsc::Sender<Command>) {
         drop(output.take());
         self.tried = Instant::now();
+        mixer.quiet.store(0, Ordering::Relaxed);
+        mixer.parked.store(false, Ordering::Release);
         match open_output(&self.wanted, mixer.clone(), lost.clone()) {
             Ok((stream, device)) => {
                 *output = Some(stream);
@@ -995,6 +1097,7 @@ impl Speakers {
             Err(e) => {
                 log::warn!("speakers did not open: {e}");
                 self.on = None;
+                forget_host();
             }
         }
     }
@@ -1002,12 +1105,7 @@ impl Speakers {
 
 /// Opens the capture for `id`, with the device it landed on; none for `None`, or for a
 /// microphone that will not open.
-fn open_capture(
-    id: Option<&str>,
-    mic: &Arc<Mic>,
-    near: &Arc<(Mutex<VecDeque<f32>>, Condvar)>,
-    tx: &mpsc::Sender<Command>,
-) -> Option<(cpal::Stream, DeviceInfo)> {
+fn open_capture(id: Option<&str>, mic: &Arc<Mic>, near: &Near, tx: &mpsc::Sender<Command>) -> Option<(cpal::Stream, DeviceInfo)> {
     mic.capturing.store(false, Ordering::Relaxed);
     near.0.lock().clear();
     match open_input(id?, near.clone(), mic.clone(), tx.clone()) {
@@ -1017,9 +1115,115 @@ fn open_capture(
         }
         Err(e) => {
             log::warn!("microphone did not open: {e}");
+            forget_host();
             None
         }
     }
+}
+
+/// An input stream in whatever sample format the device gives (cpal's defaults prefer the
+/// device's own, often 32- or 24-bit integers), handed over as f32. The copy is kept between
+/// callbacks, so after the first few it allocates nothing.
+pub(super) fn build_input(
+    device: &cpal::Device,
+    config: &cpal::SupportedStreamConfig,
+    take: impl FnMut(&[f32]) + Send + 'static,
+    err: impl FnMut(cpal::Error) + Send + 'static,
+) -> anyhow::Result<cpal::Stream> {
+    fn build<T: SizedSample>(
+        device: &cpal::Device,
+        config: cpal::StreamConfig,
+        mut take: impl FnMut(&[f32]) + Send + 'static,
+        err: impl FnMut(cpal::Error) + Send + 'static,
+    ) -> Result<cpal::Stream, cpal::Error>
+    where
+        f32: FromSample<T>,
+    {
+        let mut tmp: Vec<f32> = Vec::with_capacity(16_384);
+        let data = move |i: &[T], _: &cpal::InputCallbackInfo| {
+            tmp.clear();
+            tmp.extend(i.iter().map(|&s| f32::from_sample(s)));
+            take(&tmp);
+        };
+        device.build_input_stream::<T, _, _>(config, data, err, None)
+    }
+    use cpal::SampleFormat as F;
+    let c = stream_config(device, config, 10);
+    Ok(match config.sample_format() {
+        F::F32 => build::<f32>(device, c, take, err)?,
+        F::F64 => build::<f64>(device, c, take, err)?,
+        F::I8 => build::<i8>(device, c, take, err)?,
+        F::I16 => build::<i16>(device, c, take, err)?,
+        F::I24 => build::<cpal::I24>(device, c, take, err)?,
+        F::I32 => build::<i32>(device, c, take, err)?,
+        F::I64 => build::<i64>(device, c, take, err)?,
+        F::U8 => build::<u8>(device, c, take, err)?,
+        F::U16 => build::<u16>(device, c, take, err)?,
+        F::U24 => build::<cpal::U24>(device, c, take, err)?,
+        F::U32 => build::<u32>(device, c, take, err)?,
+        F::U64 => build::<u64>(device, c, take, err)?,
+        other => anyhow::bail!("the device gives {other:?} samples"),
+    })
+}
+
+/// The device's own config, with a buffer of `ms` where the host would otherwise choose a long
+/// one: PulseAudio's default is some two seconds, playing and recording alike, which no call
+/// (nor the echo canceller, which looks half a second back) could live with.
+fn stream_config(device: &cpal::Device, config: &cpal::SupportedStreamConfig, ms: u32) -> cpal::StreamConfig {
+    let c = config.config();
+    #[cfg(target_os = "linux")]
+    if device.id().is_ok_and(|id| id.host() == cpal::HostId::PulseAudio) {
+        let mut frames = (c.sample_rate * ms / 1000).max(1);
+        if let cpal::SupportedBufferSize::Range { min, max } = *config.buffer_size() {
+            frames = frames.clamp(min, max.max(min));
+        }
+        return cpal::StreamConfig { buffer_size: cpal::BufferSize::Fixed(frames), ..c };
+    }
+    let _ = (device, ms);
+    c
+}
+
+/// The output's counterpart of `build_input`: `fill` mixes in f32, converted to the device's
+/// format on the way out.
+fn build_output(
+    device: &cpal::Device,
+    config: &cpal::SupportedStreamConfig,
+    fill: impl FnMut(&mut [f32]) + Send + 'static,
+    err: impl FnMut(cpal::Error) + Send + 'static,
+) -> anyhow::Result<cpal::Stream> {
+    fn build<T: SizedSample + FromSample<f32>>(
+        device: &cpal::Device,
+        config: cpal::StreamConfig,
+        mut fill: impl FnMut(&mut [f32]) + Send + 'static,
+        err: impl FnMut(cpal::Error) + Send + 'static,
+    ) -> Result<cpal::Stream, cpal::Error> {
+        let mut tmp: Vec<f32> = Vec::with_capacity(16_384);
+        let data = move |o: &mut [T], _: &cpal::OutputCallbackInfo| {
+            tmp.resize(o.len(), 0.);
+            fill(&mut tmp);
+            for (d, s) in o.iter_mut().zip(&tmp) {
+                *d = T::from_sample(s.clamp(-1., 1.));
+            }
+        };
+        device.build_output_stream::<T, _, _>(config, data, err, None)
+    }
+    use cpal::SampleFormat as F;
+    let c = stream_config(device, config, 20);
+    Ok(match config.sample_format() {
+        F::F32 => build::<f32>(device, c, fill, err)?,
+        F::F64 => build::<f64>(device, c, fill, err)?,
+        F::I8 => build::<i8>(device, c, fill, err)?,
+        F::I16 => build::<i16>(device, c, fill, err)?,
+        F::I24 => build::<cpal::I24>(device, c, fill, err)?,
+        F::I32 => build::<i32>(device, c, fill, err)?,
+        F::I64 => build::<i64>(device, c, fill, err)?,
+        F::U8 => build::<u8>(device, c, fill, err)?,
+        F::U16 => build::<u16>(device, c, fill, err)?,
+        F::U24 => build::<cpal::U24>(device, c, fill, err)?,
+        F::U32 => build::<u32>(device, c, fill, err)?,
+        F::U64 => build::<u64>(device, c, fill, err)?,
+        other => anyhow::bail!("the speakers want {other:?} samples"),
+    })
 }
 
 fn open_output(id: &str, mixer: Arc<Mixer>, lost: mpsc::Sender<Command>) -> anyhow::Result<(cpal::Stream, DeviceInfo)> {
@@ -1033,6 +1237,7 @@ fn open_output(id: &str, mixer: Arc<Mixer>, lost: mpsc::Sender<Command>) -> anyh
     let mut res = Vec::new();
     let mut ready: VecDeque<f32> = VecDeque::new();
     let fill = move |out: &mut [f32]| {
+        let channels = channels.max(1);
         let frames = out.len() / channels;
         // Mix in 48 kHz stereo blocks until the device's rate and size are covered.
         while ready.len() / 2 < frames {
@@ -1058,61 +1263,47 @@ fn open_output(id: &str, mixer: Arc<Mixer>, lost: mpsc::Sender<Command>) -> anyh
             }
         }
     };
-    let mut fill = fill;
     // Unplugged, or Windows' default moved: the stream stops for good, and nothing would be
     // heard again until it's opened anew.
     let err = move |e: cpal::Error| {
-        log::warn!("speakers: {e}");
+        warn_stream("speakers", &e);
         if gone(&e) {
             let _ = lost.send(Command::OutputLost);
         }
     };
-    let stream = match config.sample_format() {
-        cpal::SampleFormat::F32 => device.build_output_stream::<f32, _, _>(config.config(), move |o: &mut [f32], _| fill(o), err, None)?,
-        cpal::SampleFormat::I16 => {
-            let mut tmp = Vec::new();
-            device.build_output_stream::<i16, _, _>(
-                config.config(),
-                move |o: &mut [i16], _| {
-                    tmp.resize(o.len(), 0.);
-                    fill(&mut tmp);
-                    for (d, s) in o.iter_mut().zip(&tmp) {
-                        *d = (s.clamp(-1., 1.) * 32767.) as i16;
-                    }
-                },
-                err,
-                None,
-            )?
-        }
-        other => anyhow::bail!("speakers want {other:?} samples"),
-    };
+    let stream = build_output(&device, &config, fill, err)?;
     stream.play()?;
     Ok((stream, playing))
 }
 
+/// A stream's error, logged; being refused real-time scheduling is no news worth a warning.
+pub(super) fn warn_stream(what: &str, e: &cpal::Error) {
+    if e.kind() == cpal::ErrorKind::RealtimeDenied {
+        log::debug!("{what}: {e}");
+    } else {
+        log::warn!("{what}: {e}");
+    }
+}
+
 /// Whether a stream's error means its device is gone (or was the default, and moved), so the
 /// stream will never deliver again.
-fn gone(e: &cpal::Error) -> bool {
+pub(super) fn gone(e: &cpal::Error) -> bool {
     matches!(e.kind(), cpal::ErrorKind::DeviceNotAvailable | cpal::ErrorKind::DeviceChanged | cpal::ErrorKind::StreamInvalidated)
 }
 
-fn open_input(
-    id: &str,
-    near: Arc<(Mutex<VecDeque<f32>>, Condvar)>,
-    mic: Arc<Mic>,
-    lost: mpsc::Sender<Command>,
-) -> anyhow::Result<(cpal::Stream, DeviceInfo)> {
+fn open_input(id: &str, near: Near, mic: Arc<Mic>, lost: mpsc::Sender<Command>) -> anyhow::Result<(cpal::Stream, DeviceInfo)> {
     let device = find(id, true).ok_or_else(|| anyhow::anyhow!("no microphone"))?;
     let using = info(&device).ok_or_else(|| anyhow::anyhow!("the microphone has no name"))?;
     let config = device.default_input_config()?;
     let (rate, channels) = (config.sample_rate(), config.channels() as usize);
     let mut resampler = Resampler::new(rate, RATE, 1);
-    let mut mono = Vec::new();
-    let mut out = Vec::new();
-    let mut take = move |input: &[f32]| {
+    let mut downmix = Downmix::new(channels, rate);
+    let mut mono = Vec::with_capacity(8192);
+    let mut out = Vec::with_capacity(8192);
+    let take = move |input: &[f32]| {
         mic.frames.fetch_add(1, Ordering::Relaxed);
         mono.clear();
-        mono.extend(input.chunks_exact(channels).map(|f| f.iter().sum::<f32>() / channels as f32));
+        downmix.process(input, &mut mono);
         out.clear();
         resampler.process(&mono, &mut out);
         let (buf, cv) = &*near;
@@ -1123,35 +1314,162 @@ fn open_input(
         cv.notify_one();
     };
     let err = move |e: cpal::Error| {
-        log::warn!("microphone: {e}");
+        warn_stream("microphone", &e);
         if gone(&e) {
             let _ = lost.send(Command::InputLost);
         }
     };
-    let stream = match config.sample_format() {
-        cpal::SampleFormat::F32 => device.build_input_stream::<f32, _, _>(config.config(), move |i, _| take(i), err, None)?,
-        cpal::SampleFormat::I16 => {
-            let mut tmp = Vec::new();
-            device.build_input_stream::<i16, _, _>(
-                config.config(),
-                move |i: &[i16], _| {
-                    tmp.clear();
-                    tmp.extend(i.iter().map(|&s| s as f32 / 32768.));
-                    take(&tmp);
-                },
-                err,
-                None,
-            )?
-        }
-        other => anyhow::bail!("the microphone gives {other:?} samples"),
-    };
+    let stream = build_input(&device, &config, take, err)?;
     stream.play()?;
     Ok((stream, using))
 }
 
+/// A whole window of a device's frames, half a second, over which each channel's level is taken.
+const DOWNMIX_WINDOW_MS: usize = 500;
+/// Quieter than this (about -60 dBFS RMS) a channel holds nothing worth switching to.
+const DOWNMIX_FLOOR: f32 = 1e-6;
+/// How long a change of channel takes, faded, so it never clicks.
+const DOWNMIX_FADE_MS: usize = 20;
+
+/// Makes a device's frames the one channel the call sends. Averaging every channel cost a
+/// microphone on one input of an audio interface 6 dB on two channels and 18 dB on eight, with the
+/// other inputs' hiss on top. So two channels are averaged while both carry the sound (a stereo
+/// or doubled-mono microphone) and the louder taken alone when the other is all but silent; more
+/// than two, the loudest is taken, measured over half a second and only left for one clearly
+/// louder. Changes fade over a few milliseconds. Allocates only when made.
+struct Downmix {
+    channels: usize,
+    /// Each channel's share of the output now, and where it is heading.
+    weights: Vec<f32>,
+    target: Vec<f32>,
+    /// Each channel's energy over the window so far, and the frames in it.
+    energy: Vec<f32>,
+    seen: usize,
+    window: usize,
+    /// How far a weight moves in a frame.
+    step: f32,
+    /// The channel taken alone, or none while two are averaged.
+    alone: Option<usize>,
+}
+
+impl Downmix {
+    fn new(channels: usize, rate: u32) -> Downmix {
+        let channels = channels.max(1);
+        let rate = rate.max(1) as usize;
+        // Two channels start averaged, as before; more start on the first until one is heard.
+        let (target, alone) = match channels {
+            2 => (vec![0.5, 0.5], None),
+            n => ((0..n).map(|c| if c == 0 { 1. } else { 0. }).collect(), Some(0)),
+        };
+        Downmix {
+            channels,
+            weights: target.clone(),
+            target,
+            energy: vec![0.; channels],
+            seen: 0,
+            window: (rate * DOWNMIX_WINDOW_MS / 1000).max(1),
+            step: 1. / (rate * DOWNMIX_FADE_MS / 1000).max(1) as f32,
+            alone,
+        }
+    }
+
+    /// Appends the mono of `input` (interleaved) to `out`.
+    fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
+        let ch = self.channels;
+        if ch == 1 {
+            out.extend_from_slice(input);
+            return;
+        }
+        for frame in input.chunks_exact(ch) {
+            let mut v = 0.;
+            let channels = frame.iter().zip(self.energy.iter_mut()).zip(self.weights.iter_mut().zip(&self.target));
+            for ((&x, energy), (w, &t)) in channels {
+                *energy += x * x;
+                if *w != t {
+                    *w = if *w < t { (*w + self.step).min(t) } else { (*w - self.step).max(t) };
+                }
+                v += x * *w;
+            }
+            out.push(v);
+            self.seen += 1;
+            if self.seen >= self.window {
+                self.decide();
+            }
+        }
+    }
+
+    /// At the end of a window: which channels to take from here.
+    fn decide(&mut self) {
+        let n = self.seen.max(1) as f32;
+        let ch = self.channels;
+        let loudest = (0..ch).max_by(|&a, &b| self.energy[a].total_cmp(&self.energy[b])).unwrap_or(0);
+        let level = |c: usize| self.energy[c] / n;
+        if level(loudest) > DOWNMIX_FLOOR {
+            if ch == 2 {
+                let other = 1 - loudest;
+                // 20 dB apart to take one alone, back to both under 15: no flapping in between.
+                let ratio = level(loudest) / level(other).max(f32::MIN_POSITIVE);
+                match self.alone {
+                    None if ratio > 100. => self.alone = Some(loudest),
+                    Some(_) if ratio < 30. => self.alone = None,
+                    Some(c) if c != loudest && ratio > 100. => self.alone = Some(loudest),
+                    _ => {}
+                }
+            } else if let Some(current) = self.alone
+                && loudest != current
+                && level(loudest) > 2. * level(current)
+            {
+                // 3 dB louder than the one taken, or the switch would go back and forth.
+                self.alone = Some(loudest);
+            }
+        }
+        for c in 0..ch {
+            self.target[c] = match self.alone {
+                Some(a) => (c == a) as u8 as f32,
+                None => 1. / ch as f32,
+            };
+        }
+        self.energy.iter_mut().for_each(|e| *e = 0.);
+        self.seen = 0;
+    }
+}
+
+/// The processing thread is on the microphone's way to everyone, every 10 ms, so it asks to be
+/// scheduled as audio work is: Windows' multimedia class ("Pro Audio"), macOS's user-interactive
+/// class. Linux has nothing an unprivileged process can ask for beyond what the audio server
+/// already does for its own threads.
+fn raise_priority() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Threading::{AVRT_PRIORITY_HIGH, AvSetMmThreadCharacteristicsW, AvSetMmThreadPriority};
+        let task: Vec<u16> = "Pro Audio\0".encode_utf16().collect();
+        let mut index = 0u32;
+        // SAFETY: a NUL-terminated name and a valid out pointer; the thread keeps the class for
+        // its whole life, so the handle is never reverted.
+        unsafe {
+            let handle = AvSetMmThreadCharacteristicsW(task.as_ptr(), &mut index);
+            if handle.is_null() {
+                log::debug!("the microphone thread stays at normal priority");
+            } else {
+                AvSetMmThreadPriority(handle, AVRT_PRIORITY_HIGH);
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn pthread_set_qos_class_self_np(class: u32, relative_priority: i32) -> i32;
+        }
+        const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+        // SAFETY: changes only the calling thread's own class.
+        unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) };
+    }
+}
+
 /// Turns raw microphone audio into what the call sends: echo cancelled against the mix, noise
 /// suppressed, at the input volume, gated.
-fn dsp_thread(mixer: Arc<Mixer>, mic: Arc<Mic>, near: Arc<(Mutex<VecDeque<f32>>, Condvar)>) {
+fn dsp_thread(mixer: Arc<Mixer>, mic: Arc<Mic>, near: Near) {
+    raise_priority();
     let mut apm: Option<(bool, bool, AudioProcessingModule)> = None;
     let mut frame = vec![0f32; FRAME];
     let mut pcm = vec![0i16; FRAME];
@@ -1178,6 +1496,15 @@ fn dsp_thread(mixer: Arc<Mixer>, mic: Arc<Mic>, near: Arc<(Mutex<VecDeque<f32>>,
                 }
                 if mic.capturing.load(Ordering::Relaxed) {
                     cv.wait_for(&mut b, Duration::from_millis(200));
+                } else if !mic.has_sink.load(Ordering::Acquire) {
+                    // No microphone and nobody to send to: nothing to do until one of them
+                    // comes, which `set_mic_sink` and the capture's first sound both say.
+                    cv.wait_for(&mut b, Duration::from_secs(5));
+                    next_silence = Instant::now() + tick;
+                    // As below for silence: the speakers' mix meanwhile is no reference for the
+                    // microphone that opens next.
+                    mixer.far.lock().clear();
+                    far_pending.clear();
                 } else if Instant::now() >= next_silence {
                     next_silence = (next_silence + tick).max(Instant::now());
                     break false;
@@ -1377,6 +1704,7 @@ pub fn cue(kind: Cue, volume: f32) {
     let samples = rendered(kind, volume);
     if !samples.is_empty() {
         cue_bus().play_cue(samples);
+        audio().mixer.wake();
     }
 }
 
@@ -1739,7 +2067,12 @@ mod tests {
             for block in [FRAME, 441, 1024] {
                 let run = play(SourceKind::Voice, ppm, 8., block, speech);
                 let target = target.max(block as f64 * 1000. / RATE as f64 + 20.);
-                println!("voice, {ppm} ppm, {block}-frame blocks: fill {:.1} ms on average, {:.1} at most, dry {}", run.mean_ms(), run.max_ms(), run.dry);
+                println!(
+                    "voice, {ppm} ppm, {block}-frame blocks: fill {:.1} ms on average, {:.1} at most, dry {}",
+                    run.mean_ms(),
+                    run.max_ms(),
+                    run.dry
+                );
                 assert!((run.mean_ms() - target).abs() < 15., "{ppm} ppm, {block}: {:.1} ms", run.mean_ms());
                 assert!(run.max_ms() < target + 30., "{ppm} ppm, {block}: grew to {:.1} ms", run.max_ms());
                 assert_eq!(run.dry, 0, "{ppm} ppm, {block}");
@@ -1827,5 +2160,98 @@ mod tests {
             write_wav(&dir.join("overlap-raw.wav"), &raw);
             write_wav(&dir.join("overlap-limited.wav"), &mixed);
         }
+    }
+
+    /// `secs` of interleaved frames at 48 kHz, each channel's sample from `f(channel, frame)`.
+    fn interleaved(channels: usize, secs: f32, f: impl Fn(usize, usize) -> f32) -> Vec<f32> {
+        let frames = (secs * RATE as f32) as usize;
+        (0..frames).flat_map(|i| (0..channels).map(move |c| (c, i))).map(|(c, i)| f(c, i)).collect()
+    }
+
+    /// Through a downmix in device-sized blocks, as callbacks hand them over.
+    fn downmixed(channels: usize, input: &[f32]) -> Vec<f32> {
+        let mut d = Downmix::new(channels, RATE);
+        let mut out = Vec::new();
+        for block in input.chunks(441 * channels) {
+            d.process(block, &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn a_microphone_on_one_input_keeps_its_level() {
+        let voice = |i: usize| 0.3 * (i as f32 * 0.05).sin();
+        // Mono passes as it is.
+        assert_eq!(downmixed(1, &[0.1, 0.2, 0.3]), [0.1, 0.2, 0.3]);
+        // The same on both channels: the average is the sound itself.
+        let both = downmixed(2, &interleaved(2, 1., |_, i| voice(i)));
+        assert!((rms(&both[24_000..]) - rms(&tone_of(voice, 24_000))).abs() < 1e-3);
+        // Only on the right: half a second in, it is taken alone, not halved.
+        let right = downmixed(2, &interleaved(2, 2., |c, i| if c == 1 { voice(i) } else { 0. }));
+        let full = rms(&tone_of(voice, 48_000));
+        assert!((rms(&right[48_000..]) / full - 1.).abs() < 0.01, "{}", rms(&right[48_000..]) / full);
+        // Eight inputs, the voice on the sixth and a little hiss on the rest: the voice alone.
+        let hiss = |c: usize, i: usize| 0.002 * (((i * 7919 + c * 104_729) % 1000) as f32 / 500. - 1.);
+        let eight = downmixed(8, &interleaved(8, 2., |c, i| if c == 5 { voice(i) } else { hiss(c, i) }));
+        assert!((rms(&eight[48_000..]) / full - 1.).abs() < 0.01, "{}", rms(&eight[48_000..]) / full);
+    }
+
+    fn tone_of(f: impl Fn(usize) -> f32, frames: usize) -> Vec<f32> {
+        (0..frames).map(f).collect()
+    }
+
+    #[test]
+    fn the_downmix_does_not_flap_between_close_channels() {
+        // Two inputs a dB apart, swapping which is louder every quarter second: once on one, it
+        // stays, since neither is ever 3 dB above the other.
+        let mut d = Downmix::new(4, RATE);
+        let mut out = Vec::new();
+        let input = interleaved(4, 6., |c, i| {
+            let swap = (i / 12_000) % 2 == 0;
+            match (c, swap) {
+                (0, true) | (1, false) => 0.30,
+                (0, false) | (1, true) => 0.27,
+                _ => 0.,
+            }
+        });
+        let mut picks = Vec::new();
+        for block in input.chunks(480 * 4) {
+            d.process(block, &mut out);
+            picks.push(d.alone);
+        }
+        picks.dedup();
+        assert!(picks.len() <= 2, "{picks:?}");
+        // And a change fades: no sample jumps by more than a fade step's worth.
+        let mut d = Downmix::new(2, RATE);
+        let mut out = Vec::new();
+        d.process(&interleaved(2, 1., |c, _| if c == 0 { 0.5 } else { 0. }), &mut out);
+        assert!(out.windows(2).all(|w| (w[1] - w[0]).abs() <= 0.5 * d.step + 1e-6));
+        assert!((out.last().unwrap() - 0.5).abs() < 1e-6, "{}", out.last().unwrap());
+    }
+
+    #[test]
+    fn the_mix_says_when_there_is_nothing_to_play() {
+        let m = Mixer::new();
+        let bus = Source::bus();
+        m.add(bus.clone());
+        let mut out = vec![0.; 2 * FRAME];
+        m.mix(&mut out);
+        m.mix(&mut out);
+        assert_eq!(m.quiet.load(Ordering::Relaxed), 2 * FRAME, "an empty bus is quiet");
+        bus.play_cue(vec![0.1; 2 * FRAME].into());
+        assert!(m.pending(), "a cue waiting counts");
+        m.mix(&mut out);
+        assert_eq!(m.quiet.load(Ordering::Relaxed), 0);
+        let voice = Source::new(SourceKind::Voice, 1., false);
+        m.add(voice.clone());
+        for _ in 0..4 {
+            m.mix(&mut out);
+        }
+        assert_eq!(m.quiet.load(Ordering::Relaxed), 0, "someone in the call keeps the speakers, silent or not");
+        m.remove(&voice);
+        m.mix(&mut out);
+        m.mix(&mut out);
+        assert!(m.quiet.load(Ordering::Relaxed) > 0);
+        assert!(!m.pending());
     }
 }

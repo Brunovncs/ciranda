@@ -195,6 +195,46 @@ impl Drop for Watch {
     }
 }
 
+/// Keeps macOS from napping Ciranda while a call is on, and whatever it shares with it: App Nap
+/// slows the timers and threads of an app whose window is hidden or covered, the microphone's,
+/// the screen's and the camera's among them. Elsewhere there is nothing to hold off.
+mod awake {
+    #[cfg(target_os = "macos")]
+    use objc2::{rc::Retained, runtime::NSObjectProtocol, runtime::ProtocolObject};
+
+    /// Held for the call's life; dropping it lets the system nap the app again.
+    #[cfg(target_os = "macos")]
+    pub struct Activity(Retained<ProtocolObject<dyn NSObjectProtocol>>);
+
+    #[cfg(target_os = "macos")]
+    impl Activity {
+        pub fn begin() -> Activity {
+            use objc2_foundation::{NSActivityOptions, NSProcessInfo, NSString};
+            let options = NSActivityOptions::UserInitiated | NSActivityOptions::LatencyCritical;
+            let reason = NSString::from_str("A call is on");
+            Activity(NSProcessInfo::processInfo().beginActivityWithOptions_reason(options, &reason))
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for Activity {
+        fn drop(&mut self) {
+            // SAFETY: the token `beginActivityWithOptions:reason:` gave, ended once.
+            unsafe { objc2_foundation::NSProcessInfo::processInfo().endActivity(&self.0) };
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub struct Activity;
+
+    #[cfg(not(target_os = "macos"))]
+    impl Activity {
+        pub fn begin() -> Activity {
+            Activity
+        }
+    }
+}
+
 /// Which of `v`, `c`, `s` the server has wrong about you, as what to tell it.
 pub fn publishing_fixes(live: [(&'static str, bool); 3], server: &[String]) -> Vec<(&'static str, bool)> {
     live.into_iter().filter(|(kind, on)| server.iter().any(|s| s == kind) != *on).collect()
@@ -254,6 +294,7 @@ pub struct Voice {
     roster: Vec<Member>,
     _ticker: Task<()>,
     _slow: Task<()>,
+    _awake: awake::Activity,
 }
 
 const SPEAK_ON: f32 = 0.0075;
@@ -327,6 +368,7 @@ impl Voice {
             roster: Vec::new(),
             _ticker: ticker,
             _slow: slow,
+            _awake: awake::Activity::begin(),
         };
         v.reconcile(cx);
         v
@@ -707,7 +749,11 @@ impl Voice {
         let me = self.session.read(cx).me.id;
         // Not in the roster yet, or a roster from before a rejoin.
         let Some(mine) = self.roster.iter().find(|m| m.user_id == me && Some(m.mid) == self.mid) else { return };
-        let live = [("v", self.mic.is_some() && self.mic_readable), ("c", self.share_live(TileKind::Camera)), ("s", self.share_live(TileKind::Screen))];
+        let live = [
+            ("v", self.mic.is_some() && self.mic_readable),
+            ("c", self.share_live(TileKind::Camera)),
+            ("s", self.share_live(TileKind::Screen)),
+        ];
         let now = Instant::now();
         let rt = self.session.read(cx).realtime.clone();
         let place = self.place;

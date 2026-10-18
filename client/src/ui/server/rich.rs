@@ -120,30 +120,28 @@ fn line_el(id: impl Into<SharedString>, line: &Line, size: f32, t: &Theme, look:
         return div().h(px(size * 1.45)).into_any_element();
     }
     let only_text = matches!(pieces.as_slice(), [Piece::Text { .. }]);
-    let mut els = pieces.into_iter().enumerate().map(|(i, p)| {
-        match p {
-            Piece::Text { text, highlights, mono, links } => {
-                let targets: Vec<(String, String)> = links.iter().map(|(r, url)| (text[r.clone()].to_string(), url.clone())).collect();
-                let ranges: Vec<Range<usize>> = links.iter().map(|l| l.0.clone()).collect();
-                let theme = *t;
-                let styled = StyledText::new(SharedString::from(text))
-                    .with_highlights(highlights)
-                    .with_font_family_overrides(mono.into_iter().map(|r| (r, SharedString::from(MONO))));
-                InteractiveText::new(ElementId::Name(format!("{id}.{i}").into()), styled)
-                    .on_click(ranges, move |ix, window, cx| {
-                        if let Some((label, url)) = targets.get(ix) {
-                            open_link(label, url, window, cx);
-                        }
-                    })
-                    .tooltip(move |ix, window, cx| {
-                        let (_, url) = links.iter().find(|(r, _)| r.contains(&ix))?;
-                        Some(crate::widgets::tip(url.clone(), &theme)(window, cx))
-                    })
-                    .into_any_element()
-            }
-            Piece::Emoji(Some(image), _) => img(image).h(px(size * 1.3)).max_w(px(size * 4.)).into_any_element(),
-            Piece::Emoji(None, raw) => div().child(raw).into_any_element(),
+    let mut els = pieces.into_iter().enumerate().map(|(i, p)| match p {
+        Piece::Text { text, highlights, mono, links } => {
+            let targets: Vec<(String, String)> = links.iter().map(|(r, url)| (text[r.clone()].to_string(), url.clone())).collect();
+            let ranges: Vec<Range<usize>> = links.iter().map(|l| l.0.clone()).collect();
+            let theme = *t;
+            let styled = StyledText::new(SharedString::from(text))
+                .with_highlights(highlights)
+                .with_font_family_overrides(mono.into_iter().map(|r| (r, SharedString::from(MONO))));
+            InteractiveText::new(ElementId::Name(format!("{id}.{i}").into()), styled)
+                .on_click(ranges, move |ix, window, cx| {
+                    if let Some((label, url)) = targets.get(ix) {
+                        open_link(label, url, window, cx);
+                    }
+                })
+                .tooltip(move |ix, window, cx| {
+                    let (_, url) = links.iter().find(|(r, _)| r.contains(&ix))?;
+                    Some(crate::widgets::tip(url.clone(), &theme)(window, cx))
+                })
+                .into_any_element()
         }
+        Piece::Emoji(Some(image), _) => img(image).h(px(size * 1.3)).max_w(px(size * 4.)).into_any_element(),
+        Piece::Emoji(None, raw) => div().child(raw).into_any_element(),
     });
     // Text as a flex item is measured on one line and can't shrink below it, so a long message ran
     // past the edge. Alone it is a block, which wraps at the width it gets; among emoji, each run

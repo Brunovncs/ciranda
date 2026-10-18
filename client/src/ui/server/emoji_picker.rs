@@ -213,22 +213,24 @@ pub fn add_emoji(session: Entity<Session>, window: &mut Window, cx: &mut App) {
         let Some(path) = paths.into_iter().next() else { return };
         // A photo straight off a phone takes a second to decode and resize: not on the UI thread.
         let source = path.clone();
-        let png: Result<Vec<u8>, String> = cx.background_executor().spawn(async move {
-            let path = source;
-            let img = image::open(&path).map_err(|_| {
-                tr!("That file is not a picture Ciranda can read.", "Ciranda não consegue ler esse arquivo como imagem.").to_string()
-            })?;
-            let img =
-                if img.width() > 128 || img.height() > 128 { img.resize(128, 128, image::imageops::FilterType::Lanczos3) } else { img };
-            let mut out = Vec::new();
-            img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png).map_err(|e| e.to_string())?;
-            if out.len() > 256 * 1024 {
-                Err(tr!("That picture is too big even at 128 px.", "Essa imagem é grande demais mesmo com 128 px.").into())
-            } else {
-                Ok(out)
-            }
-        })
-        .await;
+        let png: Result<Vec<u8>, String> = cx
+            .background_executor()
+            .spawn(async move {
+                let path = source;
+                let img = image::open(&path).map_err(|_| {
+                    tr!("That file is not a picture Ciranda can read.", "Ciranda não consegue ler esse arquivo como imagem.").to_string()
+                })?;
+                let img =
+                    if img.width() > 128 || img.height() > 128 { img.resize(128, 128, image::imageops::FilterType::Lanczos3) } else { img };
+                let mut out = Vec::new();
+                img.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png).map_err(|e| e.to_string())?;
+                if out.len() > 256 * 1024 {
+                    Err(tr!("That picture is too big even at 128 px.", "Essa imagem é grande demais mesmo com 128 px.").into())
+                } else {
+                    Ok(out)
+                }
+            })
+            .await;
         let stem: String = path
             .file_stem()
             .map(|s| s.to_string_lossy().to_lowercase())

@@ -4966,21 +4966,31 @@ impl Window {
         Ok(())
     }
 
-    /// Paint a surface into the scene for the next frame at the current z-index.
+    /// Paint a surface into the scene for the next frame at the current z-index, filling
+    /// `bounds` (scaled by the GPU) with its corners rounded by `corner_radii`.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
     #[cfg(target_os = "macos")]
-    pub fn paint_surface(&mut self, bounds: Bounds<Pixels>, image_buffer: CVPixelBuffer) {
+    pub fn paint_surface(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        image_buffer: CVPixelBuffer,
+    ) {
         use crate::PaintSurface;
 
         self.invalidator.debug_assert_paint();
 
+        let corner_radii = corner_radii
+            .clamp_radii_for_quad_size(bounds.size)
+            .scale(self.scale_factor());
         let bounds = self.snap_bounds(bounds);
         let content_mask = self.snapped_content_mask();
         self.next_frame.scene.insert_primitive(PaintSurface {
             order: 0,
             bounds,
             content_mask,
+            corner_radii,
             image_buffer,
         });
     }

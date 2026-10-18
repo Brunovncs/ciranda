@@ -656,7 +656,13 @@ impl ServerView {
         self.chat_pane(ChatKey::Here(room), &session, room, window, cx)
     }
 
-    fn away_chat(&mut self, session: &Entity<Session>, conversation: ConversationId, window: &mut Window, cx: &mut Context<Self>) -> Entity<ChatView> {
+    fn away_chat(
+        &mut self,
+        session: &Entity<Session>,
+        conversation: ConversationId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<ChatView> {
         // Chats of sessions no longer kept go with them.
         let kept = |key: &ChatKey| match key {
             ChatKey::Away(id, _) => crate::elsewhere::away_session(*id, cx).is_some(),
@@ -679,7 +685,14 @@ impl ServerView {
 
     /// The pane for `key`, made if it is not kept (with what was being written in it before), and
     /// marked as shown last. Called on every draw of the chat, so finding it is kept cheap.
-    fn chat_pane(&mut self, key: ChatKey, session: &Entity<Session>, room: Room, window: &mut Window, cx: &mut Context<Self>) -> Entity<ChatView> {
+    fn chat_pane(
+        &mut self,
+        key: ChatKey,
+        session: &Entity<Session>,
+        room: Room,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<ChatView> {
         if let Some(at) = self.chats.iter().position(|c| c.key == key) {
             if at + 1 != self.chats.len() {
                 let chat = self.chats.remove(at);
@@ -898,11 +911,17 @@ impl ServerView {
             HotkeyAction::Overlay => {
                 if !prefs(cx).overlay_enabled {
                     overlay::toast(
-                        tr!("Turn the overlay on in Settings › In game first.", "Ative a sobreposição em Configurações › Durante o jogo primeiro."),
+                        tr!(
+                            "Turn the overlay on in Settings › In game first.",
+                            "Ative a sobreposição em Configurações › Durante o jogo primeiro."
+                        ),
                         cx,
                     );
                 } else if !crate::ui::game_overlay::toggle(cx) {
-                    overlay::toast(tr!("Overlay hidden. The same hotkey brings it back.", "Sobreposição escondida. O mesmo atalho a traz de volta."), cx);
+                    overlay::toast(
+                        tr!("Overlay hidden. The same hotkey brings it back.", "Sobreposição escondida. O mesmo atalho a traz de volta."),
+                        cx,
+                    );
                 }
             }
             HotkeyAction::Replay => self.save_replay(cx),
@@ -1016,7 +1035,12 @@ impl ServerView {
                     div()
                         .px(px(10.))
                         .pb(px(8.))
-                        .child(VolumeSlider::new(("user-volume", user as u64), gain, move |g, cx| voice.update(cx, |v, cx| v.set_volume(user, g, cx))).render(t, cx))
+                        .child(
+                            VolumeSlider::new(("user-volume", user as u64), gain, move |g, cx| {
+                                voice.update(cx, |v, cx| v.set_volume(user, g, cx))
+                            })
+                            .render(t, cx),
+                        )
                         .into_any_element()
                 }));
                 let muted_for_me = volume_of(user) == 0.;
@@ -1121,7 +1145,14 @@ impl ServerView {
         // The conversations are every server's: their title, not this server's.
         let lead = if self.dms_open {
             lead.child(
-                div().size(px(28.)).flex().items_center().justify_center().rounded(px(8.)).bg(t.accent_soft).child(icon("message", 15., t.accent)),
+                div()
+                    .size(px(28.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(8.))
+                    .bg(t.accent_soft)
+                    .child(icon("message", 15., t.accent)),
             )
             .child(title(tr!("Direct messages", "Mensagens diretas"), t.text))
         } else {
@@ -1171,14 +1202,16 @@ impl ServerView {
                         )
                     }),
             )
-            .when(!self.dms_open, |d| d.child(
-                tool_button("toggle-members", "users", show_members, if show_members { t.accent } else { t.text2 }, t)
-                    .tooltip(tip(
-                        if show_members { tr!("Hide members", "Ocultar membros") } else { tr!("Show members", "Mostrar membros") },
-                        t,
-                    ))
-                    .on_click(cx.listener(|_, _, _, cx| set_prefs(cx, |p| p.show_members = !p.show_members))),
-            ))
+            .when(!self.dms_open, |d| {
+                d.child(
+                    tool_button("toggle-members", "users", show_members, if show_members { t.accent } else { t.text2 }, t)
+                        .tooltip(tip(
+                            if show_members { tr!("Hide members", "Ocultar membros") } else { tr!("Show members", "Mostrar membros") },
+                            t,
+                        ))
+                        .on_click(cx.listener(|_, _, _, cx| set_prefs(cx, |p| p.show_members = !p.show_members))),
+                )
+            })
             .child(
                 icon_button("settings", "settings", t)
                     .tooltip(tip(tr!("Settings (Ctrl+,)", "Configurações (Ctrl+,)"), t))
@@ -1342,7 +1375,10 @@ impl ServerView {
                         )
                         .child(
                             tool_button("hang-up", "phone-off", false, t.critical, t)
-                                .tooltip(tip(if private { tr!("Hang up", "Desligar") } else { tr!("Leave the channel", "Sair do canal") }, t))
+                                .tooltip(tip(
+                                    if private { tr!("Hang up", "Desligar") } else { tr!("Leave the channel", "Sair do canal") },
+                                    t,
+                                ))
                                 .on_click(cx.listener(|this, _, _, cx| this.leave_voice(cx))),
                         ),
                 )
@@ -1380,17 +1416,22 @@ impl ServerView {
                                     }),
                                 ),
                         )
-                        .when(!private, |d| d.child(
-                            panel_button("soundpad", "soundboard", false, t)
-                                .tooltip(tip(tr!("Soundboard: play a sound for everyone", "Painel de sons: toque um som para todos"), t))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, e: &MouseDownEvent, window, cx| {
-                                        cx.stop_propagation();
-                                        this.open_soundpad(e.position, window, cx)
-                                    }),
-                                ),
-                        )),
+                        .when(!private, |d| {
+                            d.child(
+                                panel_button("soundpad", "soundboard", false, t)
+                                    .tooltip(tip(
+                                        tr!("Soundboard: play a sound for everyone", "Painel de sons: toque um som para todos"),
+                                        t,
+                                    ))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, e: &MouseDownEvent, window, cx| {
+                                            cx.stop_propagation();
+                                            this.open_soundpad(e.position, window, cx)
+                                        }),
+                                    ),
+                            )
+                        }),
                 )
                 .into_any_element(),
         )
@@ -1512,7 +1553,16 @@ impl Render for ServerView {
                 .items_center()
                 .justify_center()
                 .gap(px(10.))
-                .child(div().size(px(64.)).rounded_full().bg(t.layer).flex().items_center().justify_center().child(icon("message", 26., t.text3)))
+                .child(
+                    div()
+                        .size(px(64.))
+                        .rounded_full()
+                        .bg(t.layer)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(icon("message", 26., t.text3)),
+                )
                 .child(title(tr!("Your conversations", "Suas conversas"), t.text))
                 .child(caption(
                     tr!(

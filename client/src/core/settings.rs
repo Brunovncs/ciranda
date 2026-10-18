@@ -1,7 +1,8 @@
 //! `settings.json`, in the same place and with the same keys the Electron client used, so an
 //! upgrade keeps the server, the sign-in and every preference. Keys this client does not know
-//! are kept as they were. The passwords and sign-ins in it are sealed for this Windows user (see
-//! `secret`); the plain ones an older client wrote are read and sealed on the spot.
+//! are kept as they were. The passwords and sign-ins in it are sealed for this user (see
+//! `secret`); the plain ones an older client wrote are read and sealed on the spot. On macOS and
+//! Linux the folder and everything in it are readable by this user alone.
 
 use super::api::normalize_base;
 use super::secret;
@@ -699,36 +700,54 @@ pub struct Store {
     /// Keys whose value did not parse, with the default used instead. The file keeps what it
     /// had until the setting is actually changed.
     unread: Map<String, Value>,
-    /// Each secret's sealed form, so a save (one per slider step) neither calls DPAPI again nor
+    /// Each secret's sealed form, so a save (one per slider step) neither seals again nor
     /// rewrites a secret that did not change.
     sealed: HashMap<String, String>,
+    /// Secrets sealed under a keychain key this run does not have (see `secret::locked`), by
+    /// where they are. They read as empty, and are written back as they were until replaced.
+    locked: HashMap<SecretAt, String>,
     pub values: Settings,
 }
 
+/// Where a secret is in the file: the top-level keys (""), or the saved server with that address
+/// and username; and its key there.
+type SecretAt = (String, &'static str);
+
 /// Visits every secret in the file's shape: the server password and the sign-in, at the top and
 /// in each saved server, and the account password kept there.
-fn each_secret(map: &mut Map<String, Value>, f: &mut impl FnMut(&mut String)) {
-    let mut visit = |m: &mut Map<String, Value>| {
+fn each_secret(map: &mut Map<String, Value>, f: &mut impl FnMut(SecretAt, &mut String)) {
+    let mut visit = |scope: String, m: &mut Map<String, Value>| {
         for key in ["password", "sessionToken", "accountPassword"] {
             if let Some(Value::String(s)) = m.get_mut(key) {
-                f(s);
+                f((scope.clone(), key), s);
             }
         }
     };
-    visit(map);
+    visit(String::new(), map);
     if let Some(Value::Array(list)) = map.get_mut("savedServers") {
         for s in list.iter_mut().filter_map(Value::as_object_mut) {
-            visit(s);
+            let at = |k: &str| s.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
+            let scope = format!("{}\n{}", normalize_base(&at("url")).to_lowercase(), at("username"));
+            visit(scope, s);
         }
     }
 }
 
 /// The file with its secrets opened, and whether any was still unsealed. One that does not open
-/// (sealed by another Windows user, or damaged) reads as empty: signing in again replaces it.
-fn open_secrets(raw: &Map<String, Value>, sealed: &mut HashMap<String, String>) -> (Map<String, Value>, bool) {
+/// (sealed by another Windows user, or damaged) reads as empty: signing in again replaces it. One
+/// sealed under a keychain key this run lacks reads as empty too, but goes in `locked`.
+fn open_secrets(
+    raw: &Map<String, Value>,
+    sealed: &mut HashMap<String, String>,
+    locked: &mut HashMap<SecretAt, String>,
+) -> (Map<String, Value>, bool) {
     let mut opened = raw.clone();
     let mut unsealed = false;
-    each_secret(&mut opened, &mut |s| {
+    each_secret(&mut opened, &mut |at, s| {
+        if secret::locked(s) {
+            locked.insert(at, std::mem::take(s));
+            return;
+        }
         if !secret::is_sealed(s) {
             unsealed |= !s.is_empty();
             return;
@@ -772,8 +791,11 @@ impl Store {
 
     pub fn load_from(path: PathBuf) -> Store {
         let raw: Map<String, Value> = std::fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
-        let mut sealed = HashMap::new();
-        let (opened, unsealed) = open_secrets(&raw, &mut sealed);
+        let (mut sealed, mut locked) = (HashMap::new(), HashMap::new());
+        let (opened, unsealed) = open_secrets(&raw, &mut sealed, &mut locked);
+        if !locked.is_empty() {
+            log::warn!("settings.json: some passwords and sign-ins are sealed with a key this run lacks; they are kept");
+        }
         let (mut values, unread) = read_leniently(&opened);
         values.ui_scale = values.ui_scale.clamp(70, 180);
         values.sound_volume = values.sound_volume.min(200);
@@ -797,9 +819,9 @@ impl Store {
             Ok(Value::Object(now)) => unread.keys().filter_map(|k| Some((k.clone(), now.get(k)?.clone()))).collect(),
             _ => unread,
         };
-        let mut store = Store { path, raw, unread, sealed, values };
+        let mut store = Store { path, raw, unread, sealed, locked, values };
         // Secrets an older client left in the clear are not left there until some setting changes.
-        if unsealed && secret::SEALS {
+        if unsealed && secret::seals() {
             store.save();
         }
         store
@@ -818,11 +840,17 @@ impl Store {
             Ok(Value::Object(fresh)) => fresh,
             _ => Map::new(),
         };
-        // Compared with `unread` as it is, in the clear, and written sealed.
+        // Compared with `unread` as it is, in the clear, and written sealed. A locked secret stays
+        // as it was until something takes its place.
         let mut stored = fresh.clone();
-        let sealed = &mut self.sealed;
-        each_secret(&mut stored, &mut |s| {
-            if !s.is_empty() {
+        let (sealed, locked) = (&mut self.sealed, &mut self.locked);
+        each_secret(&mut stored, &mut |at, s| {
+            if s.is_empty() {
+                if let Some(kept) = locked.get(&at) {
+                    s.clone_from(kept);
+                }
+            } else {
+                locked.remove(&at);
                 *s = sealed.entry(std::mem::take(s)).or_insert_with_key(|plain| secret::seal(plain)).clone();
             }
         });
@@ -861,14 +889,65 @@ pub fn write_file(path: &Path, text: &str) {
 pub fn write_durably(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+        create_private_dir(dir)?;
     }
     let tmp = path.with_extension("json.part");
-    let mut file = std::fs::File::create(&tmp)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(&tmp)?;
+    // One left over from an older version keeps the mode it was made with.
+    #[cfg(unix)]
+    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
     file.write_all(bytes)?;
     file.sync_all()?;
     drop(file);
     std::fs::rename(&tmp, path)
+}
+
+/// Makes `dir` and any parents missing, readable by this user alone on macOS and Linux (where a
+/// new folder is otherwise open to every account on the computer); on Windows the account's own
+/// folders already are.
+pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    return std::os::unix::fs::DirBuilderExt::mode(std::fs::DirBuilder::new().recursive(true), 0o700).create(dir);
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(dir)
+}
+
+/// Versions before this one left the data folder and its files readable by every account on a
+/// Mac or Linux computer (0755 and 0644): they become this user's alone, once. A folder already
+/// closed is left as it is; the media cache that used to live inside is skipped, as it moves out.
+pub fn make_private(dir: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fn set(path: &Path, mode: u32) {
+            if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)) {
+                log::warn!("{}: could not be made private: {e}", path.display());
+            }
+        }
+        fn walk(dir: &Path) {
+            for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                // Not following links: what one points at is not Ciranda's to change.
+                let (path, Ok(kind)) = (entry.path(), entry.file_type()) else { continue };
+                if kind.is_dir() && entry.file_name() != "media" {
+                    set(&path, 0o700);
+                    walk(&path);
+                } else if kind.is_file() {
+                    set(&path, 0o600);
+                }
+            }
+        }
+        let Ok(meta) = std::fs::symlink_metadata(dir) else { return };
+        if meta.is_dir() && meta.permissions().mode() & 0o077 != 0 {
+            set(dir, 0o700);
+            walk(dir);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
 }
 
 #[cfg(test)]
@@ -1165,6 +1244,41 @@ mod tests {
         let v = &store.values;
         assert_eq!((v.session_token.as_str(), v.password.as_str(), v.theme.as_str()), ("", "door", "onyx"));
         assert_eq!(v.saved_servers[0].session_token, "");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_secret_sealed_under_a_key_this_run_lacks_is_kept_until_replaced() {
+        // Sealed under another keychain key (its id is not this run's): the keychain did not
+        // answer, or a backup came from elsewhere. It reads as empty and stays on disk.
+        let other = format!("keychain:00000000{}", "ab".repeat(48));
+        assert!(secret::locked(&other));
+        let (dir, path) = scratch(
+            "locked",
+            &format!(
+                r#"{{"serverUrl":"pi.local:8080","username":"predo","sessionToken":"{other}","theme":"onyx",
+                    "savedServers":[{{"url":"pi.local:8080","username":"predo","sessionToken":"{other}","accountPassword":"{other}"}},
+                                    {{"url":"box:9000","username":"lis","sessionToken":"plain"}}]}}"#
+            ),
+        );
+        let mut store = Store::load_from(path.clone());
+        let v = &store.values;
+        assert_eq!((v.session_token.as_str(), v.saved_servers[0].account_password.as_str()), ("", ""));
+        assert_eq!(v.saved_servers[1].session_token, "plain");
+        let back: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(back["savedServers"][0]["sessionToken"], other.as_str(), "kept through the save that sealed the plain one");
+        assert_eq!(back["savedServers"][0]["accountPassword"], other.as_str());
+        assert!(secret::is_sealed(back["savedServers"][1]["sessionToken"].as_str().unwrap()));
+
+        // Moved in the list, it is still its server's; signing in again replaces it.
+        store.update(|s| s.move_server("box:9000", "lis", 0));
+        let back: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(back["savedServers"][1]["sessionToken"], other.as_str());
+        assert_eq!(back["savedServers"][0]["accountPassword"], "");
+        store.update(|s| s.remember_server(server("pi.local:8080", "predo", "fresh", "Pi")));
+        let back: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(back["savedServers"][1]["sessionToken"].as_str().and_then(secret::open).as_deref(), Some("fresh"));
+        assert_eq!(back["savedServers"][1]["accountPassword"], other.as_str(), "only what was replaced goes");
         let _ = std::fs::remove_dir_all(dir);
     }
 

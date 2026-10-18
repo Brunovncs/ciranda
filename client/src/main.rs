@@ -13,8 +13,8 @@ mod dm;
 mod elsewhere;
 mod emoji;
 mod files;
-// Global hotkeys, the notification-area icon, game audio and replays are Windows only so far;
-// elsewhere their platform halves are stubs.
+// The notification-area icon, game audio and replays are Windows only so far, and so is telling
+// which hotkeys other programs hold; elsewhere their platform halves are stubs.
 #[cfg_attr(not(windows), allow(dead_code))]
 mod hotkeys;
 mod icons;
@@ -125,11 +125,20 @@ fn app_menu(cx: &mut gpui::App) {
 /// X11 (XWayland on a Wayland desktop) unless `CIRANDA_WAYLAND` is set: GNOME's compositor
 /// leaves window decorations to the program, and GPUI draws none, so on Wayland there the window
 /// would have no title bar to move or close it by.
+///
+/// `WAYLAND_DISPLAY` is emptied, not removed. GPUI takes Wayland only for a non-empty one, but
+/// libwebrtc shares the screen through the desktop portal (PipeWire) when the session is Wayland
+/// and the variable merely exists; removed, it fell back to its X11 capturer, which on Wayland
+/// sees only XWayland's windows and a black screen. Nothing else Ciranda uses connects to Wayland.
+/// Set once here and never touched again, so no thread ever reads it while it changes.
 #[cfg(target_os = "linux")]
 fn prefer_x11() {
-    if std::env::var_os("DISPLAY").is_some_and(|d| !d.is_empty()) && std::env::var_os("CIRANDA_WAYLAND").is_none() {
+    if std::env::var_os("DISPLAY").is_some_and(|d| !d.is_empty())
+        && std::env::var_os("CIRANDA_WAYLAND").is_none()
+        && std::env::var_os("WAYLAND_DISPLAY").is_some()
+    {
         // SAFETY: first thing in main, before any thread that could read the environment.
-        unsafe { std::env::remove_var("WAYLAND_DISPLAY") };
+        unsafe { std::env::set_var("WAYLAND_DISPLAY", "") };
     }
 }
 
@@ -178,6 +187,9 @@ fn main() {
             }
         }
     }
+    core::settings::make_private(&core::settings::data_dir());
+    // Before the settings are read, which opens what it seals.
+    core::secret::init();
     let store = core::settings::Store::load();
     i18n::set(i18n::resolve(&store.values.language));
 
@@ -191,6 +203,9 @@ fn main() {
         text_field::bind_keys(cx);
         #[cfg(target_os = "macos")]
         app_menu(cx);
+        // The name notifications go out under.
+        #[cfg(target_os = "linux")]
+        cx.set_app_identity("ciranda", "Ciranda");
         cx.set_global(prefs::Prefs::new(store));
         prefs::init(cx);
         ui::updates::init(cx);

@@ -56,6 +56,9 @@ pub struct Composer {
     drawn: u64,
 }
 
+/// What a menu entry does to the composer when picked.
+type MenuAction = Box<dyn Fn(&mut Composer, &mut Window, &mut Context<Composer>)>;
+
 impl EventEmitter<Dismiss> for Composer {}
 
 impl Focusable for Composer {
@@ -194,28 +197,23 @@ impl Composer {
         self.selected = picked.as_ref().map(|l| l.id);
         cx.notify();
         let this = cx.entity().downgrade();
-        let entry =
-            |glyph: &'static str, text: SharedString, danger: bool, f: Box<dyn Fn(&mut Composer, &mut Window, &mut Context<Composer>)>| {
-                let this: WeakEntity<Composer> = this.clone();
-                MenuEntry::item(glyph, text, danger, move |window, cx| {
-                    let _ = this.update(cx, |c, cx| f(c, window, cx));
-                })
-            };
+        let entry = |glyph: &'static str, text: SharedString, danger: bool, f: MenuAction| {
+            let this: WeakEntity<Composer> = this.clone();
+            MenuEntry::item(glyph, text, danger, move |window, cx| {
+                let _ = this.update(cx, |c, cx| f(c, window, cx));
+            })
+        };
         let mut items = Vec::new();
         if let Some(l) = picked {
             let id = l.id;
-            let mode = |m: Mode| -> Box<dyn Fn(&mut Composer, &mut Window, &mut Context<Composer>)> {
+            let mode = |m: Mode| -> MenuAction {
                 Box::new(move |c, _, cx| {
                     c.mode = if c.mode == m { Mode::Arrange } else { m };
                     cx.notify();
                 })
             };
-            let op = |f: fn(&mut Layout, u64)| -> Box<dyn Fn(&mut Composer, &mut Window, &mut Context<Composer>)> {
-                Box::new(move |c, _, cx| c.change(|layout| f(layout, id), cx))
-            };
-            let size = |w: f32| -> Box<dyn Fn(&mut Composer, &mut Window, &mut Context<Composer>)> {
-                Box::new(move |c, _, cx| c.change(|layout| layout.scale_to(id, w), cx))
-            };
+            let op = |f: fn(&mut Layout, u64)| -> MenuAction { Box::new(move |c, _, cx| c.change(|layout| f(layout, id), cx)) };
+            let size = |w: f32| -> MenuAction { Box::new(move |c, _, cx| c.change(|layout| layout.scale_to(id, w), cx)) };
             let cropping = self.mode == Mode::Crop;
             let stretching = self.mode == Mode::Stretch;
             items.push(entry(

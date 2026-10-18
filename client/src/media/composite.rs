@@ -202,6 +202,8 @@ impl Layout {
         self.index(id).map(|i| self.layers.remove(i))
     }
 
+    // Moves in the stack, not conversions.
+    #[allow(clippy::wrong_self_convention)]
     pub fn to_front(&mut self, id: u64) {
         if let Some(i) = self.index(id) {
             let l = self.layers.remove(i);
@@ -209,6 +211,7 @@ impl Layout {
         }
     }
 
+    #[allow(clippy::wrong_self_convention)]
     pub fn to_back(&mut self, id: u64) {
         if let Some(i) = self.index(id) {
             let l = self.layers.remove(i);
@@ -666,7 +669,7 @@ struct Feed {
 /// Captures one screen or window for the canvas until told to stop or it ends.
 fn capture(kind: SourceKind, id: u64, layer: u64, comp: Arc<Composition>, feed: Arc<Feed>, fps: Arc<AtomicU32>) {
     let found = screen::capturer(kind).and_then(|c| {
-        let target = c.get_source_list().into_iter().find(|s| s.id() == id)?;
+        let target = screen::target(&c, id)?;
         Some((c, target))
     });
     let Some((mut c, target)) = found else {
@@ -676,17 +679,21 @@ fn capture(kind: SourceKind, id: u64, layer: u64, comp: Arc<Composition>, feed: 
     };
     let (f, cmp) = (feed.clone(), comp.clone());
     let mut bgra = Vec::new();
-    c.start_capture(Some(target), move |frame| match frame {
-        Ok(frame) => draw(&frame, layer, &cmp, &f, &mut bgra),
-        Err(CaptureError::Permanent) => f.ended.store(true, Ordering::Relaxed),
-        Err(CaptureError::Temporary) => {}
+    c.start_capture(Some(target), move |frame| {
+        // A panic drawing it ends this source, not Ciranda.
+        screen::guarded(&f.ended, || match frame {
+            Ok(frame) => draw(&frame, layer, &cmp, &f, &mut bgra),
+            Err(CaptureError::Permanent) => f.ended.store(true, Ordering::Relaxed),
+            Err(CaptureError::Temporary) => {}
+        })
     });
     let mut checked = Instant::now();
     while !feed.stop.load(Ordering::Relaxed) && !feed.ended.load(Ordering::Relaxed) {
         let tick = Instant::now();
         c.capture_frame();
-        // A closed window may only stop giving frames; the list says for sure.
-        if checked.elapsed() >= Duration::from_secs(1) {
+        // A closed window may only stop giving frames; the list says for sure. The portal's
+        // placeholder is no window to look for: its stream ends with an error instead.
+        if !screen::portal() && checked.elapsed() >= Duration::from_secs(1) {
             checked = Instant::now();
             if !c.get_source_list().iter().any(|s| s.id() == id) {
                 log::info!("composite: the {kind:?} {id} closed");

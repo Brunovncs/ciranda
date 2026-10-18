@@ -33,7 +33,9 @@ hkdf = "0.12"
 x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
 zeroize = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-cpal = "0.18"
+# `realtime`: the device threads ask for real-time scheduling (MMCSS on Windows; ALSA's on Linux,
+# where the PulseAudio host below runs its own).
+cpal = { version = "0.18", features = ["realtime"] }
 dirs = "7"
 emojis = "0.9"
 futures = "0.3"
@@ -45,7 +47,12 @@ env_logger = { version = "0.11", default-features = false, features = ["auto-col
 parking_lot = "0.12"
 # The window's HWND, to hide it to the notification area. Already in the tree through GPUI.
 raw-window-handle = "0.6"
-reqwest = { version = "0.13", default-features = false, features = ["native-tls", "json", "charset", "http2"] }
+# TLS is rustls with ring, checked against the system's certificate store (rustls-platform-verifier,
+# as a browser does), for HTTP and the socket alike; see `core::api::tls`. No OpenSSL to ship on
+# Linux, and no cmake or nasm to build aws-lc on every runner.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "charset", "http2"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-platform-verifier = "0.7"
 # The speakers' end of each stream's queue: the output callback never waits on a lock for it.
 rtrb = "0.3"
 # Band-limited (windowed sinc) resampling between 48 kHz and whatever rate a device runs at; the
@@ -57,7 +64,7 @@ sha2 = "0.10"
 smallvec = "1"
 symphonia = { version = "0.5", default-features = false, features = ["mp3", "wav", "ogg", "vorbis", "flac", "pcm"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
-tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.30", features = ["__rustls-tls"] }
 tract-onnx = "0.23"
 unicode-segmentation = "1"
 url = "2"
@@ -70,6 +77,21 @@ features = ["input-msmf"]
 
 [target.'cfg(target_os = "macos")'.dependencies]
 sys-locale = "0.3"
+# Global hotkeys: Carbon's RegisterEventHotKey, which needs no Accessibility permission.
+global-hotkey = "0.9"
+keyboard-types = "0.8"
+# The key that seals secrets at rest, kept in the login keychain. Already in the tree through the
+# certificate verifier.
+security-framework = "3"
+# The camera's own list of modes: nokhwa's filters it wrongly on macOS (media/camera.rs). The same
+# version nokhwa uses.
+nokhwa-bindings-macos = "0.2.4"
+# App Nap held off during a call, and the share's sound through a Core Audio process tap. The
+# versions cpal already brings.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSProcessInfo", "NSString", "NSUUID", "NSValue"] }
+objc2-core-audio = { version = "0.3", default-features = false, features = ["std", "AudioHardware", "objc2", "objc2-foundation"] }
+objc2-core-foundation = "0.3"
 
 [target.'cfg(target_os = "macos")'.dependencies.nokhwa]
 version = "0.10"
@@ -81,12 +103,27 @@ version = "0.10"
 default-features = false
 features = ["input-v4l"]
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Global hotkeys: XGrabKey over x11rb (pure Rust, already in the tree through GPUI).
+global-hotkey = "0.9"
+keyboard-types = "0.8"
+# The key that seals secrets at rest, kept in the Secret Service (GNOME Keyring, KWallet) over
+# zbus: pure Rust, so the AppImage needs no libdbus. The same crate and features as GPUI's own.
+oo7 = { version = "0.6", default-features = false, features = ["async-std", "native_crypto"] }
+# PulseAudio (and PipeWire through pipewire-pulse) before ALSA: devices by their own names, and each
+# sink's monitor for a share's sound. A pure-Rust client of the protocol, so nothing to install.
+cpal = { version = "0.18", features = ["pulseaudio"] }
+# Wayland screen sharing goes through the desktop portal, whose D-Bus replies need a GLib main
+# loop running.
+libwebrtc = { version = "0.3.51", features = ["glib-main-loop"] }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Globalization",
     "Win32_Security_Cryptography",
     "Win32_System_Registry",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
@@ -111,13 +148,18 @@ windows = { version = "0.62", features = [
 ] }
 windows-core = "0.62"
 
+[dev-dependencies]
+# The macOS and Linux hotkeys' key codes, so their mapping is tested on every platform.
+keyboard-types = "0.8"
+
 [build-dependencies]
 embed-resource = "3"
 
-# GPUI with video surfaces on Windows: YUV frames drawn and scaled by the GPU. What changed from
-# the published 0.3.7 is listed in vendor/GPUI_VENDORED.md.
+# GPUI with video surfaces on Windows and macOS: YUV frames drawn and scaled by the GPU. What
+# changed from the published 0.3.7 is listed in vendor/GPUI_VENDORED.md.
 [patch.crates-io]
 gpui-pre = { path = "vendor/gpui-pre" }
+gpui-pre-apple = { path = "vendor/gpui-pre-apple" }
 gpui-pre-windows = { path = "vendor/gpui-pre-windows" }
 # webrtc-sys with a Media Foundation H.264 encoder on Windows (vendor/webrtc-sys/VENDORED.md).
 webrtc-sys = { path = "vendor/webrtc-sys" }

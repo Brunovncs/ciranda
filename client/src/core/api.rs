@@ -6,7 +6,8 @@ use parking_lot::RwLock;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 #[derive(Clone, Debug)]
@@ -95,10 +96,70 @@ struct Credentials {
     token: String,
 }
 
+/// The TLS every connection to a server is made with: rustls on ring, and certificates checked
+/// the way the system checks them (its own store, its revocation, the roots an admin installed),
+/// so a server with a certificate from a CA put on this computer by hand works as it did with the
+/// system's TLS before. Nothing here accepts a certificate the system would not.
+///
+/// The first call also makes ring the process's provider, for anything that builds a client
+/// without a configuration of its own (the updater): rustls refuses to pick one by itself.
+fn tls_base() -> &'static rustls::ClientConfig {
+    static BASE: OnceLock<rustls::ClientConfig> = OnceLock::new();
+    BASE.get_or_init(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .expect("ring does TLS 1.2 and 1.3");
+        match rustls_platform_verifier::Verifier::new(provider) {
+            Ok(verifier) => builder.dangerous().with_custom_certificate_verifier(Arc::new(verifier)).with_no_client_auth(),
+            // Without the system's checks nothing could be trusted: HTTPS fails, plain HTTP works.
+            Err(e) => {
+                log::error!("the system's certificate checks are not available, so no HTTPS server can be reached: {e}");
+                builder.with_root_certificates(rustls::RootCertStore::empty()).with_no_client_auth()
+            }
+        }
+    })
+}
+
+/// `tls_base`, offering these application protocols.
+pub fn tls(alpn: &[&[u8]]) -> rustls::ClientConfig {
+    let mut config = tls_base().clone();
+    config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+    config
+}
+
+/// Makes ring the process's TLS provider. Done by the first `Api` anyway; anything that may make a
+/// client of its own before one exists calls this first.
+pub fn install_tls() {
+    tls_base();
+}
+
+/// Whether a redirect from `from` may be followed with the server password and the sign-in on it:
+/// only to the same host, on the same scheme and port, or the same host moving up to HTTPS. The
+/// password goes in a header of our own, which an HTTP client carries to wherever it is sent; a
+/// reverse proxy sending it to another host would hand that host the password.
+fn may_follow(from: &url::Url, to: &url::Url) -> bool {
+    let same_host = from.host_str().is_some_and(|h| to.host_str().is_some_and(|t| t.eq_ignore_ascii_case(h)));
+    let same_place = from.scheme() == to.scheme() && from.port_or_known_default() == to.port_or_known_default();
+    let upgrade = from.scheme() == "http" && to.scheme() == "https";
+    same_host && (same_place || upgrade)
+}
+
+/// The most a file may be when nothing better is known: the largest the server lets an owner allow.
+const MOST_FILE_BYTES: u64 = 2 << 30;
+/// What a file sealed on its way gains: the version, the nonce and the tag.
+const SEALING: u64 = 1 << 10;
+/// The most a picture to draw may be (an avatar, an emoji, a picture in the chat): the server
+/// takes avatars and emoji of 256 KB, and a picture bigger than this is not one to decode.
+pub const PICTURE_BYTES: u64 = 64 << 20;
+
 #[derive(Clone)]
 pub struct Api {
     http: reqwest::Client,
     creds: Arc<RwLock<Credentials>>,
+    /// The largest file this server could hand back, from its settings; 0 until they are known.
+    file_limit: Arc<AtomicU64>,
 }
 
 impl Api {
@@ -109,9 +170,31 @@ impl Api {
         let http = reqwest::Client::builder()
             .user_agent(concat!("Ciranda/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(15))
+            .tls_backend_preconfigured(tls(&[b"h2", b"http/1.1"]))
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                let follow = attempt.previous().len() < 10 && attempt.previous().first().is_none_or(|from| may_follow(from, attempt.url()));
+                if follow { attempt.follow() } else { attempt.stop() }
+            }))
             .build()
             .expect("http client");
-        Api { http, creds: Default::default() }
+        Api { http, creds: Default::default(), file_limit: Default::default() }
+    }
+
+    /// What the server's settings say about files: no file it hands back is bigger than the most
+    /// its owner may allow. Not the limit set now, which an owner may have lowered since a bigger
+    /// file was sent.
+    pub fn note_file_limits(&self, info: &ServerInfo) {
+        let most = info.max_file_limit.into_iter().chain(info.max_file_bytes).max().unwrap_or(0);
+        self.file_limit.store(most, Ordering::Relaxed);
+    }
+
+    /// The most a file downloaded from this server may be, sealed or not.
+    fn file_cap(&self) -> u64 {
+        let most = match self.file_limit.load(Ordering::Relaxed) {
+            0 => MOST_FILE_BYTES,
+            n => n,
+        };
+        most + SEALING
     }
 
     pub fn set_server(&self, base: &str, password: &str) {
@@ -489,7 +572,12 @@ impl Api {
 
     /// A sealed attachment, still sealed: it is opened by whoever holds its key.
     pub async fn download_sealed(&self, id: ConversationId, hash: &str) -> Result<(Vec<u8>, String)> {
-        self.file(&format!("/api/dms/{id}/uploads/{hash}")).await
+        self.file(&format!("/api/dms/{id}/uploads/{hash}"), self.file_cap()).await
+    }
+
+    /// As `download_sealed`, for a picture to draw (`PICTURE_BYTES`).
+    pub async fn download_sealed_picture(&self, id: ConversationId, hash: &str) -> Result<(Vec<u8>, String)> {
+        self.file(&format!("/api/dms/{id}/uploads/{hash}"), self.file_cap().min(PICTURE_BYTES + SEALING)).await
     }
 
     // Files.
@@ -530,7 +618,13 @@ impl Api {
     }
 
     pub async fn download(&self, hash: &str) -> Result<(Vec<u8>, String)> {
-        self.file(&format!("/api/uploads/{hash}")).await
+        self.file(&format!("/api/uploads/{hash}"), self.file_cap()).await
+    }
+
+    /// A stored file that is to be drawn: an avatar, an emoji, a picture in the chat. Refused
+    /// past `PICTURE_BYTES`, which no picture worth decoding comes near.
+    pub async fn download_picture(&self, hash: &str) -> Result<(Vec<u8>, String)> {
+        self.file(&format!("/api/uploads/{hash}"), self.file_cap().min(PICTURE_BYTES)).await
     }
 
     /// A stored file saved straight to `path` as it arrives, so a 2 GB one never sits in memory.
@@ -583,6 +677,10 @@ impl Api {
                 body: Value::Null,
             });
         }
+        let cap = self.file_cap();
+        if res.content_length().is_some_and(|n| n > cap) {
+            return Err(too_big());
+        }
         progress.total(res.content_length().or(size).unwrap_or(0));
         let mut file = Some(std::fs::File::create(part).map_err(|e| broken_download(e.to_string()))?);
         let mut digest = sha2::Sha256::new();
@@ -592,6 +690,9 @@ impl Api {
             let chunk = tokio::time::timeout(STALL, res.chunk()).await.map_err(|_| unreachable())?.map_err(|_| unreachable())?;
             let done = chunk.is_none();
             if let Some(chunk) = chunk {
+                if received + chunk.len() as u64 > cap {
+                    return Err(too_big());
+                }
                 digest.update(&chunk);
                 received += chunk.len() as u64;
                 buf.extend_from_slice(&chunk);
@@ -599,7 +700,8 @@ impl Api {
             // To the disk a megabyte at a time, on a blocking thread: a disk that is slow or on
             // the network must not hold up the runtime every other request runs on.
             if buf.len() >= WRITE_BYTES || (done && !buf.is_empty()) {
-                let (mut f, bytes) = (file.take().expect("file between writes"), std::mem::replace(&mut buf, Vec::with_capacity(WRITE_BYTES)));
+                let (mut f, bytes) =
+                    (file.take().expect("file between writes"), std::mem::replace(&mut buf, Vec::with_capacity(WRITE_BYTES)));
                 file = Some(
                     tokio::task::spawn_blocking(move || {
                         use std::io::Write;
@@ -627,17 +729,19 @@ impl Api {
     /// The server's picture, which needs no account: the sign-in screen shows it. A server of the
     /// Electron line keeps its one picture at `/api/server/logo` instead.
     pub async fn server_icon(&self, hash: &str) -> Result<(Vec<u8>, String)> {
-        match self.file(&format!("/api/server/icon/{hash}")).await {
-            Err(e) if e.status == 404 => self.file("/api/server/logo").await,
+        match self.file(&format!("/api/server/icon/{hash}"), PICTURE_BYTES).await {
+            Err(e) if e.status == 404 => self.file("/api/server/logo", PICTURE_BYTES).await,
             got => got,
         }
     }
 
-    async fn file(&self, path: &str) -> Result<(Vec<u8>, String)> {
+    /// A file whole, in memory. Given up on as soon as more than `cap` bytes came: the hash is only
+    /// checked at the end, so a server sending without end would otherwise fill the memory first.
+    async fn file(&self, path: &str, cap: u64) -> Result<(Vec<u8>, String)> {
         let base = self.base();
         let url = format!("{base}{path}");
-        // No limit on the whole: a 25 MB file from a Pi at home can take minutes. What ends one is
-        // the server not answering, or the file not moving, for `STALL`.
+        // No limit on the time it takes: a 25 MB file from a Pi at home can take minutes. What ends
+        // one is the server not answering, or the file not moving, for `STALL`.
         let unreachable = || ApiError::unreachable(&base);
         let mut res = tokio::time::timeout(STALL, self.authed(self.http.get(url)).send())
             .await
@@ -653,8 +757,14 @@ impl Api {
             });
         }
         let ct = res.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("application/octet-stream").to_string();
+        if res.content_length().is_some_and(|n| n > cap) {
+            return Err(too_big());
+        }
         let mut bytes = Vec::with_capacity(res.content_length().unwrap_or(0).min(64 << 20) as usize);
         while let Some(chunk) = tokio::time::timeout(STALL, res.chunk()).await.map_err(|_| unreachable())?.map_err(|_| unreachable())? {
+            if (bytes.len() + chunk.len()) as u64 > cap {
+                return Err(too_big());
+            }
             bytes.extend_from_slice(&chunk);
         }
         Ok((bytes, ct))
@@ -802,6 +912,20 @@ const STALL: Duration = Duration::from_secs(30);
 
 /// How much of a download saved to disk is held before it is written.
 const WRITE_BYTES: usize = 1 << 20;
+
+/// A download bigger than anything the server could have been sent: not kept.
+fn too_big() -> ApiError {
+    ApiError {
+        status: 0,
+        code: ErrorCode::FileTooLarge,
+        message: tr!(
+            "The server sent more than that file can be, so it was not kept.",
+            "O servidor mandou mais do que esse arquivo pode ter, então ele não foi guardado."
+        )
+        .into(),
+        body: Value::Null,
+    }
+}
 
 fn broken_download(why: String) -> ApiError {
     ApiError {
@@ -978,6 +1102,115 @@ mod tests {
         assert_eq!(got.unwrap_err().code, ErrorCode::Cancelled);
         assert!(!bad.exists());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A server on this computer that answers each request with what `reply` makes of its head,
+    /// and keeps every head it was sent.
+    fn answering(reply: impl Fn(&str) -> Vec<u8> + Send + 'static) -> (String, Arc<parking_lot::Mutex<Vec<String>>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let heads = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen = heads.clone();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut head = Vec::new();
+                let mut byte = [0; 1];
+                while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).is_ok_and(|n| n == 1) {
+                    head.push(byte[0]);
+                }
+                let head = String::from_utf8_lossy(&head).to_string();
+                let _ = stream.write_all(&reply(&head));
+                seen.lock().push(head);
+            }
+        });
+        (base, heads)
+    }
+
+    #[test]
+    fn a_download_bigger_than_it_can_be_is_dropped_as_it_comes() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let body = vec![7u8; 300_000];
+        // Said up front, and not said at all (the body runs until the connection closes).
+        let told = {
+            let b = body.clone();
+            answering(move |_| {
+                [format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", b.len()).into_bytes(), b.clone()].concat()
+            })
+        };
+        let untold = {
+            let b = body.clone();
+            answering(move |_| [b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec(), b.clone()].concat())
+        };
+        for (base, _) in [told, untold] {
+            let api = Api::new();
+            api.set_server(&base, "");
+            assert_eq!(rt.block_on(api.file("/f", 100_000)).unwrap_err().code, ErrorCode::FileTooLarge);
+            assert_eq!(rt.block_on(api.file("/f", 300_000)).unwrap().0.len(), 300_000);
+        }
+        let api = Api::new();
+        assert_eq!(api.file_cap(), MOST_FILE_BYTES + SEALING, "nothing known yet: the most a server allows");
+        api.note_file_limits(&ServerInfo { max_file_bytes: Some(25 << 20), max_file_limit: Some(1 << 30), ..Default::default() });
+        assert_eq!(api.file_cap(), (1 << 30) + SEALING, "an owner may have lowered the limit since a bigger file was sent");
+    }
+
+    #[test]
+    fn the_server_password_does_not_follow_a_redirect_to_another_host() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let health = br#"{"ok":true,"passwordRequired":true,"authenticated":true}"#;
+        let ok = move |_: &str| {
+            [format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", health.len()).into_bytes(), health.to_vec()]
+                .concat()
+        };
+        let (elsewhere, heard) = answering(ok);
+        let away = elsewhere.clone();
+        let (base, _) = answering(move |head| {
+            let to = if head.starts_with("GET /api/health") { format!("{away}/api/health") } else { "/api/health".into() };
+            format!("HTTP/1.1 302 Found\r\nLocation: {to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").into_bytes()
+        });
+        let api = Api::new();
+        api.set_server(&base, "the door");
+        let got = rt.block_on(api.health());
+        assert_eq!(got.unwrap_err().status, 302, "not followed");
+        assert!(heard.lock().is_empty(), "the other host never heard from it");
+
+        let from = url::Url::parse("http://pi.local:8080/api/x").unwrap();
+        let to = |u: &str| url::Url::parse(u).unwrap();
+        assert!(may_follow(&from, &to("http://pi.local:8080/api/y")));
+        assert!(may_follow(&from, &to("https://PI.local/api/x")), "the same host, moving up to HTTPS");
+        assert!(!may_follow(&from, &to("http://pi.local:9000/api/x")), "another port is another server");
+        assert!(!may_follow(&from, &to("http://evil.example/api/x")));
+        assert!(!may_follow(&to("https://h.example.com"), &to("http://h.example.com")), "never down to plain HTTP");
+    }
+
+    #[test]
+    fn the_clients_are_made_with_rustls_and_the_system_s_checks() {
+        // Building them would panic on a TLS configuration reqwest did not take, or no provider.
+        let _ = Api::new();
+        install_tls();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+        assert_eq!(tls(&[b"http/1.1"]).alpn_protocols, [b"http/1.1".to_vec()]);
+        let _ = reqwest::Client::builder().build().expect("a plain client, as the updater makes, finds the provider");
+    }
+
+    /// Over the network, so not run by default: `cargo test -- --ignored https`.
+    #[test]
+    #[ignore]
+    fn https_reaches_a_real_server_and_refuses_a_bad_certificate() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let api = Api::new();
+        api.set_server("https://api.github.com", "");
+        let got = rt.block_on(api.http.get("https://api.github.com/zen").send()).expect("github over rustls");
+        assert!(got.status().is_success() || got.status().as_u16() == 403, "{}", got.status());
+        assert!(
+            rt.block_on(api.http.get("https://self-signed.badssl.com/").send()).is_err(),
+            "a self-signed certificate is refused, as before"
+        );
+        assert!(rt.block_on(api.http.get("https://expired.badssl.com/").send()).is_err());
+        let connector = tokio_tungstenite::Connector::Rustls(Arc::new(tls(&[b"http/1.1"])));
+        let ws =
+            rt.block_on(tokio_tungstenite::connect_async_tls_with_config("wss://ws.postman-echo.com/raw", None, false, Some(connector)));
+        assert!(ws.is_ok(), "a socket over the same TLS: {:?}", ws.err());
     }
 
     #[test]

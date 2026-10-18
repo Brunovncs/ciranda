@@ -1,16 +1,19 @@
 # Vendored GPUI
 
-`gpui-pre` and `gpui-pre-windows` 0.3.7, copied from crates.io (less `.cargo-ok`) and patched in
-`client/Cargo.toml`'s `[patch.crates-io]`, so video is drawn by the GPU on Windows: the published
-crates have the "surface" primitive end to end (`PaintSurface`, `PrimitiveBatch::Surfaces`), but
-its only payload is a macOS `CVPixelBuffer` and the DirectX renderer's `draw_surfaces` is an empty
-stub. Everything else is the published 0.3.7, byte for byte; to see the changes, diff a directory
-against `~/.cargo/registry/src/index.crates.io-*/<crate>-0.3.7`.
+`gpui-pre`, `gpui-pre-windows` and `gpui-pre-apple` 0.3.7, copied from crates.io (less
+`.cargo-ok`) and patched in `client/Cargo.toml`'s `[patch.crates-io]`, so video is drawn by the GPU
+on Windows and macOS: the published crates have the "surface" primitive end to end
+(`PaintSurface`, `PrimitiveBatch::Surfaces`), but its only payload is a macOS `CVPixelBuffer`, the
+DirectX renderer's `draw_surfaces` is an empty stub, and the Metal one draws full-range buffers
+only (it asserts, taking the window down on anything else), with square corners. Everything else
+is the published 0.3.7, byte for byte; to see the changes, diff a directory against
+`~/.cargo/registry/src/index.crates.io-*/<crate>-0.3.7`.
 
-To move to a newer GPUI: port the changes below (or drop them, if upstream has its own Windows
-surfaces by then), or remove the `[patch.crates-io]` lines and this directory to go back to the
-crates as published, which brings back the client's CPU path for video (BGRA `RenderImage`s
-through the sprite atlas).
+To move to a newer GPUI: port the changes below (or drop them, if upstream has its own surfaces
+by then), or remove the `[patch.crates-io]` lines and this directory to go back to the crates as
+published. The client (`src/media/video.rs`) would then need its Windows video back on the CPU
+path (BGRA `RenderImage`s through the sprite atlas, as Linux draws now) and its macOS tiles
+without rounded corners or video-range buffers.
 
 ## gpui-pre
 
@@ -24,13 +27,23 @@ through the sprite atlas).
     camera). Platform-neutral; only the Windows renderer draws it.
   - `PaintSurface` gains, on Windows only, `frame: SurfaceFrame` and
     `corner_radii: Corners<ScaledPixels>` (rounded like images are). The macOS field is untouched.
-- `src/window.rs`: `Window::paint_surface(bounds, corner_radii, frame)` on Windows, beside the
-  macOS one (which is untouched): snaps the bounds, takes the content mask, clamps and scales the
-  radii, and inserts the `PaintSurface`.
+  - `PaintSurface::corner_radii` is there on macOS too.
+- `src/window.rs`: `Window::paint_surface(bounds, corner_radii, frame)` on Windows, and the macOS
+  one takes `corner_radii` as well (`paint_surface(bounds, corner_radii, image_buffer)`): each
+  snaps the bounds, takes the content mask, clamps and scales the radii, and inserts the
+  `PaintSurface`.
 - `src/elements/surface.rs`: `SurfaceSource::Frame(SurfaceFrame)` on Windows (with
   `From<SurfaceFrame>`), and `surface(...)` available on Windows as well as macOS, so a frame is
   drawn with `surface(frame).object_fit(ObjectFit::Contain).rounded(...)` like an `img`. Its
-  rounded corners come from the element's style.
+  rounded corners come from the element's style, on macOS as on Windows (upstream left a TODO).
+  On macOS, `unsafe SurfaceSource::from_cv_pixel_buffer(*mut c_void)` takes over one reference
+  to a `CVPixelBufferRef`, so the client draws pixel buffers without core-video's bindings of
+  its own.
+- `src/assets.rs`: `RenderImage::into_frames`, so Linux's video pictures, once the window has let
+  go of them, give their buffers back for the next frames instead of each frame allocating its
+  own.
+- `Cargo.toml`: `core-foundation` 0.10 on macOS (already in the tree through core-video), for
+  `from_cv_pixel_buffer`.
 
 ## gpui-pre-windows
 
@@ -58,3 +71,38 @@ through the sprite atlas).
   the client used to convert on the CPU) and rounds the corners with `quad_sdf`, as images are.
   Planes are bound to `t2`-`t4` (after the instance buffer in `t1`), the sampler to `s1`.
 - `build.rs`: "surface" added to the modules fxc precompiles for release builds.
+
+## gpui-pre-apple
+
+The Metal renderer (`gpui-pre-macos` draws through it).
+
+- `src/metal_renderer.rs`
+  - `draw_surfaces` takes video-range (`420v`) as well as full-range (`420f`) bi-planar 4:2:0
+    pixel buffers; any other format, or a buffer CoreVideo can't make textures of, is skipped and
+    logged once instead of `assert_eq!`/`unwrap` panicking in the middle of a frame.
+  - `SurfaceBounds` (the per-surface instance data, which cbindgen exports to the shaders) gains
+    `corner_radii` and `video_range`, filled in `write_instances`; the surfaces' instance buffer
+    is bound to the fragment stage as well.
+  - Each pixel buffer drawn, with its two `CVMetalTexture`s, is held (`surfaces_in_flight`) until
+    the command buffer has completed, in the same completion handler that gives back the instance
+    buffer. Upstream let go of the textures as soon as they were encoded and of the buffer when
+    the scene was dropped, so a decoder's pool could hand the buffer out again while the GPU was
+    still reading it.
+- `src/shaders.metal`: `surface_vertex` passes the surface's index (`surface_id`, flat) on;
+  `surface_fragment` converts BT.601 Y'CbCr to RGB from full range or, when the surface is video
+  range, after expanding luma 16-235 and chroma 16-240, and rounds the corners with `quad_sdf`, as
+  sprites are. Mirroring isn't the renderer's: the client mirrors your own camera as it writes
+  the buffer.
+
+## Linux (gpui-pre-wgpu): not vendored
+
+Linux draws video as BGRA `RenderImage`s (converted on the decoding thread, buffers reused,
+dropped from the atlas as they are replaced). `gpui-pre-wgpu` already has the other half of a
+surface path: a `surfaces` pipeline and `vs_surface`/`fs_surface` shaders sampling a Y and a CbCr
+texture, but `PrimitiveBatch::Surfaces` is drawn as nothing and `PaintSurface` has no payload off
+macOS and Windows. To draw YUV there as Windows does: make the `SurfaceFrame` field, `paint_surface`
+and `SurfaceSource::Frame` in `gpui-pre` cover Linux too; in `wgpu_renderer.rs` keep per stream
+(`SurfaceFrame::id`) an R8 Y and an RG8 UV texture, written with `queue.write_texture` only when
+the frame's serial changes (I420 frames converted to NV12 on the decoding thread, so one shader
+serves both), with a bind group per stream, and dropped when a render no longer draws the stream;
+then add video range and corner radii to `SurfaceParams` and `fs_surface` as above.

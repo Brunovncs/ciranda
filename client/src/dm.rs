@@ -17,6 +17,7 @@ use crate::core::types::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use zeroize::Zeroizing;
 
 /// Whether this computer can take part in private conversations yet.
 #[derive(Clone, Debug, PartialEq)]
@@ -77,7 +78,8 @@ pub enum SealError {
     NoKey,
     /// The other person has no key yet.
     PeerHasNoKey,
-    /// Their key changed and the change was not accepted here: a call's key is not sealed to it.
+    /// Their key changed and the change was not accepted here: nothing is sealed to it, neither a
+    /// message nor a call's key, until it is.
     KeyNotConfirmed,
 }
 
@@ -86,7 +88,7 @@ impl SealError {
         match self {
             SealError::NoKey => ErrorCode::NoKey,
             SealError::PeerHasNoKey => ErrorCode::PeerHasNoKey,
-            SealError::KeyNotConfirmed => ErrorCode::Forbidden,
+            SealError::KeyNotConfirmed => ErrorCode::KeyNotConfirmed,
         }
     }
 
@@ -94,8 +96,8 @@ impl SealError {
     pub fn message(self) -> Option<&'static str> {
         match self {
             SealError::KeyNotConfirmed => Some(tr!(
-                "Their security key changed. Confirm it in the conversation before calling.",
-                "A chave de segurança dessa pessoa mudou. Confirme na conversa antes de ligar."
+                "Their security key changed, so nothing was sent. Compare your safety number or accept the new key in the conversation first.",
+                "A chave de segurança dessa pessoa mudou, então nada foi enviado. Comparem o código de segurança ou aceite a nova chave na conversa primeiro."
             )),
             _ => None,
         }
@@ -201,6 +203,13 @@ impl Vault {
             MineKey::Key(mine) => {
                 self.state = match &self.identity {
                     Some((id, identity)) if *id == mine.id && identity.public_b64() == mine.public_key => KeyState::Ready,
+                    None if self.file.identity_locked() => KeyState::Failed(
+                        tr!(
+                            "The system keychain didn't open, so your private-message key can't be read. Unlock it and open Ciranda again.",
+                            "O chaveiro do sistema não abriu, então a chave das conversas privadas não pode ser lida. Desbloqueie e abra Ciranda de novo."
+                        )
+                        .into(),
+                    ),
                     _ => KeyState::Locked,
                 };
                 self.on_server = Some(mine);
@@ -253,9 +262,16 @@ impl Vault {
         true
     }
 
-    /// The recovery key, as shown, if this computer made or was given it.
-    pub fn recovery(&self) -> Option<String> {
-        self.file.recovery().map(|r| r.display())
+    /// The recovery key, as shown, while this computer keeps it: from when it is made until the
+    /// person says it is somewhere safe. Opening it asks the system to unseal it, so it is called
+    /// to show it and not to draw a button (`has_recovery`).
+    pub fn recovery(&self) -> Option<Zeroizing<String>> {
+        self.file.recovery().map(|r| Zeroizing::new(r.display()))
+    }
+
+    /// Whether `recovery` has anything to show, without opening it.
+    pub fn has_recovery(&self) -> bool {
+        self.file.has_recovery()
     }
 
     /// A recovery key was made here and nobody has said it is kept somewhere yet.
@@ -263,6 +279,8 @@ impl Vault {
         self.ready() && !self.file.recovery_saved()
     }
 
+    /// They kept it: this computer's copy goes, and it can't be shown again. A new one can be made
+    /// while the identity key is here (`new_recovery`).
     pub fn mark_backed_up(&mut self) {
         self.file.mark_recovery_saved();
     }
@@ -354,12 +372,27 @@ impl Vault {
         Some(key)
     }
 
-    /// Seals something for the other person, to both your current keys.
-    pub fn seal(&mut self, conversation: ConversationId, peer: UserId, aad: &str, plain: &[u8]) -> Result<Sealed, SealError> {
+    /// Seals something for the other person, to both your current keys, whoever holds theirs.
+    /// Everything that leaves goes through `seal_confirmed` instead.
+    fn seal(&mut self, conversation: ConversationId, peer: UserId, aad: &str, plain: &[u8]) -> Result<Sealed, SealError> {
         let mine = self.my_key().filter(|_| self.ready()).ok_or(SealError::NoKey)?;
         let theirs = *self.current.get(&peer).ok_or(SealError::PeerHasNoKey)?;
         let key = self.pair(conversation, mine, peer, theirs).ok_or(SealError::PeerHasNoKey)?;
         Ok(Sealed { text: key.seal(aad, plain), sender_key: mine, recipient_key: theirs })
+    }
+
+    /// Seals for the other person, but never to a key of theirs not accepted here. The server
+    /// says which key is theirs, and whoever holds a key it named reads what is sealed to it: so
+    /// the first one met is pinned and taken (as when the conversation starts), and a change after
+    /// it waits for the person to accept it.
+    fn seal_confirmed(&mut self, conversation: ConversationId, peer: UserId, aad: &str, plain: &[u8]) -> Result<Sealed, SealError> {
+        self.my_key().filter(|_| self.ready()).ok_or(SealError::NoKey)?;
+        self.pin(peer);
+        let theirs = *self.current.get(&peer).ok_or(SealError::PeerHasNoKey)?;
+        if !self.is_accepted(peer, theirs) {
+            return Err(SealError::KeyNotConfirmed);
+        }
+        self.seal(conversation, peer, aad, plain)
     }
 
     /// Opens something sealed between you and `peer`; `from_me` says which of the two keys is yours.
@@ -400,23 +433,23 @@ impl Vault {
             payload.mid = Some(crypto::b64(&crypto::random::<16>()));
         }
         let json = crypto::pad(serde_json::to_vec(&payload).unwrap_or_default());
-        self.seal(conversation, peer, &aad::message(conversation, self.me), &json)
+        self.seal_confirmed(conversation, peer, &aad::message(conversation, self.me), &json)
     }
 
-    pub fn seal_reactions(&mut self, conversation: ConversationId, peer: UserId, message: MessageId, emoji: &[String]) -> Result<Sealed, SealError> {
+    pub fn seal_reactions(
+        &mut self,
+        conversation: ConversationId,
+        peer: UserId,
+        message: MessageId,
+        emoji: &[String],
+    ) -> Result<Sealed, SealError> {
         let json = crypto::pad(serde_json::to_vec(emoji).unwrap_or_default());
-        self.seal(conversation, peer, &aad::reaction(conversation, message, self.me), &json)
+        self.seal_confirmed(conversation, peer, &aad::reaction(conversation, message, self.me), &json)
     }
 
-    /// A call's media key, sealed by the caller. Never to a key of theirs not accepted here:
-    /// whoever holds it would hear the call.
+    /// A call's media key, sealed by the caller: whoever holds the key it is sealed to hears the call.
     pub fn seal_call_key(&mut self, conversation: ConversationId, peer: UserId, key: &[u8; 32]) -> Result<Sealed, SealError> {
-        self.pin(peer);
-        let theirs = *self.current.get(&peer).ok_or(SealError::PeerHasNoKey)?;
-        if !self.is_accepted(peer, theirs) {
-            return Err(SealError::KeyNotConfirmed);
-        }
-        self.seal(conversation, peer, &aad::call(conversation, self.me), key)
+        self.seal_confirmed(conversation, peer, &aad::call(conversation, self.me), key)
     }
 
     /// The media key of `call`, if it opens and belongs to it. Refused rather than marked when it
@@ -424,8 +457,14 @@ impl Vault {
     pub fn open_call_key(&mut self, call: &CallInfo) -> Option<[u8; 32]> {
         let from_me = call.caller_id == self.me;
         let peer = if from_me { call.callee_id } else { call.caller_id };
-        let (plain, confirmed) =
-            self.open(call.conversation_id, peer, (call.sender_key, call.recipient_key), from_me, &aad::call(call.conversation_id, call.caller_id), &call.sealed_key)?;
+        let (plain, confirmed) = self.open(
+            call.conversation_id,
+            peer,
+            (call.sender_key, call.recipient_key),
+            from_me,
+            &aad::call(call.conversation_id, call.caller_id),
+            &call.sealed_key,
+        )?;
         let key: [u8; 32] = plain.try_into().ok().filter(|_| confirmed)?;
         // The sealed text's nonce is new with every sealing, so it names this call's key: seen
         // before for another call, it is that call's key rung again.
@@ -510,8 +549,9 @@ impl Vault {
     /// not shown, and the real current ones are not covered by a refusal. A new text older than the
     /// one shown, by the server's edit time and then its edit count, is late, and superseded too.
     ///
-    /// What was seen lives as long as the session: a computer that never saw the newer text can't
-    /// tell it was withheld, which is as far as anything the server keeps can be checked.
+    /// What was seen lives as long as the message is kept here (`forget_all_but`): a computer that
+    /// never saw the newer text can't tell it was withheld, which is as far as anything the server
+    /// keeps can be checked.
     fn place(&mut self, m: &SealedMessage, sealed: &str, p: &Payload) -> Placement {
         let id = m.id;
         let Some(nonce) = crypto::nonce_of(sealed) else { return Placement::Refused };
@@ -541,12 +581,28 @@ impl Vault {
         if older { Placement::Superseded } else { Placement::Current }
     }
 
+    /// Forgets what was seen of every message but these: their texts, nonces and own ids. The
+    /// session keeps the messages it shows and the last of each conversation, so a replay or a swap
+    /// is still told among all of those; one involving a message let go is told again once both
+    /// are loaded together.
+    pub fn forget_all_but(&mut self, keep: &HashSet<MessageId>) {
+        self.texts.retain(|id, _| keep.contains(id));
+        self.nonces.retain(|_, id| keep.contains(id));
+        self.mids.retain(|_, id| keep.contains(id));
+    }
+
     /// An earlier text of `m`: None if it doesn't open here, or is not one of `m`'s. Seen, it can't
     /// be put back as the current one later.
     pub fn open_version(&mut self, m: &Message, peer: UserId, v: &SealedVersion) -> Option<String> {
         let (conversation, author) = (m.channel_id, m.user_id?);
-        let (plain, _) =
-            self.open(conversation, peer, (v.sender_key, v.recipient_key), author == self.me, &aad::message(conversation, author), &v.sealed)?;
+        let (plain, _) = self.open(
+            conversation,
+            peer,
+            (v.sender_key, v.recipient_key),
+            author == self.me,
+            &aad::message(conversation, author),
+            &v.sealed,
+        )?;
         let p = serde_json::from_slice::<Payload>(&plain).ok()?;
         let nonce = crypto::nonce_of(&v.sealed)?;
         let now = m.private.as_ref().and_then(|c| c.mid.as_ref());
@@ -569,12 +625,24 @@ impl Vault {
     }
 
     /// Everybody's sealed reactions to a message, opened and counted as a channel's are.
-    pub fn open_reactions(&mut self, conversation: ConversationId, peer: UserId, message: MessageId, sealed: &[SealedReaction]) -> Vec<Reaction> {
+    pub fn open_reactions(
+        &mut self,
+        conversation: ConversationId,
+        peer: UserId,
+        message: MessageId,
+        sealed: &[SealedReaction],
+    ) -> Vec<Reaction> {
         let mut out: Vec<Reaction> = Vec::new();
         for r in sealed {
             let from_me = r.user_id == self.me;
-            let Some((plain, _)) = self.open(conversation, peer, (r.sender_key, r.recipient_key), from_me, &aad::reaction(conversation, message, r.user_id), &r.sealed)
-            else {
+            let Some((plain, _)) = self.open(
+                conversation,
+                peer,
+                (r.sender_key, r.recipient_key),
+                from_me,
+                &aad::reaction(conversation, message, r.user_id),
+                &r.sealed,
+            ) else {
                 continue;
             };
             let Ok(emoji) = serde_json::from_slice::<Vec<String>>(&plain) else { continue };
@@ -657,7 +725,10 @@ impl Vault {
         let Some(current) = self.current.get(&peer).copied() else { return false };
         let since = self.pin_id(peer).unwrap_or(0);
         !self.is_accepted(peer, current)
-            || self.unconfirmed.get(&peer).is_some_and(|seen| seen.iter().any(|k| *k > since && *k < current && !self.is_accepted(peer, *k)))
+            || self
+                .unconfirmed
+                .get(&peer)
+                .is_some_and(|seen| seen.iter().any(|k| *k > since && *k < current && !self.is_accepted(peer, *k)))
     }
 
     /// The change was seen and accepted: their current key, and the ones between the pinned key and
@@ -884,6 +955,69 @@ mod tests {
         assert!(a.key_changed_for(2));
         a.accept_key(2);
         assert!(!a.key_changed_for(2));
+    }
+
+    #[test]
+    fn nothing_is_sealed_to_a_changed_key_until_it_is_accepted() {
+        let (mut a, _) = pair_up();
+        let hello = Payload { body: "oi".into(), ..Default::default() };
+        assert_eq!(a.seal_message(5, 2, &hello).unwrap().recipient_key, 20, "first contact: their key is taken");
+
+        // The server names a new key as theirs (a push, or the keys in a `stale_key` refusal).
+        a.key_changed(PublicKeyInfo { id: 21, user_id: 2, public_key: Identity::generate().public_b64(), created_at: 0 });
+        assert_eq!(a.seal_message(5, 2, &hello).unwrap_err(), SealError::KeyNotConfirmed);
+        assert_eq!(a.seal_reactions(5, 2, 9, &["👍".into()]).unwrap_err(), SealError::KeyNotConfirmed);
+        assert_eq!(a.seal_call_key(5, 2, &crypto::random::<32>()).unwrap_err(), SealError::KeyNotConfirmed);
+        assert_eq!(SealError::KeyNotConfirmed.code(), ErrorCode::KeyNotConfirmed);
+        assert!(a.key_changed_for(2), "and the conversation says so");
+
+        a.accept_key(2);
+        assert_eq!(a.seal_message(5, 2, &hello).unwrap().recipient_key, 21, "accepted: sealed to the new key");
+        assert!(a.seal_reactions(5, 2, 9, &["👍".into()]).is_ok());
+
+        // Marking the safety number as checked accepts a change too.
+        a.key_changed(PublicKeyInfo { id: 22, user_id: 2, public_key: Identity::generate().public_b64(), created_at: 0 });
+        assert!(a.seal_message(5, 2, &hello).is_err());
+        a.set_verified(2, true);
+        assert_eq!(a.seal_message(5, 2, &hello).unwrap().recipient_key, 22);
+    }
+
+    #[test]
+    fn first_contact_is_sealed_without_asking_even_after_they_changed_keys() {
+        let (a, _) = pair_up();
+        let mut fresh = Vault::new(temp_file(), 1);
+        fresh.identity = a.identity.as_ref().map(|(id, _)| (*id, a.file.identity().unwrap().1));
+        fresh.state = KeyState::Ready;
+        let (older, newer) = (Identity::generate(), Identity::generate());
+        fresh.learn([
+            PublicKeyInfo { id: 19, user_id: 2, public_key: older.public_b64(), created_at: 0 },
+            PublicKeyInfo { id: 23, user_id: 2, public_key: newer.public_b64(), created_at: 0 },
+        ]);
+        fresh.current.insert(2, 23);
+        assert!(fresh.file.pin(2).is_none());
+        let sealed = fresh.seal_message(5, 2, &Payload { body: "primeira".into(), ..Default::default() }).unwrap();
+        assert_eq!(sealed.recipient_key, 23);
+        assert_eq!(fresh.file.pin(2), Some(newer.public_b64().as_str()), "pinned as it was sealed to");
+        assert!(!fresh.key_changed_for(2));
+    }
+
+    #[test]
+    fn what_the_session_lets_go_the_vault_forgets_and_what_it_keeps_stays_checked() {
+        let (mut a, mut b) = pair_up();
+        let one = a.seal_message(5, 2, &Payload { body: "um".into(), ..Default::default() }).unwrap();
+        let two = a.seal_message(5, 2, &Payload { body: "dois".into(), ..Default::default() }).unwrap();
+        b.open_message(&as_sent(one.clone(), 1, 1), 1);
+        b.open_message(&as_sent(two, 2, 1), 1);
+        assert_eq!((b.texts.len(), b.nonces.len(), b.mids.len()), (2, 2, 2));
+
+        b.forget_all_but(&HashSet::from([1]));
+        assert_eq!((b.texts.len(), b.nonces.len(), b.mids.len()), (1, 1, 1));
+        assert!(b.texts.get(&1).is_some_and(|t| t.shown.is_some()));
+        assert!(b.open_message(&as_sent(one.clone(), 3, 1), 1).private.unwrap().out_of_place, "a message kept is still told replayed");
+
+        b.forget_all_but(&HashSet::new());
+        assert!(b.texts.is_empty() && b.nonces.is_empty() && b.mids.is_empty());
+        assert_eq!(b.open_message(&as_sent(one, 1, 1), 1).body, "um", "loaded again, it opens as before");
     }
 
     #[test]

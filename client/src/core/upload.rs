@@ -147,7 +147,8 @@ fn expired(e: ApiError) -> ApiError {
     if e.code != ErrorCode::NoSuchUpload {
         return e;
     }
-    let message = tr!("The upload stopped for too long and expired. Send it again.", "O envio ficou parado tempo demais e expirou. Envie de novo.");
+    let message =
+        tr!("The upload stopped for too long and expired. Send it again.", "O envio ficou parado tempo demais e expirou. Envie de novo.");
     ApiError { message: message.into(), ..e }
 }
 

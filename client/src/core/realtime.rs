@@ -8,6 +8,7 @@ use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, interval, sleep, timeout};
@@ -125,9 +126,13 @@ type Pending = HashMap<String, oneshot::Sender<Result<Value, RequestError>>>;
 async fn run(url: String, api: Api, scope: Scope, mut commands: mpsc::UnboundedReceiver<Command>, events: async_channel::Sender<Event>) {
     let mut attempt = 0usize;
     let mut next_rid = 0u64;
+    // The same TLS as every HTTP request (`api::tls`), offering HTTP/1.1 alone: a WebSocket
+    // starts as an HTTP/1.1 upgrade, which a server that picked HTTP/2 would not understand.
+    let tls = Arc::new(super::api::tls(&[b"http/1.1"]));
     loop {
         let mut pending: Pending = HashMap::new();
-        match timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(url.as_str())).await {
+        let connector = tokio_tungstenite::Connector::Rustls(tls.clone());
+        match timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async_tls_with_config(url.as_str(), None, false, Some(connector))).await {
             Ok(Ok((ws, _))) => {
                 let (mut sink, mut stream) = ws.split();
                 next_rid += 1;

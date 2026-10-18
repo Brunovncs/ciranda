@@ -4,7 +4,7 @@
 //! trusts the caller to have checked.
 
 use libwebrtc::prelude::VideoBuffer;
-use libwebrtc::video_frame::I420Buffer;
+use libwebrtc::video_frame::{I420Buffer, NV12Buffer};
 
 /// libyuv's `FilterMode`: averaging, the best when scaling down and what WebRTC itself scales with.
 const FILTER_BOX: i32 = 3;
@@ -65,6 +65,60 @@ unsafe extern "C" {
         width: i32,
         height: i32,
     );
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn SplitUVPlane(
+        src_uv: *const u8,
+        src_stride_uv: i32,
+        dst_u: *mut u8,
+        dst_stride_u: i32,
+        dst_v: *mut u8,
+        dst_stride_v: i32,
+        width: i32,
+        height: i32,
+    );
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn CopyPlane(src: *const u8, src_stride: i32, dst: *mut u8, dst_stride: i32, width: i32, height: i32);
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn MirrorPlane(src: *const u8, src_stride: i32, dst: *mut u8, dst_stride: i32, width: i32, height: i32);
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn I420ToNV12(
+        src_y: *const u8,
+        src_stride_y: i32,
+        src_u: *const u8,
+        src_stride_u: i32,
+        src_v: *const u8,
+        src_stride_v: i32,
+        dst_y: *mut u8,
+        dst_stride_y: i32,
+        dst_uv: *mut u8,
+        dst_stride_uv: i32,
+        width: i32,
+        height: i32,
+    ) -> i32;
+    #[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
+    fn I420ToARGB(
+        src_y: *const u8,
+        src_stride_y: i32,
+        src_u: *const u8,
+        src_stride_u: i32,
+        src_v: *const u8,
+        src_stride_v: i32,
+        dst_argb: *mut u8,
+        dst_stride_argb: i32,
+        width: i32,
+        height: i32,
+    ) -> i32;
+    #[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
+    fn NV12ToARGB(
+        src_y: *const u8,
+        src_stride_y: i32,
+        src_uv: *const u8,
+        src_stride_uv: i32,
+        dst_argb: *mut u8,
+        dst_stride_argb: i32,
+        width: i32,
+        height: i32,
+    ) -> i32;
     fn ARGBScale(
         src_argb: *const u8,
         src_stride_argb: i32,
@@ -153,11 +207,7 @@ pub fn scale_rect(src: &I420Buffer, rect: Rect, dst: &mut I420Buffer) {
     let (x, y, w, h) = rect;
     let (sy, su, sv) = src.strides();
     let (py, pu, pv) = src.data();
-    let (py, pu, pv) = (
-        &py[(y * sy + x) as usize..],
-        &pu[(y / 2 * su + x / 2) as usize..],
-        &pv[(y / 2 * sv + x / 2) as usize..],
-    );
+    let (py, pu, pv) = (&py[(y * sy + x) as usize..], &pu[(y / 2 * su + x / 2) as usize..], &pv[(y / 2 * sv + x / 2) as usize..]);
     let (dw, dh) = (dst.width(), dst.height());
     let (dy, du, dv) = dst.strides();
     let (qy, qu, qv) = dst.data_mut();
@@ -250,17 +300,13 @@ pub fn scale_bgra(src: &[u8], stride: u32, w: u32, h: u32, dst: &mut [u8], dw: u
     assert_eq!(r, 0, "ARGBScale");
 }
 
-/// The bytes `rows` rows of `row` bytes take at `stride`.
-fn span(stride: u32, row: u32, rows: u32) -> usize {
-    if rows == 0 { 0 } else { (stride * (rows - 1) + row) as usize }
-}
-
 /// An NV12 picture, `w` × `h` (even) with its own strides, scaled into packed NV12 planes of
 /// `dw` × `dh` (even): `dy` then `duv`, `dw` bytes a row each.
 #[allow(clippy::too_many_arguments)]
 pub fn scale_nv12(y: &[u8], sy: u32, uv: &[u8], suv: u32, (w, h): (u32, u32), dy: &mut [u8], duv: &mut [u8], (dw, dh): (u32, u32)) {
     assert!(w % 2 == 0 && h % 2 == 0 && dw % 2 == 0 && dh % 2 == 0, "odd NV12 size");
-    assert!(sy >= w && suv >= w && y.len() >= span(sy, w, h) && uv.len() >= span(suv, w, h / 2), "short source");
+    let fits = |stride: u32, rows: u32| span(stride as usize, w as usize, rows as usize);
+    assert!(sy >= w && suv >= w && y.len() >= fits(sy, h) && uv.len() >= fits(suv, h / 2), "short source");
     assert!(dy.len() >= (dw * dh) as usize && duv.len() >= (dw * dh / 2) as usize, "short destination");
     // SAFETY: both pictures are within their slices, as checked above.
     let r = unsafe {
@@ -298,7 +344,9 @@ pub fn scale_i420_to_nv12(src: &I420Buffer, dy: &mut [u8], duv: &mut [u8], (dw, 
     let plane = |p: &[u8], stride: u32, (pw, ph): (u32, u32), d: &mut [u8], (qw, qh): (u32, u32)| {
         // SAFETY: `src` is a whole buffer, so each of its planes holds `pw` × `ph`; `d` holds
         // `qw` × `qh`, packed, as sized above.
-        let r = unsafe { ScalePlane(p.as_ptr(), stride as i32, pw as i32, ph as i32, d.as_mut_ptr(), qw as i32, qw as i32, qh as i32, FILTER_BOX) };
+        let r = unsafe {
+            ScalePlane(p.as_ptr(), stride as i32, pw as i32, ph as i32, d.as_mut_ptr(), qw as i32, qw as i32, qh as i32, FILTER_BOX)
+        };
         assert_eq!(r, 0, "ScalePlane");
     };
     plane(py, sy, (w, h), dy, (dw, dh));
@@ -306,6 +354,137 @@ pub fn scale_i420_to_nv12(src: &I420Buffer, dy: &mut [u8], duv: &mut [u8], (dw, 
     plane(pv, sv, (w / 2, h / 2), sv_out, (cw, ch));
     // SAFETY: both chroma planes are `cw` × `ch` packed, and `duv` holds `ch` rows of `2 * cw`.
     unsafe { MergeUVPlane(su_out.as_ptr(), cw as i32, sv_out.as_ptr(), cw as i32, duv.as_mut_ptr(), dw as i32, cw as i32, ch as i32) };
+}
+
+/// A YUV picture's planes where they lie, each as its bytes (from its first row) and its stride:
+/// I420's Y, U and V, or NV12's Y and interleaved UV. Chroma is half the picture each way,
+/// rounding up.
+#[cfg_attr(windows, allow(dead_code))]
+#[derive(Clone, Copy)]
+pub enum Planes<'a> {
+    I420 { y: (&'a [u8], usize), u: (&'a [u8], usize), v: (&'a [u8], usize) },
+    Nv12 { y: (&'a [u8], usize), uv: (&'a [u8], usize) },
+}
+
+#[cfg_attr(windows, allow(dead_code))]
+impl<'a> Planes<'a> {
+    pub fn of_i420(b: &'a I420Buffer) -> Self {
+        let (y, u, v) = b.data();
+        let (sy, su, sv) = b.strides();
+        Planes::I420 { y: (y, sy as usize), u: (u, su as usize), v: (v, sv as usize) }
+    }
+
+    pub fn of_nv12(b: &'a NV12Buffer) -> Self {
+        let (y, uv) = b.data();
+        let (sy, suv) = b.strides();
+        Planes::Nv12 { y: (y, sy as usize), uv: (uv, suv as usize) }
+    }
+
+    /// Panics unless every plane holds a whole `w` × `h` picture's rows at its stride, which the
+    /// C side trusts.
+    fn check(&self, (w, h): (u32, u32)) {
+        let (w, h) = (w as usize, h as usize);
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        let fits = |(bytes, stride): (&[u8], usize), row: usize, rows: usize| stride >= row && bytes.len() >= span(stride, row, rows);
+        let whole = match *self {
+            Planes::I420 { y, u, v } => fits(y, w, h) && fits(u, cw, ch) && fits(v, cw, ch),
+            Planes::Nv12 { y, uv } => fits(y, w, h) && fits(uv, 2 * cw, ch),
+        };
+        assert!(w > 0 && h > 0 && whole, "short source planes");
+    }
+}
+
+/// The bytes `rows` rows of `row` bytes take at `stride`.
+fn span(stride: usize, row: usize, rows: usize) -> usize {
+    if rows == 0 { 0 } else { stride * (rows - 1) + row }
+}
+
+/// `src`, `w` × `h`, into NV12 planes with strides of their own (`dy`, `duv`: a pixel buffer's),
+/// in one pass, flipped left to right when `mirror`. A mirrored picture's chroma goes through
+/// `scratch`, kept by the caller.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+pub fn to_nv12(src: Planes, (w, h): (u32, u32), mirror: bool, dy: &mut [u8], sy: usize, duv: &mut [u8], suv: usize, scratch: &mut Vec<u8>) {
+    src.check((w, h));
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    assert!(sy >= w as usize && dy.len() >= span(sy, w as usize, h as usize), "short Y plane");
+    assert!(suv >= 2 * cw as usize && duv.len() >= span(suv, 2 * cw as usize, ch as usize), "short UV plane");
+    let (w, h, cw, ch, sy, suv) = (w as i32, h as i32, cw as i32, ch as i32, sy as i32, suv as i32);
+    let quarter = (cw * ch) as usize;
+    // SAFETY: every source plane holds its rows (checked by `check`) and each destination plane
+    // holds `h` rows of `w` bytes and `ch` rows of `2 * cw`, as asserted; the scratch planes are
+    // `cw` × `ch`, packed.
+    unsafe {
+        match (src, mirror) {
+            (Planes::I420 { y, u, v }, false) => {
+                let r = I420ToNV12(
+                    y.0.as_ptr(),
+                    y.1 as i32,
+                    u.0.as_ptr(),
+                    u.1 as i32,
+                    v.0.as_ptr(),
+                    v.1 as i32,
+                    dy.as_mut_ptr(),
+                    sy,
+                    duv.as_mut_ptr(),
+                    suv,
+                    w,
+                    h,
+                );
+                assert_eq!(r, 0, "I420ToNV12");
+            }
+            (Planes::Nv12 { y, uv }, false) => {
+                CopyPlane(y.0.as_ptr(), y.1 as i32, dy.as_mut_ptr(), sy, w, h);
+                CopyPlane(uv.0.as_ptr(), uv.1 as i32, duv.as_mut_ptr(), suv, 2 * cw, ch);
+            }
+            (Planes::I420 { y, u, v }, true) => {
+                scratch.resize(2 * quarter, 0);
+                let (mu, mv) = scratch.split_at_mut(quarter);
+                MirrorPlane(y.0.as_ptr(), y.1 as i32, dy.as_mut_ptr(), sy, w, h);
+                MirrorPlane(u.0.as_ptr(), u.1 as i32, mu.as_mut_ptr(), cw, cw, ch);
+                MirrorPlane(v.0.as_ptr(), v.1 as i32, mv.as_mut_ptr(), cw, cw, ch);
+                MergeUVPlane(mu.as_ptr(), cw, mv.as_ptr(), cw, duv.as_mut_ptr(), suv, cw, ch);
+            }
+            (Planes::Nv12 { y, uv }, true) => {
+                scratch.resize(4 * quarter, 0);
+                let (split, mirrored) = scratch.split_at_mut(2 * quarter);
+                let (su, sv) = split.split_at_mut(quarter);
+                let (mu, mv) = mirrored.split_at_mut(quarter);
+                MirrorPlane(y.0.as_ptr(), y.1 as i32, dy.as_mut_ptr(), sy, w, h);
+                SplitUVPlane(uv.0.as_ptr(), uv.1 as i32, su.as_mut_ptr(), cw, sv.as_mut_ptr(), cw, cw, ch);
+                MirrorPlane(su.as_ptr(), cw, mu.as_mut_ptr(), cw, cw, ch);
+                MirrorPlane(sv.as_ptr(), cw, mv.as_mut_ptr(), cw, cw, ch);
+                MergeUVPlane(mu.as_ptr(), cw, mv.as_ptr(), cw, duv.as_mut_ptr(), suv, cw, ch);
+            }
+        }
+    }
+}
+
+/// `src`, `w` × `h`, as the BGRA picture (libyuv's ARGB; BT.601, limited range) GPUI draws, into
+/// `dst`, tightly packed, flipped left to right when `mirror`.
+#[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
+pub fn to_bgra(src: Planes, (w, h): (u32, u32), mirror: bool, dst: &mut [u8]) {
+    src.check((w, h));
+    let row = w as usize * 4;
+    assert!(dst.len() >= row * h as usize, "short destination");
+    let (w, h) = (w as i32, h as i32);
+    // SAFETY: every source plane holds its rows (checked by `check`) and `dst` holds `h` rows of
+    // `w` pixels, as asserted.
+    let r = unsafe {
+        match src {
+            Planes::I420 { y, u, v } => {
+                I420ToARGB(y.0.as_ptr(), y.1 as i32, u.0.as_ptr(), u.1 as i32, v.0.as_ptr(), v.1 as i32, dst.as_mut_ptr(), row as i32, w, h)
+            }
+            Planes::Nv12 { y, uv } => NV12ToARGB(y.0.as_ptr(), y.1 as i32, uv.0.as_ptr(), uv.1 as i32, dst.as_mut_ptr(), row as i32, w, h),
+        }
+    };
+    assert_eq!(r, 0, "to ARGB");
+    if mirror {
+        for line in dst[..row * h as usize].chunks_exact_mut(row) {
+            let (pixels, _) = line.as_chunks_mut::<4>();
+            pixels.reverse();
+        }
+    }
 }
 
 /// Uncompressed camera formats, as libyuv names them.
@@ -514,10 +693,97 @@ mod tests {
         dst.fill(0);
         let stride = w + 64;
         let y = vec![100u8; (stride * h) as usize];
-        let uv: Vec<u8> = (0..stride * h / 2).map(|i| if i % stride >= w { 0 } else if i % 2 == 0 { 90 } else { 160 }).collect();
+        let uv: Vec<u8> = (0..stride * h / 2)
+            .map(|i| {
+                if i % stride >= w {
+                    0
+                } else if i % 2 == 0 {
+                    90
+                } else {
+                    160
+                }
+            })
+            .collect();
         let (dy, duv) = dst.split_at_mut((dw * dh) as usize);
         scale_nv12(&y, stride, &uv, stride, (w, h), dy, duv, (dw, dh));
         assert!(packed(&dst));
+    }
+
+    /// A picture whose every plane holds its column (luma) or 100 + its column, 200 - its column
+    /// (chroma), to see where each sample lands.
+    fn columns(w: u32, h: u32) -> I420Buffer {
+        let mut b = I420Buffer::new(w, h);
+        let (sy, su, sv) = b.strides();
+        let (py, pu, pv) = b.data_mut();
+        for (plane, stride, f) in [(py, sy, 0i32), (pu, su, 100), (pv, sv, 200)] {
+            for row in plane.chunks_mut(stride as usize) {
+                for (x, p) in row.iter_mut().enumerate() {
+                    *p = if f == 200 { 200 - x as i32 } else { f + x as i32 } as u8;
+                }
+            }
+        }
+        b
+    }
+
+    #[test]
+    fn pictures_convert_into_a_pixel_buffer_s_planes() {
+        // Odd sides (chroma rounds up) into rows padded as CoreVideo pads them.
+        let (w, h) = (31u32, 17u32);
+        let (cw, ch) = (16usize, 9usize);
+        let (sy, suv) = (64usize, 64usize);
+        let src = columns(w, h);
+        let mut y = vec![0u8; sy * h as usize];
+        let mut uv = vec![0u8; suv * ch];
+        let mut scratch = Vec::new();
+        let rows_are =
+            |plane: &[u8], stride: usize, rows: usize, want: &[u8]| plane.chunks(stride).take(rows).all(|r| &r[..want.len()] == want);
+        let luma: Vec<u8> = (0..w as u8).collect();
+        let chroma: Vec<u8> = (0..cw as u8).flat_map(|x| [100 + x, 200 - x]).collect();
+        to_nv12(Planes::of_i420(&src), (w, h), false, &mut y, sy, &mut uv, suv, &mut scratch);
+        assert!(rows_are(&y, sy, h as usize, &luma) && rows_are(&uv, suv, ch, &chroma));
+
+        // Mirrored: every row reversed, U and V kept paired.
+        let luma_m: Vec<u8> = luma.iter().rev().copied().collect();
+        let chroma_m: Vec<u8> = (0..cw as u8).rev().flat_map(|x| [100 + x, 200 - x]).collect();
+        to_nv12(Planes::of_i420(&src), (w, h), true, &mut y, sy, &mut uv, suv, &mut scratch);
+        assert!(rows_are(&y, sy, h as usize, &luma_m) && rows_are(&uv, suv, ch, &chroma_m));
+
+        // From NV12 (as `to_nv12` just wrote it), straight and mirrored.
+        let (ny, nuv) = (y.clone(), uv.clone());
+        let nv12 = Planes::Nv12 { y: (&ny, sy), uv: (&nuv, suv) };
+        to_nv12(nv12, (w, h), false, &mut y, 40, &mut uv, 40, &mut scratch);
+        assert!(rows_are(&y, 40, h as usize, &luma_m) && rows_are(&uv, 40, ch, &chroma_m));
+        to_nv12(nv12, (w, h), true, &mut y, sy, &mut uv, suv, &mut scratch);
+        assert!(rows_are(&y, sy, h as usize, &luma) && rows_are(&uv, suv, ch, &chroma));
+    }
+
+    #[test]
+    #[should_panic(expected = "short UV plane")]
+    fn a_pixel_buffer_too_small_is_refused() {
+        let src = columns(32, 16);
+        to_nv12(Planes::of_i420(&src), (32, 16), false, &mut [0; 32 * 16], 32, &mut [0; 32 * 7], 32, &mut Vec::new());
+    }
+
+    #[test]
+    fn pictures_convert_to_bgra_mirrored_or_not() {
+        // Black on the left half, white on the right: BT.601 limited range, as the encoders get.
+        let (w, h) = (8u32, 2u32);
+        let mut src = filled(w, h, 16, 128, 128);
+        let (sy, _, _) = src.strides();
+        for row in src.data_mut().0.chunks_mut(sy as usize) {
+            row[4..8].fill(235);
+        }
+        let mut px = vec![0u8; (w * h * 4) as usize];
+        let white_on = |px: &[u8], right: bool| {
+            px.chunks_exact(4).enumerate().all(|(i, p)| {
+                let level = if (i % 8 >= 4) == right { 254..=255 } else { 0..=1 };
+                p[..3].iter().all(|c| level.contains(c)) && p[3] == 255
+            })
+        };
+        to_bgra(Planes::of_i420(&src), (w, h), false, &mut px);
+        assert!(white_on(&px, true));
+        to_bgra(Planes::of_i420(&src), (w, h), true, &mut px);
+        assert!(white_on(&px, false));
     }
 
     #[test]

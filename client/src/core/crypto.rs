@@ -51,8 +51,13 @@ pub fn public_key(text: &str) -> Option<[u8; 32]> {
 }
 
 fn seal_with(key: &[u8; 32], aad: &[u8], plain: &[u8]) -> Vec<u8> {
+    seal_with_nonce(key, aad, plain, random())
+}
+
+/// `seal_with` under a nonce of the caller's: only the tests pin one, to check the format against
+/// fixed bytes. Anything that leaves this computer gets a fresh random one.
+fn seal_with_nonce(key: &[u8; 32], aad: &[u8], plain: &[u8], nonce: [u8; NONCE]) -> Vec<u8> {
     let cipher = XChaCha20Poly1305::new(key.into());
-    let nonce: [u8; NONCE] = random();
     let sealed = cipher.encrypt(XNonce::from_slice(&nonce), Payload { msg: plain, aad }).expect("XChaCha20-Poly1305 does not fail to seal");
     let mut out = Vec::with_capacity(1 + NONCE + sealed.len());
     out.push(VERSION);
@@ -202,7 +207,8 @@ pub fn pair_key(mine: &Identity, me: UserId, their_public: &[u8; 32], them: User
     if !shared.was_contributory() {
         return None;
     }
-    let (first, second) = if me < them { ((me, mine.public()), (them, *their_public)) } else { ((them, *their_public), (me, mine.public())) };
+    let (first, second) =
+        if me < them { ((me, mine.public()), (them, *their_public)) } else { ((them, *their_public), (me, mine.public())) };
     let mut info = Vec::with_capacity(8 * 3 + 64);
     info.extend_from_slice(&conversation.to_be_bytes());
     info.extend_from_slice(&first.0.to_be_bytes());
@@ -386,6 +392,104 @@ mod tests {
         assert_eq!(pad(vec![b'x'; 129]).len(), 192);
         let v: serde_json::Value = serde_json::from_slice(&padded).unwrap();
         assert_eq!(v["body"], "hi");
+    }
+
+    // Known answers. Everything below was produced once by this code and written down: what was
+    // sealed and stored with it (messages on the server, wrapped keys, safety numbers people
+    // compared) has to keep opening and reading the same, so a change that moves any of these
+    // bytes is a change of format, not a refactoring.
+
+    /// Two fixed identities, ids 1 and 2, as the vectors use them.
+    fn fixed() -> (Identity, Identity) {
+        (Identity::from_secret(Zeroizing::new([0x11; 32])), Identity::from_secret(Zeroizing::new([0x22; 32])))
+    }
+
+    #[test]
+    fn known_answer_the_pair_key_s_salt_and_info() {
+        let (a, b) = fixed();
+        assert_eq!(a.public_b64(), "e06Qm75__kTEZaIgA31gjuNYl9Me-XLwf3SJLLD3PxM");
+        assert_eq!(b.public_b64(), "D6poTtKIZ7l_Smot7l34zpdOdrcBjj8iocTPJnhXDyA");
+        // HKDF-SHA256, salt "harmony-dm-v1", info conversation ‖ lower id ‖ its key ‖ higher id ‖
+        // its key, ids as big-endian i64: the same from either side.
+        let want = "b0fc31987202b69061f05d8fb6f5209a170391eba63aaa4e056079cbd7050faf";
+        assert_eq!(hex::encode(pair_key(&a, 1, &b.public(), 2, 7).unwrap().0.as_slice()), want);
+        assert_eq!(hex::encode(pair_key(&b, 2, &a.public(), 1, 7).unwrap().0.as_slice()), want);
+        let shared = a.secret.diffie_hellman(&PublicKey::from(b.public()));
+        let mut info = 7i64.to_be_bytes().to_vec();
+        info.extend(1i64.to_be_bytes().iter().chain(&a.public()).chain(&2i64.to_be_bytes()).chain(&b.public()));
+        let mut by_hand = [0u8; 32];
+        Hkdf::<Sha256>::new(Some(b"harmony-dm-v1"), shared.as_bytes()).expand(&info, &mut by_hand).unwrap();
+        assert_eq!(hex::encode(by_hand), want);
+    }
+
+    #[test]
+    fn known_answer_the_associated_data_of_each_kind() {
+        assert_eq!(aad::message(7, 1), "harmony-dm-v1/message/7/1");
+        assert_eq!(aad::reaction(7, 100, 2), "harmony-dm-v1/reaction/7/100/2");
+        assert_eq!(aad::call(7, 1), "harmony-dm-v1/call/7/1");
+        assert_eq!(aad::message(-3, 9_007_199_254_740_993), "harmony-dm-v1/message/-3/9007199254740993");
+    }
+
+    #[test]
+    fn known_answer_a_sealed_message_s_bytes() {
+        let (a, b) = fixed();
+        let sealed = "ATMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM4Fkr1GHru_b3hVjLtqVztcZHeCo3hqSFUr3hzlw";
+        let k = pair_key(&b, 2, &a.public(), 1, 7).unwrap();
+        assert_eq!(k.open(&aad::message(7, 1), sealed).as_deref(), Some(br#"{"body":"oi"}"#.as_slice()));
+        assert!(k.open(&aad::message(7, 2), sealed).is_none());
+        // base64url without padding of version 1 ‖ the 24-byte nonce ‖ ciphertext and tag.
+        let bytes = unb64(sealed).unwrap();
+        assert_eq!(bytes[0], 1);
+        assert_eq!(&bytes[1..25], &[0x33; 24]);
+        assert_eq!(bytes.len(), 1 + 24 + 13 + 16);
+        assert_eq!(nonce_of(sealed), Some([0x33; 24]));
+        assert_eq!(b64(&seal_with_nonce(&k.0, aad::message(7, 1).as_bytes(), br#"{"body":"oi"}"#, [0x33; 24])), sealed);
+        let mut later = bytes.clone();
+        later[0] = 2;
+        assert!(k.open(&aad::message(7, 1), &b64(&later)).is_none(), "another version is not read as this one");
+    }
+
+    #[test]
+    fn known_answer_a_sealed_file() {
+        let sealed = unb64("AXd3d3d3d3d3d3d3d3d3d3d3d3d3d3d3dwAHN4bEUCaTQI39Vu7KX_vFf3RZlBpQO1ta").unwrap();
+        assert_eq!(open_file(&[0x66; 32], &sealed).as_deref(), Some(b"file bytes".as_slice()));
+    }
+
+    #[test]
+    fn known_answer_the_recovery_key_and_its_wrapping() {
+        let (a, _) = fixed();
+        let bytes: [u8; 20] = std::array::from_fn(|i| (i as u8).wrapping_mul(13));
+        let shown = "006H-M9SM-8575-PT3N-GA7S-SADP-RF8D-VTQQ";
+        assert_eq!(RecoveryKey(Zeroizing::new(bytes)).display(), shown);
+        // Crockford's base32 read back, however it was typed.
+        for typed in [
+            shown,
+            "006h m9sm 8575 pt3n ga7s sadp rf8d vtqq",
+            "OO6H-M9SM-8575-PT3N-GA7S-SADP-RF8D-VTQQ",
+            "006HM9SM8575PT3NGA7SSADPRF8DVTQQ",
+        ] {
+            assert_eq!(*RecoveryKey::parse(typed).unwrap().0, bytes, "{typed}");
+        }
+        assert_eq!(
+            *RecoveryKey::parse("1111-1111-1111-1111-1111-1111-1111-1111").unwrap().0,
+            *RecoveryKey::parse("IiLl-1111-1111-1111-1111-1111-1111-1111").unwrap().0
+        );
+        let r = RecoveryKey::parse(shown).unwrap();
+        // HKDF-SHA256, salt "harmony-recovery-v1", info "wrap identity".
+        assert_eq!(hex::encode(r.wrapping_key().as_slice()), "1a1f7e72a5523fe600c53989e36590567655d765c156ff0dc2089825fcdbc1ba");
+        // What the server keeps: the private half sealed under it, the public key as associated data.
+        let wrapped = "AVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVbWXuqBjNMZkhU8tgZjfsPQ6TJ0qumXZuJddZM4bcF3OtQx0QmCbOScd47xAgzUwvg";
+        let back = unwrap(wrapped, &a.public(), &r).unwrap();
+        assert_eq!(*back.secret_bytes(), *a.secret_bytes());
+        assert_eq!(b64(&seal_with_nonce(&r.wrapping_key(), &a.public(), a.secret_bytes().as_slice(), [0x55; 24])), wrapped);
+    }
+
+    #[test]
+    fn known_answer_the_safety_number() {
+        let (a, b) = fixed();
+        let want = "13418 66612 62703 17296 72420 61925";
+        assert_eq!(safety_number((1, &a.public()), (2, &b.public())), want);
+        assert_eq!(safety_number((2, &b.public()), (1, &a.public())), want);
     }
 
     #[test]
