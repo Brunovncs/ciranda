@@ -10,7 +10,7 @@
 import { join } from 'node:path';
 import express from 'express';
 import { config, iceServers, signalingBase, whepUrl, whipUrl } from './config.js';
-import { LoginLimiter, newMediaToken, secretsMatch } from './auth.js';
+import { AccountLockout, LoginLimiter, newMediaToken, secretsMatch } from './auth.js';
 import { Throttle } from './throttle.js';
 import { MediaMtxMonitor } from './mediamtx-api.js';
 import { Rooms, normalizeUsername, normalizePath } from './rooms.js';
@@ -124,8 +124,26 @@ const calls = new Calls({
  * the owner has set something there. config.password is read exactly once
  * more, to seed it, and nothing else in this file should consult it again.
  */
-const serverSettings = new ServerSettings(metaStore, { envPassword: config.password });
+const serverSettings = new ServerSettings(metaStore, {
+  envPassword: config.password,
+  relayGuarded: () => Boolean(config.mediaToken),
+});
 chat.maxFileBytes = serverSettings.maxFileBytes ?? DEFAULT_FILE_BYTES;
+
+/**
+ * The legacy watch token follows the door, wherever the door was changed.
+ *
+ * It was minted at boot from the environment alone, and kept in step only
+ * when the host changed the door (ops.js). A door the owner put on from the
+ * client left `config.mediaToken` empty, and with it the auth hook's
+ * open-server shortcut: anybody who knew a name could watch the flat
+ * namespace straight from MediaMTX, door or no door, until a restart. And a
+ * door the owner set before a restart was not seen at boot either.
+ */
+function followDoor() {
+  config.mediaToken = serverSettings.passwordRequired ? (config.mediaToken || newMediaToken()) : '';
+}
+followDoor();
 
 const rooms = new Rooms({ claimTtlMs: config.claimTtlMs });
 const limiter = new LoginLimiter({
@@ -134,18 +152,60 @@ const limiter = new LoginLimiter({
 });
 
 /**
- * A second limiter for account logins, keyed by nickname rather than address.
+ * A second limiter for account passwords: by nickname and address together,
+ * under a higher ceiling for the nickname alone. See AccountLockout.
  *
  * The shared-password limiter is keyed by IP, which is the right control for
  * "someone is guessing the door key". It is the wrong one here: everybody
  * behind one NAT shares an address, so one person fat-fingering their password
- * would lock out the household. Keying by nickname also means an attacker who
- * rotates addresses still cannot grind a single account.
+ * would lock out the household.
  */
-const loginLimiter = new LoginLimiter({
+const loginLimiter = new AccountLockout({
   maxAttempts: config.maxLoginAttempts,
   lockoutMinutes: config.lockoutMinutes,
 });
+
+/**
+ * Signing up and signing in, per address: each costs a scrypt, about 120 ms
+ * of a Pi's CPU, whoever's name it is for. The lockout above only counts
+ * failures against one name; this is what stops one address spending the
+ * server's CPU on a stream of new names, or of new accounts. A household
+ * signing everybody in at once fits in the burst.
+ */
+const accountThrottle = new Throttle({ burst: 30, perSecond: 1 / 6 });
+
+/** The throttle's answer as a 429, or null to go on. */
+function accountGate(req, res) {
+  const gate = accountThrottle.take(req.ip ?? 'unknown');
+  if (gate.allowed) return null;
+  res.set('Retry-After', String(gate.retryAfterSec));
+  return res.status(429).json({
+    error: 'slow_down',
+    retryAfterSec: gate.retryAfterSec,
+    message: `Too many attempts from here. Try again in ${formatWait(gate.retryAfterSec)}.`,
+  });
+}
+
+/**
+ * console.warn for things a stranger can cause at will -- a wrong door
+ * password, a refused media token -- which on an SD card is a stranger
+ * filling the disk one line at a time. A burst gets through as it is; past
+ * that, one a minute per kind, saying how many were left out in between.
+ */
+const logThrottle = new Throttle({ burst: 20, perSecond: 1 / 60 });
+/** @type {Map<string, number>} by kind: lines left out since the last one written */
+const unlogged = new Map();
+
+function warnQuietly(kind, line) {
+  if (!logThrottle.take(kind).allowed) {
+    unlogged.set(kind, (unlogged.get(kind) ?? 0) + 1);
+    return;
+  }
+  const skipped = unlogged.get(kind);
+  unlogged.delete(kind);
+  console.warn(skipped ? `${line} (and ${skipped} more like it not logged)` : line);
+}
+
 const monitor = new MediaMtxMonitor({
   apiUrl: config.mediamtxApi,
   intervalMs: config.pollIntervalMs,
@@ -186,7 +246,7 @@ mountOps(app, {
   setDoorPassword: (password) => {
     serverSettings.useEnvironmentPassword(password);
     config.password = password;
-    config.mediaToken = password ? (config.mediaToken || newMediaToken()) : '';
+    followDoor();
   },
 });
 
@@ -241,7 +301,8 @@ function requirePassword(req, res, next) {
   }
 
   const result = limiter.fail(key);
-  console.warn(
+  warnQuietly(
+    'door',
     `[auth] wrong password from ${key}` +
       (result.locked ? ` -- locked out for ${formatWait(result.retryAfterSec)}` : ''),
   );
@@ -404,6 +465,7 @@ const requireRole = (...roles) => (req, res, next) => {
 };
 
 app.post('/api/accounts/register', async (req, res) => {
+  if (accountGate(req, res)) return undefined;
   const result = await accounts.register(req.body?.nickname, req.body?.password);
   if (!result.ok) {
     const messages = {
@@ -448,7 +510,8 @@ app.post('/api/accounts/login', async (req, res) => {
   // as typed, "b ob" and "bo b" would each get fresh tries at bob. Names that
   // can't be an account share one key, so they can't grow the limiter either.
   const nickname = normalizeNickname(req.body?.nickname) ?? '';
-  const gate = loginLimiter.check(nickname);
+  const ip = req.ip ?? 'unknown';
+  const gate = loginLimiter.check(nickname, ip);
   if (!gate.allowed) {
     res.set('Retry-After', String(gate.retryAfterSec));
     return res.status(429).json({
@@ -457,10 +520,11 @@ app.post('/api/accounts/login', async (req, res) => {
       message: `Too many wrong passwords for "${nickname}". Try again in ${formatWait(gate.retryAfterSec)}.`,
     });
   }
+  if (accountGate(req, res)) return undefined;
 
   const user = await accounts.verify(nickname, req.body?.password);
   if (!user) {
-    const result = loginLimiter.fail(nickname);
+    const result = loginLimiter.fail(nickname, ip);
     if (result.locked) {
       res.set('Retry-After', String(result.retryAfterSec));
       return res.status(429).json({
@@ -477,7 +541,7 @@ app.post('/api/accounts/login', async (req, res) => {
       message: 'Wrong nickname or password.',
     });
   }
-  loginLimiter.succeed(nickname);
+  loginLimiter.succeed(nickname, ip);
   // Only after the right password, so this cannot be used to find out who
   // is banned.
   if (user.banned_at != null) {
@@ -511,11 +575,35 @@ app.get('/api/accounts/me', requireLogin, (req, res) => {
   res.json({ user: publicUser(req.user) });
 });
 
+/*
+ * The current password is checked under the sign-in lockout, on the same
+ * count: a session is not the password, and a stolen one must not become an
+ * unmetered way of guessing it.
+ */
 app.post('/api/accounts/password', requireLogin, async (req, res) => {
+  const ip = req.ip ?? 'unknown';
+  const gate = loginLimiter.check(req.user.nickname, ip);
+  if (!gate.allowed) {
+    res.set('Retry-After', String(gate.retryAfterSec));
+    return res.status(429).json({
+      error: 'locked_out',
+      retryAfterSec: gate.retryAfterSec,
+      message: `Too many wrong passwords. Try again in ${formatWait(gate.retryAfterSec)}.`,
+    });
+  }
   const ok = await accounts.verify(req.user.nickname, req.body?.current);
   if (!ok) {
-    return res.status(401).json({ error: 'bad_credentials', message: 'Current password is wrong.' });
+    const result = loginLimiter.fail(req.user.nickname, ip);
+    if (result.locked) res.set('Retry-After', String(result.retryAfterSec));
+    return res.status(result.locked ? 429 : 401).json({
+      error: result.locked ? 'locked_out' : 'bad_credentials',
+      ...(result.locked ? { retryAfterSec: result.retryAfterSec } : { attemptsLeft: result.attemptsLeft }),
+      message: result.locked
+        ? `Too many wrong passwords. Try again in ${formatWait(result.retryAfterSec)}.`
+        : 'Current password is wrong.',
+    });
   }
+  loginLimiter.succeed(req.user.nickname, ip);
   const result = await accounts.changePassword(req.user.id, req.body?.password);
   if (!result.ok) {
     return res.status(400).json({ error: result.error, message: 'Use at least 6 characters.' });
@@ -703,6 +791,7 @@ function removeAccount(res, id, by) {
   // socket authenticates once and would go on receiving everything. A call
   // they were in ends too; its conversation went with them, so it leaves no line.
   calls.leaveUser(id);
+  voice.forgetUser(id);
   realtime?.kickUser(id);
   // Everything that named them is now wrong: the member list, every message
   // they wrote, every roster they were in.
@@ -792,7 +881,10 @@ app.post('/api/server', requireRole('owner'), (req, res) => {
   }
 
   if (req.body?.name !== undefined) serverSettings.setName(req.body.name);
-  if (typeof req.body?.password === 'string') serverSettings.setPassword(req.body.password);
+  if (typeof req.body?.password === 'string') {
+    serverSettings.setPassword(req.body.password);
+    followDoor();
+  }
   if (icon !== undefined) {
     const hash = icon === null ? null : String(icon);
     if (hash) chat.retain(hash);
@@ -1110,6 +1202,18 @@ app.post('/api/channels/:id', requireAdmin, async (req, res) => {
     ...(micLocked !== undefined ? { micLocked: Boolean(micLocked) } : {}),
   });
   if (!result.ok) return res.status(400).json({ error: result.error });
+  /*
+   * A new password changes who may come in, not who is already in the room:
+   * the people in it, and the admin who set it, keep their places. Without
+   * their grants back the auth hook -- which asks for a grant on every new
+   * session -- would leave them sitting in the channel unable to hear
+   * anybody who starts a camera from here on.
+   */
+  if (typeof req.body?.password === 'string' && req.body.password) {
+    for (const userId of new Set([req.user.id, ...voice.roster(id).map((m) => m.userId)])) {
+      channels.grant(id, userId);
+    }
+  }
   realtime?.broadcastChannels();
   if (micLocked !== undefined) {
     // Same order as a force-mute, for the same reason: the roster tells the
@@ -1402,10 +1506,28 @@ app.post('/api/messages/:id/react', requireLogin, (req, res) => {
   return res.json({ reactions: result.reactions });
 });
 
+/*
+ * Searches per person. A search is a full-text query, or a LIKE over every
+ * message in the channel when the words will not make one, and each answer
+ * is a page of messages with their reactions looked up; a script asking in
+ * a loop would have the Pi doing nothing else. The client asks a quarter of
+ * a second after typing stops, so somebody typing never meets this.
+ */
+const searchThrottle = new Throttle({ burst: 20, perSecond: 2 });
+
 app.get('/api/channels/:id/search', requireLogin, (req, res) => {
   const id = Number.parseInt(req.params.id, 10);
   const channel = readableChannel(req, id);
   if (!channel) return res.status(404).json({ error: 'no_such_channel' });
+  const gate = searchThrottle.take(req.user.id);
+  if (!gate.allowed) {
+    res.set('Retry-After', String(gate.retryAfterSec));
+    return res.status(429).json({
+      error: 'slow_down',
+      retryAfterSec: gate.retryAfterSec,
+      message: 'Too many searches at once. Wait a moment and try again.',
+    });
+  }
 
   const { mode, results } = chat.search(id, req.query.q);
   return res.json({ mode, results: forClient(results) });
@@ -1614,7 +1736,8 @@ app.get('/api/uploads/:hash', requireLogin, (req, res) => sendUpload(req, res));
 
 /** A key for loading uploads without headers. See GET /api/media/:hash. */
 app.get('/api/media-key', requireLogin, (req, res) => {
-  res.json({ key: mintMediaKey(mediaKeySecret(req.user), req.user.id) });
+  // The full row: a session's row leaves the password hash out on purpose.
+  res.json({ key: mintMediaKey(mediaKeySecret(accounts.byId(req.user.id)), req.user.id) });
 });
 
 /**
@@ -1800,6 +1923,22 @@ app.post('/api/soundpad/:id/delete', requireAdmin, (req, res) => {
 // denies.
 // ---------------------------------------------------------------------------
 
+/** The account exists and is not banned. */
+function accountInGoodStanding(userId) {
+  const user = accounts.byId(userId);
+  return Boolean(user) && user.banned_at == null;
+}
+
+/**
+ * Whether this person may be in this channel now: as the join decides it,
+ * asked again for every session MediaMTX opens.
+ */
+function mayEnterChannel(channelId, userId) {
+  const channel = channels.get(channelId);
+  if (!channel || !accountInGoodStanding(userId)) return false;
+  return !channel.password_hash || channels.hasGrant(channelId, userId);
+}
+
 app.post('/mediamtx/auth', (req, res) => {
   const { action, path, query } = req.body ?? {};
 
@@ -1833,14 +1972,29 @@ app.post('/mediamtx/auth', (req, res) => {
     const claim = readChannelToken(mediaSecret, token);
 
     if (!claim || claim.cid !== channelTarget.cid || claim.flags !== TOKEN_FLAGS.channel) {
-      console.warn(`[auth] channel ${action} REJECTED for "${path}" (bad or expired token)`);
+      warnQuietly('auth', `[auth] channel ${action} REJECTED for "${path}" (bad or expired token)`);
+      return res.sendStatus(401);
+    }
+
+    /*
+     * Still theirs, and still allowed in. The token says who it was issued
+     * to and which slot; the slot must still be held by that person -- a slot
+     * goes to the next person to join once its holder leaves -- and the
+     * channel must still let them in: not banned, and holding a grant if it
+     * has a password. Without this a token outlived everything that should
+     * have ended it by up to its ten minutes. Live presence is consulted
+     * here, which a restart empties; every client rejoins after one anyway,
+     * and gets new tokens when it does.
+     */
+    const holder = voice.slot(claim.cid, claim.mid);
+    if (holder?.userId !== claim.uid || !mayEnterChannel(claim.cid, claim.uid)) {
+      warnQuietly('auth', `[auth] channel ${action} REJECTED for "${path}" (no longer in the channel)`);
       return res.sendStatus(401);
     }
 
     if (action === 'read' || action === 'playback') {
       // Membership of the channel is the whole check: any member may watch any
-      // other member. The hook never consults live presence, which keeps it
-      // stateless, restart-proof, and off any lock during a join storm.
+      // other member.
       return res.sendStatus(204);
     }
 
@@ -1848,7 +2002,7 @@ app.post('/mediamtx/auth', (req, res) => {
       // Publishing additionally requires the SLOT to match, or one member
       // could publish into another member's path.
       if (claim.mid !== channelTarget.mid) {
-        console.warn(`[auth] channel publish REJECTED for "${path}" (slot mismatch)`);
+        warnQuietly('auth', `[auth] channel publish REJECTED for "${path}" (slot mismatch)`);
         return res.sendStatus(401);
       }
       // The enforcing half of force-mute. The Phase 0 spike showed that
@@ -1857,7 +2011,7 @@ app.post('/mediamtx/auth', (req, res) => {
       // stick across the reconnect that follows.
       if (channelTarget.kind === MEDIA_KINDS.voice
           && voice.isForceMuted(channelTarget.cid, channelTarget.mid)) {
-        console.warn(`[auth] channel publish REFUSED for "${path}" (force-muted)`);
+        warnQuietly('auth', `[auth] channel publish REFUSED for "${path}" (force-muted)`);
         return res.sendStatus(401);
       }
       return res.sendStatus(204);
@@ -1878,12 +2032,20 @@ app.post('/mediamtx/auth', (req, res) => {
     const token = new URLSearchParams(query ?? '').get('token');
     const claim = readChannelToken(mediaSecret, token);
     if (!claim || claim.cid !== callTarget.conversationId || claim.flags !== TOKEN_FLAGS.call) {
-      console.warn(`[auth] call ${action} REJECTED for "${path}" (bad or expired token)`);
+      warnQuietly('auth', `[auth] call ${action} REJECTED for "${path}" (bad or expired token)`);
+      return res.sendStatus(401);
+    }
+    // The same rule as a channel's: the slot still theirs, the call still
+    // going, and the account not banned since.
+    const call = calls.get(claim.cid);
+    const holder = calls.voice.slot(claim.cid, claim.mid);
+    if (!call || !Calls.isParty(call, claim.uid) || holder?.userId !== claim.uid || !accountInGoodStanding(claim.uid)) {
+      warnQuietly('auth', `[auth] call ${action} REJECTED for "${path}" (no longer in the call)`);
       return res.sendStatus(401);
     }
     if (action === 'read' || action === 'playback') return res.sendStatus(204);
     if (action === 'publish' && claim.mid === callTarget.mid) return res.sendStatus(204);
-    console.warn(`[auth] call ${action} REJECTED for "${path}" (slot mismatch)`);
+    warnQuietly('auth', `[auth] call ${action} REJECTED for "${path}" (slot mismatch)`);
     return res.sendStatus(401);
   }
 
@@ -1902,7 +2064,7 @@ app.post('/mediamtx/auth', (req, res) => {
     if (!config.mediaToken) return res.sendStatus(204);
     const token = new URLSearchParams(query ?? '').get('token');
     if (secretsMatch(token, config.mediaToken)) return res.sendStatus(204);
-    console.warn(`[auth] read REJECTED for "${username}" (missing or stale watch token)`);
+    warnQuietly('auth', `[auth] read REJECTED for "${username}" (missing or stale watch token)`);
     return res.sendStatus(401);
   }
 
@@ -1913,7 +2075,7 @@ app.post('/mediamtx/auth', (req, res) => {
       console.log(`[auth] publish accepted for "${username}"`);
       return res.sendStatus(204);
     }
-    console.warn(`[auth] publish REJECTED for "${username}" (bad or expired token)`);
+    warnQuietly('auth', `[auth] publish REJECTED for "${username}" (bad or expired token)`);
     return res.sendStatus(401);
   }
 
@@ -1931,17 +2093,17 @@ app.post('/mediamtx/auth', (req, res) => {
  * socket came in with, for HARMONY_SIGNALING_URL=auto.
  */
 function issueTokens(channelId, userId, mid, host) {
-  return mediaTokens({ id: channelId, mid, host, flags: TOKEN_FLAGS.channel, pathFor: channelPath });
+  return mediaTokens({ id: channelId, mid, uid: userId, host, flags: TOKEN_FLAGS.channel, pathFor: channelPath });
 }
 
 /** The same, for one side of a private call: its own namespace and its own flag. */
 function issueCallTokens(conversationId, userId, mid, host) {
-  return mediaTokens({ id: conversationId, mid, host, flags: TOKEN_FLAGS.call, pathFor: callPath });
+  return mediaTokens({ id: conversationId, mid, uid: userId, host, flags: TOKEN_FLAGS.call, pathFor: callPath });
 }
 
-function mediaTokens({ id, mid, host, flags, pathFor }) {
+function mediaTokens({ id, mid, uid, host, flags, pathFor }) {
   const token = mintChannelToken(mediaSecret, {
-    cid: id, mid, flags, ttlMs: config.channelTokenTtlMs,
+    cid: id, mid, uid, flags, ttlMs: config.channelTokenTtlMs,
   });
   const base = signalingBase(host);
   const url = (kind) => `${base}/${pathFor(id, mid, kind)}`;
@@ -1973,11 +2135,15 @@ function mediaTokens({ id, mid, host, flags, pathFor }) {
 monitor.start();
 
 // Sweep idle sessions hourly. Cheap, and it keeps a long-lived server from
-// accumulating a row per login forever.
-const sessionSweeper = setInterval(
-  () => accounts.expireSessions(config.sessionIdleMs),
-  60 * 60 * 1000,
-);
+// accumulating a row per login forever. A write from a timer: a throw here --
+// a full disk -- would end the process, where it can wait an hour instead.
+const sessionSweeper = setInterval(() => {
+  try {
+    accounts.expireSessions(config.sessionIdleMs);
+  } catch (err) {
+    console.warn(`[accounts] could not sweep idle sessions: ${err.message}`);
+  }
+}, 60 * 60 * 1000);
 sessionSweeper.unref();
 
 // What a handler threw or rejected with: logged, and a plain 500 rather than
@@ -2049,18 +2215,48 @@ monitor.on('paths', () => {
   });
 });
 
+/**
+ * How long a shutdown waits for requests in flight before closing anyway.
+ * Docker sends SIGKILL ten seconds after SIGTERM, and the database has to be
+ * closed before that, not by it.
+ */
+const SHUTDOWN_GRACE_MS = 5000;
+
+let stopping = false;
+
+/*
+ * Closing checkpoints the WAL, so the next start does not have to replay it.
+ * Skipping this is survivable but leaves -wal/-shm files behind.
+ */
+function finishShutdown() {
+  try {
+    db.close();
+  } catch (err) {
+    console.warn(`[harmony] closing the database: ${err.message}`);
+  }
+  process.exit(0);
+}
+
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.on(signal, () => {
+    if (stopping) return;
+    stopping = true;
     console.log(`\n[harmony] ${signal} -- shutting down`);
     monitor.stop();
     calls.close();
     realtime?.close();
     clearInterval(sessionSweeper);
-    server.close(() => {
-      // Closing checkpoints the WAL, so the next start does not have to replay
-      // it. Skipping this is survivable but leaves -wal/-shm files behind.
-      db.close();
-      process.exit(0);
-    });
+    // server.close() only stops new connections and waits for the open ones,
+    // and a client keeps one alive between polls for as long as it likes, so
+    // on its own this waited out Docker's patience and the SIGKILL closed the
+    // database instead. Idle ones go now, busy ones when they finish or the
+    // grace runs out, whichever is first.
+    server.close(finishShutdown);
+    server.closeIdleConnections();
+    setTimeout(() => {
+      console.warn('[harmony] requests still open after the grace; closing anyway');
+      server.closeAllConnections();
+      finishShutdown();
+    }, SHUTDOWN_GRACE_MS);
   });
 }

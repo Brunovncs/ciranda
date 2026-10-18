@@ -17,7 +17,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
 
-import { callPath, channelPath, mintChannelToken, parseCallPath } from '../src/channels.js';
+import { callPath, channelPath, mintChannelToken, parseCallPath, readChannelToken } from '../src/channels.js';
 import { isPublicKey, isSealedText } from '../src/dms.js';
 import { Throttle } from '../src/throttle.js';
 import { Calls } from '../src/calls.js';
@@ -759,12 +759,15 @@ describe('calls', () => {
     await eve.close();
   });
 
+  const hook = (path, t, action = 'read') => api('/mediamtx/auth', {
+    method: 'POST', body: { action, path, query: `token=${encodeURIComponent(t)}` },
+  });
+  let bobsToken;
+
   it('opens the relay to call tokens only, and keeps channel tokens out', async () => {
     const joined = await bob.request({ type: 'voice:refresh', conversationId: convo });
     const token = new URL(joined.publish.voice).searchParams.get('token');
-    const hook = (path, t, action = 'read') => api('/mediamtx/auth', {
-      method: 'POST', body: { action, path, query: `token=${encodeURIComponent(t)}` },
-    });
+    bobsToken = token;
     assert.equal((await hook(callPath(convo, 1, 'voice'), token)).status, 204, 'reading the other side');
     assert.equal((await hook(callPath(convo, 2, 'voice'), token, 'publish')).status, 204, 'publishing your own slot');
     assert.equal((await hook(callPath(convo, 1, 'voice'), token, 'publish')).status, 401, 'not the other slot');
@@ -780,6 +783,9 @@ describe('calls', () => {
     const line = await bob.next((m) => m.type === 'dm:message' && m.message.kind === 'call' && m.message.meta.outcome === 'ended');
     assert.equal(typeof line.message.meta.durationMs, 'number');
     assert.equal(line.message.sealed, null);
+    // The token has minutes left on it, and the call it was for is over.
+    assert.equal((await hook(callPath(convo, 1, 'voice'), bobsToken)).status, 401, 'no reading a call that ended');
+    assert.equal((await hook(callPath(convo, 2, 'voice'), bobsToken, 'publish')).status, 401);
   });
 
   it('records a missed call for somebody who is not online', async () => {
@@ -957,8 +963,16 @@ describe('removing an account', () => {
 describe('tokens', () => {
   it('cannot be turned from one kind into the other', () => {
     // The flag is inside the signature: changing it breaks the token.
-    const t = mintChannelToken('secret', { cid: 5, mid: 1, flags: 'rw' });
+    const t = mintChannelToken('secret', { cid: 5, mid: 1, uid: 3, flags: 'rw' });
     const forged = t.replace('.rw.', '.dm.');
     assert.notEqual(t, forged);
+    assert.equal(readChannelToken('secret', t).flags, 'rw');
+    assert.equal(readChannelToken('secret', forged), null);
+  });
+
+  it('name who they were issued to, and that cannot be changed either', () => {
+    const t = mintChannelToken('secret', { cid: 5, mid: 1, uid: 3, flags: 'dm' });
+    assert.equal(readChannelToken('secret', t).uid, 3);
+    assert.equal(readChannelToken('secret', t.replace('.1.3.', '.1.4.')), null);
   });
 });

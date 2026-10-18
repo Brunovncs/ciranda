@@ -46,15 +46,21 @@ function hashDoor(password, salt) {
 export class ServerSettings {
   #meta;
   #envPassword;
+  #relayGuarded;
 
   /**
+   * `relayGuarded()` says whether the legacy media branch is asking for its
+   * watch token right now (see restartRequired). Left out, it is what it was
+   * at boot: whether the environment set a password.
+   *
    * @param {{get: (k: string) => string|null, set: (k: string, v: string) => void,
    *          delete: (k: string) => void}} meta
-   * @param {{envPassword: string}} opts
+   * @param {{envPassword: string, relayGuarded?: () => boolean}} opts
    */
-  constructor(meta, { envPassword = '' } = {}) {
+  constructor(meta, { envPassword = '', relayGuarded = null } = {}) {
     this.#meta = meta;
     this.#envPassword = envPassword;
+    this.#relayGuarded = relayGuarded ?? (() => Boolean(this.#envPassword));
 
     // A server that ran the other line kept its picture as `server_logo`.
     // Same thing, an upload hash holding one reference, so it moves across
@@ -146,18 +152,19 @@ export class ServerSettings {
   /**
    * True when the media relay's stance no longer matches this one.
    *
-   * MediaMTX's open-server shortcut is decided at boot from the environment
-   * -- `config.mediaToken` is minted then or not at all -- and it governs
-   * the legacy flat stream namespace. Voice channels are unaffected: their
-   * paths are checked before that shortcut is ever reached, which is the
-   * security-critical ordering in the auth hook.
+   * MediaMTX's open-server shortcut governs the legacy flat stream namespace:
+   * with no `config.mediaToken` any read there is let through. Voice
+   * channels are unaffected: their paths are checked before that shortcut is
+   * ever reached, which is the security-critical ordering in the auth hook.
    *
-   * So turning the password on or off from the client takes effect
-   * immediately for the app and not at all for that one legacy branch until
-   * a restart. Saying so is better than hoping nobody notices.
+   * The token used to be minted at boot or not at all, so turning the
+   * password on from the client left that one legacy branch open until a
+   * restart. index.js now keeps it in step with every change of the door,
+   * which leaves this false; it stays, and keeps measuring, so that saying
+   * so remains better than hoping nobody notices if the two ever part again.
    */
   get restartRequired() {
-    return Boolean(this.#envPassword) !== this.passwordRequired;
+    return this.#relayGuarded() !== this.passwordRequired;
   }
 
   /** Does this attempt open the door? */

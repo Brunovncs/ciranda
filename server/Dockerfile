@@ -28,7 +28,7 @@ ARG ALPINE_VERSION=3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb
 
 # Pinned for the same reason install.sh pins it: MediaMTX removes configuration
 # keys between releases, and an unknown key aborts startup rather than warning.
-ARG MEDIAMTX_VERSION=1.21.0
+ARG MEDIAMTX_VERSION=1.21.2
 
 # --------------------------------------------------------------------------
 # MediaMTX binary
@@ -48,10 +48,10 @@ RUN apk add --no-cache curl tar
 # pins the same ones.
 RUN set -eu; \
     case "${TARGETARCH}${TARGETVARIANT}" in \
-      amd64)   MTX_ARCH=linux_amd64  MTX_SHA256=e02e34c3337a35f20ac9e5aa31524566108964e6e37dbc46cf8292169f6c792b ;; \
-      arm64)   MTX_ARCH=linux_arm64  MTX_SHA256=a8113b5928ba1a934b81557b61b8a07954b76921a4b567d54c7f086f8b39d9a2 ;; \
-      armv7)   MTX_ARCH=linux_armv7  MTX_SHA256=b697706a572742665433a77e9403e94e874ae4a3b1144a574875904a332414bc ;; \
-      armv6)   MTX_ARCH=linux_armv6  MTX_SHA256=6884e1f26856a065e57a69f0423a55b79198a4b45b6deeed8661284d3cfb2914 ;; \
+      amd64)   MTX_ARCH=linux_amd64  MTX_SHA256=121be6e00397e473a95d83c75f4fcd3819a6af3b0e1a50889cba43ab4fab6a27 ;; \
+      arm64)   MTX_ARCH=linux_arm64  MTX_SHA256=180a235374a548d9133cdd5e20f5dbd8b01317be1c86e0d7e66df585dc42ed6f ;; \
+      armv7)   MTX_ARCH=linux_armv7  MTX_SHA256=bff8951f51dcb0426c306fc3fad793232f03947916370b166d10e6c73dcf9ce2 ;; \
+      armv6)   MTX_ARCH=linux_armv6  MTX_SHA256=70d0680d73841e85ed8ed908a323e4e2365cec84452427e78dc339d4ef90e1bd ;; \
       *) echo "unsupported platform: ${TARGETARCH}${TARGETVARIANT}" >&2; exit 1 ;; \
     esac; \
     curl -fsSL -o /tmp/mediamtx.tar.gz \
@@ -86,12 +86,17 @@ FROM node:${NODE_VERSION}
 
 LABEL org.opencontainers.image.title="Harmony server" \
       org.opencontainers.image.description="Relay-only WebRTC screen sharing: control server + MediaMTX" \
-      org.opencontainers.image.source="https://github.com/PedroLucasMiguel/harmony" \
+      org.opencontainers.image.source="https://github.com/Brunovncs/ciranda" \
       org.opencontainers.image.licenses="MIT"
 
 # tini reaps zombies and forwards signals; bash is for the entrypoint's
 # `wait -n`, which busybox ash does not have.
-RUN apk add --no-cache tini bash
+#
+# Pinned to a release line, not to one build: Alpine keeps only the newest
+# build of a package in a branch, so an exact pin (bash=5.3.9-r1) stops the
+# image building the day a security fix lands. `~` takes that fix and no
+# new release line. Alpine 3.24 has tini 0.19.0 and bash 5.3.9.
+RUN apk add --no-cache "tini~0.19" "bash~5.3"
 
 COPY --from=mediamtx /mediamtx /usr/local/bin/mediamtx
 

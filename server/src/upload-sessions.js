@@ -42,7 +42,10 @@ import { mediaTypeOf } from './chat.js';
 export const CHUNK_BYTES = 8 * 1024 * 1024;
 /** A session nothing has been sent to for this long is abandoned. */
 const IDLE_MS = 10 * 60 * 1000;
-/** Open sessions per account: enough for a few files at once, not a flood. */
+/**
+ * Open sessions per account: enough for a few files at once, not a flood.
+ * Together they may hold no more than one file's limit; see open().
+ */
 export const PER_USER = 3;
 
 /**
@@ -114,8 +117,17 @@ export class UploadSessions {
     if (size > this.#chat.maxFileBytes) return { ok: false, error: 'file_too_large' };
     const type = String(contentType ?? '').split(';')[0].trim().toLowerCase();
     if (!mediaTypeOf(type)) return { ok: false, error: 'type_not_allowed' };
-    const mine = [...this.#sessions.values()].filter((s) => s.userId === userId).length;
-    if (mine >= PER_USER) return { ok: false, error: 'too_many_uploads' };
+    const mine = [...this.#sessions.values()].filter((s) => s.userId === userId);
+    if (mine.length >= PER_USER) return { ok: false, error: 'too_many_uploads' };
+    /*
+     * And no more room between them than the largest one file may take.
+     * Each session holds its whole size from the start, so three at the
+     * 2 GB limit let one member hold 6 GB of a server's room for as long
+     * as they cared to dribble bytes in, and everybody else was told the
+     * server was full. A few small files at once still fit.
+     */
+    const held = mine.reduce((sum, s) => sum + s.size, 0);
+    if (held + size > this.#chat.maxFileBytes) return { ok: false, error: 'too_many_uploads' };
     // Room for all of it, on top of every other upload still arriving.
     const room = this.#chat.reserve(size);
     if (!room.ok) return room;

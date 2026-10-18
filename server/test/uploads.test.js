@@ -9,7 +9,7 @@ import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
-import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { createHash, randomBytes } from 'node:crypto';
 import { Readable } from 'node:stream';
@@ -98,6 +98,28 @@ describe('the free-disk floor', () => {
       assert.equal(real.chat.store(Buffer.from('a real disk'), 'text/plain').ok, true);
     } finally {
       real.close();
+    }
+  });
+});
+
+describe('making room', () => {
+  it('keeps a file whose row could not be dropped', () => {
+    const s = scratchChat({ quota: 30 });
+    try {
+      // Counted as nobody's, yet a message still names it: the foreign key
+      // refuses the row, and the file has to outlive the refusal with it.
+      const kept = s.chat.store(Buffer.from('ten bytes!'), 'text/plain').upload.hash;
+      const user = s.db.prepare("INSERT INTO users (nickname, password_hash, created_at) VALUES ('ana', 'x', 0) RETURNING id").get().id;
+      const channel = s.db.prepare('SELECT id FROM channels LIMIT 1').get().id;
+      s.db.prepare('INSERT INTO messages (channel_id, user_id, attachment_hash, created_at) VALUES (?, ?, ?, 0)')
+        .run(channel, user, kept);
+
+      assert.deepEqual(s.chat.store(Buffer.from('twenty-five bytes, nearly'), 'text/plain'),
+        { ok: false, error: 'server_full' });
+      assert.ok(s.db.prepare('SELECT 1 FROM uploads WHERE hash = ?').get(kept), 'the row is still there');
+      assert.ok(existsSync(s.chat.pathFor(kept)), 'and so is the file it promises');
+    } finally {
+      s.close();
     }
   });
 });
@@ -220,6 +242,23 @@ describe('upload sessions', () => {
     assert.equal(theirs.ok, true, 'one person\'s uploads do not hold up another\'s');
     for (const { id } of mine) await sessions.cancel({ id, userId: 3 });
     await sessions.cancel({ id: theirs.id, userId: 4 });
+  });
+
+  it('holds no more room per account than one file may take', async () => {
+    // 64 is the limit here: three files of 40 used to hold 120 between them.
+    const first = await sessions.open({ userId: 5, size: 40, contentType: 'text/plain' });
+    assert.equal(first.ok, true);
+    assert.deepEqual(await sessions.open({ userId: 5, size: 40, contentType: 'text/plain' }),
+      { ok: false, error: 'too_many_uploads' });
+    const small = await sessions.open({ userId: 5, size: 24, contentType: 'text/plain' });
+    assert.equal(small.ok, true, 'what still fits under the limit is fine');
+    const theirs = await sessions.open({ userId: 6, size: 40, contentType: 'text/plain' });
+    assert.equal(theirs.ok, true, 'and somebody else has their own');
+    await sessions.cancel({ id: first.id, userId: 5 });
+    const again = await sessions.open({ userId: 5, size: 40, contentType: 'text/plain' });
+    assert.equal(again.ok, true, 'room given back is room to use again');
+    for (const id of [small.id, again.id]) await sessions.cancel({ id, userId: 5 });
+    await sessions.cancel({ id: theirs.id, userId: 6 });
   });
 
   it('keeps the allowlist and the limit', async () => {

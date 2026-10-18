@@ -12,8 +12,9 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { dirname, resolve } from 'node:path';
-import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -358,6 +359,19 @@ describe('the server', () => {
     assert.equal(res.headers.get('content-type'), 'application/octet-stream');
     const bytes = Buffer.from(await res.arrayBuffer());
     assert.equal(bytes.subarray(0, 16).toString('latin1'), 'SQLite format 3\0');
+    // A plain journal, so the one file is all of it; and the accounts in it.
+    assert.equal(bytes[18], 1);
+    assert.equal(bytes[19], 1);
+    const scratch = mkdtempSync(join(tmpdir(), 'harmony-backup-'));
+    const copy = join(scratch, 'copy.db');
+    writeFileSync(copy, bytes);
+    const opened = new DatabaseSync(copy, { readOnly: true });
+    try {
+      assert.ok(opened.prepare('SELECT COUNT(*) AS n FROM users').get().n >= 1);
+    } finally {
+      opened.close();
+      rmSync(scratch, { recursive: true, force: true });
+    }
     await waitFor(() => !readdirSync(dataDir).some((n) => n.startsWith('.ops-backup-')));
   });
 });

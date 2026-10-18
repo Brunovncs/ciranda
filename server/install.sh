@@ -37,7 +37,7 @@ set -euo pipefail
 
 # Pinned deliberately: mediamtx.yml is validated against this release, and
 # MediaMTX removes config keys between versions (a stale key aborts startup).
-MEDIAMTX_VERSION="${MEDIAMTX_VERSION:-1.21.0}"
+MEDIAMTX_VERSION="${MEDIAMTX_VERSION:-1.21.2}"
 PREFIX=/opt/harmony
 CONF_DIR=/etc/harmony
 ENV_FILE="$CONF_DIR/harmony.env"
@@ -104,9 +104,10 @@ echo "==> Architecture $(uname -m) -> ${MTX_ARCH}"
 
 # --- dependencies -----------------------------------------------------------
 # Node 24, not 22: the database is `node:sqlite`, which is only unflagged from
-# Node 22.13. Installing the 22.x line risks landing on an earlier 22 where
-# `import ... from "node:sqlite"` throws at startup with nothing to install to
-# fix it, so take the next LTS line and leave no room for doubt.
+# Node 22.13, and the host's backup uses its `backup()`, which an earlier 22
+# does not have either. On one of those `import ... from "node:sqlite"` throws
+# at startup with nothing to install to fix it, so take the next LTS line and
+# leave no room for doubt. package.json's engines say the same.
 if ! command -v node >/dev/null 2>&1; then
   echo "==> Installing Node.js 24"
   curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
@@ -114,15 +115,14 @@ if ! command -v node >/dev/null 2>&1; then
 fi
 
 NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
-NODE_MINOR="$(node -p 'process.versions.node.split(".")[1]')"
-if (( NODE_MAJOR < 22 )) || { (( NODE_MAJOR == 22 )) && (( NODE_MINOR < 13 )); }; then
-  echo "Node 22.13+ required (node:sqlite is flagged before that), found $(node -v)" >&2
+if (( NODE_MAJOR < 24 )); then
+  echo "Node 24+ required (node:sqlite and its backup()), found $(node -v)" >&2
   echo "  curl -fsSL https://deb.nodesource.com/setup_24.x | sudo bash - && sudo apt-get install -y nodejs" >&2
   exit 1
 fi
 
 # Fail now rather than at first boot if this build has no SQLite.
-if ! node --no-warnings -e 'import("node:sqlite").then(()=>0,()=>process.exit(1))'; then
+if ! node --no-warnings -e 'import("node:sqlite").then((m)=>process.exit(typeof m.backup === "function" ? 0 : 1),()=>process.exit(1))'; then
   echo "This Node build has no node:sqlite module. Install Node 24 from nodesource." >&2
   exit 1
 fi
@@ -140,13 +140,13 @@ else
 
   curl -fsSL "$URL" -o "$TMP/$TARBALL"
   # Each archive's SHA-256 from the release's checksums.sha256, so what gets
-  # installed as root is what MediaMTX published. They belong to 1.21.0: a
+  # installed as root is what MediaMTX published. They belong to 1.21.2: a
   # MEDIAMTX_VERSION override must bring its own, as MEDIAMTX_SHA256.
   case "${MEDIAMTX_VERSION}/${MTX_ARCH}" in
-    1.21.0/linux_amd64) MTX_SHA256=e02e34c3337a35f20ac9e5aa31524566108964e6e37dbc46cf8292169f6c792b ;;
-    1.21.0/linux_arm64) MTX_SHA256=a8113b5928ba1a934b81557b61b8a07954b76921a4b567d54c7f086f8b39d9a2 ;;
-    1.21.0/linux_armv7) MTX_SHA256=b697706a572742665433a77e9403e94e874ae4a3b1144a574875904a332414bc ;;
-    1.21.0/linux_armv6) MTX_SHA256=6884e1f26856a065e57a69f0423a55b79198a4b45b6deeed8661284d3cfb2914 ;;
+    1.21.2/linux_amd64) MTX_SHA256=121be6e00397e473a95d83c75f4fcd3819a6af3b0e1a50889cba43ab4fab6a27 ;;
+    1.21.2/linux_arm64) MTX_SHA256=180a235374a548d9133cdd5e20f5dbd8b01317be1c86e0d7e66df585dc42ed6f ;;
+    1.21.2/linux_armv7) MTX_SHA256=bff8951f51dcb0426c306fc3fad793232f03947916370b166d10e6c73dcf9ce2 ;;
+    1.21.2/linux_armv6) MTX_SHA256=70d0680d73841e85ed8ed908a323e4e2365cec84452427e78dc339d4ef90e1bd ;;
     *) MTX_SHA256="${MEDIAMTX_SHA256:-}" ;;
   esac
   if [[ -z $MTX_SHA256 ]]; then

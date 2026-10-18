@@ -88,6 +88,11 @@ export class LoginLimiter {
     this.#entries.delete(key);
   }
 
+  /** Wipe every key `match` picks. */
+  forget(match) {
+    for (const key of this.#entries.keys()) if (match(key)) this.#entries.delete(key);
+  }
+
   /**
    * Drop entries that are past their lockout and have gone quiet, so a flood of
    * one-shot attempts from many addresses cannot grow this map without bound.
@@ -103,6 +108,59 @@ export class LoginLimiter {
   /** Test seam. */
   get size() {
     return this.#entries.size;
+  }
+}
+
+/**
+ * The lockout for an account's password: keyed by the nickname AND the
+ * address guessing at it, under a much higher ceiling for the nickname alone.
+ *
+ * Keyed by nickname only, it was a weapon: three wrong guesses at the
+ * owner's name from anywhere and the owner was locked out of their own
+ * server, again every time it expired, for as long as somebody cared to
+ * keep it up. Keyed by address only, everybody behind one NAT shares one
+ * allowance. Per (nickname, address) somebody guessing locks out only
+ * themselves; the nickname's own ceiling, `ceiling` times higher, is what
+ * still stops many addresses grinding one account together.
+ */
+export class AccountLockout {
+  #pairs;
+  #names;
+
+  constructor({ maxAttempts = 3, lockoutMinutes, ceiling = 10, now = Date.now } = {}) {
+    this.#pairs = new LoginLimiter({ maxAttempts, lockoutMinutes, now });
+    this.#names = new LoginLimiter({ maxAttempts: maxAttempts * ceiling, lockoutMinutes, now });
+  }
+
+  // A space cannot be in a nickname, so no nickname and address run together
+  // into somebody else's pair.
+  static #pair = (nickname, ip) => `${nickname} ${ip}`;
+
+  /** @returns {{allowed: boolean, retryAfterSec: number}} the longer wait of the two */
+  check(nickname, ip) {
+    const pair = this.#pairs.check(AccountLockout.#pair(nickname, ip));
+    const name = this.#names.check(nickname);
+    if (pair.allowed && name.allowed) return pair;
+    return { allowed: false, retryAfterSec: Math.max(pair.retryAfterSec, name.retryAfterSec) };
+  }
+
+  /** @returns {{locked: boolean, retryAfterSec: number, attemptsLeft: number}} */
+  fail(nickname, ip) {
+    const pair = this.#pairs.fail(AccountLockout.#pair(nickname, ip));
+    const name = this.#names.fail(nickname);
+    if (!name.locked) return pair;
+    return { locked: true, retryAfterSec: Math.max(pair.retryAfterSec, name.retryAfterSec), attemptsLeft: 0 };
+  }
+
+  succeed(nickname, ip) {
+    this.#pairs.succeed(AccountLockout.#pair(nickname, ip));
+    this.#names.succeed(nickname);
+  }
+
+  /** Every lockout on this nickname, from every address: the host reset the password. */
+  clear(nickname) {
+    this.#pairs.forget((key) => key.startsWith(`${nickname} `));
+    this.#names.succeed(nickname);
   }
 }
 

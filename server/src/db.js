@@ -487,6 +487,23 @@ export const MIGRATIONS = [
   (db) => {
     db.exec('ALTER TABLE users ADD COLUMN banned_at INTEGER');
   },
+
+  /*
+   * v17 -- indexes under the deletes.
+   *
+   * Evicting a file makes SQLite check that no message still names it, and
+   * removing an account finds, releases and deletes every message they
+   * wrote -- and with no index on the column, each of those was a scan of
+   * every message the server ever kept. Partial on the hashes: most
+   * messages carry no file, and a lookup by hash never wants a NULL.
+   */
+  (db) => {
+    db.exec(`
+      CREATE INDEX messages_user ON messages(user_id);
+      CREATE INDEX messages_attachment ON messages(attachment_hash) WHERE attachment_hash IS NOT NULL;
+      CREATE INDEX dm_messages_attachment ON dm_messages(attachment_hash) WHERE attachment_hash IS NOT NULL;
+    `);
+  },
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

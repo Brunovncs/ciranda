@@ -22,6 +22,7 @@ import { createReadStream, readdirSync, readFileSync, rmSync, statSync } from 'n
 import { rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
+import { DatabaseSync, backup } from 'node:sqlite';
 import express from 'express';
 
 import { secretsMatch } from './auth.js';
@@ -57,7 +58,7 @@ const BACKUP_PREFIX = '.ops-backup-';
  * @param {import('./channels.js').Channels} deps.channels
  * @param {import('./channels.js').VoiceRooms} deps.voice
  * @param {import('./calls.js').Calls} deps.calls
- * @param {import('./auth.js').LoginLimiter} deps.loginLimiter
+ * @param {import('./auth.js').AccountLockout} deps.loginLimiter
  * @param {() => import('./realtime.js').Realtime|null} deps.realtime
  * @param {() => object} deps.serverView
  * @param {(res: import('express').Response, id: number, by: string) => void} deps.removeAccount
@@ -177,7 +178,7 @@ export function mountOps(app, deps) {
       return res.status(400).json({ error: result.error, message: 'Use at least 6 characters.' });
     }
     realtime()?.closeUser(target.id);
-    loginLimiter.succeed(target.nickname);
+    loginLimiter.clear(target.nickname);
     console.warn(`[ops] ${target.nickname}'s password reset by the host`);
     return res.json({ ok: true, user: opsAccount(accounts.byId(target.id), online()) });
   });
@@ -266,16 +267,29 @@ export function mountOps(app, deps) {
   /**
    * A consistent copy of the database, streamed.
    *
-   * VACUUM INTO writes a snapshot as of one moment however busy the server
-   * is, which copying the file would not be: the WAL holds what the main
-   * file does not yet. It runs on the event loop, which for a friends'
-   * server is a few megabytes and a blink. The uploads are not in it; they
+   * SQLite's online backup, a hundred pages at a time with the event loop
+   * free in between, and still a snapshot as of one moment however busy the
+   * server is: a write made meanwhile through this connection -- the only
+   * one that writes -- is carried into the copy. Copying the file would be
+   * neither: the WAL holds what the main file does not yet. VACUUM INTO,
+   * which this used to be, held the event loop for the whole copy, and on
+   * an SD card a database of any size is every request and every media
+   * session's auth hook waiting behind it. The uploads are not in it; they
    * are files, and the host can copy those as they are.
    */
   router.get('/backup', async (_req, res) => {
     const file = join(dataDir, `${BACKUP_PREFIX}${randomBytes(8).toString('hex')}.db`);
     try {
-      db.prepare('VACUUM INTO ?').run(file);
+      await backup(db, file);
+      // The copy comes out in WAL mode, as the original is. Back to a plain
+      // journal, as VACUUM INTO's was, so the one file is the whole of it
+      // and opens anywhere, read-only media included. A header write.
+      const copy = new DatabaseSync(file);
+      try {
+        copy.exec('PRAGMA journal_mode = DELETE');
+      } finally {
+        copy.close();
+      }
     } catch (err) {
       rmSync(file, { force: true });
       throw err;

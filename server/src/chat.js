@@ -607,13 +607,28 @@ export class Chat {
     return this.#q.upload.get(hash)?.content_type === SEALED_TYPE;
   }
 
-  /** Delete unreferenced files until there is room, oldest first. */
+  /**
+   * Delete unreferenced files until there is room, oldest first.
+   *
+   * The row goes first and the file only once it has. The other way round,
+   * a row that would not go -- a message still naming the file although its
+   * count says nobody does, which the foreign key refuses, or a full disk --
+   * left a row promising a file that was no longer there.
+   */
   #evictOrphans(needed) {
     for (const { hash, bytes } of this.#q.orphans.all()) {
+      let dropped;
+      try {
+        dropped = this.#q.deleteUpload.run(hash).changes > 0;
+      } catch (err) {
+        console.warn(`[uploads] could not evict ${hash}: ${err.message}`);
+        continue;
+      }
+      if (!dropped) continue;
+      this.#used -= bytes;
       try {
         unlinkSync(this.pathFor(hash));
-      } catch { /* already gone; drop the row anyway */ }
-      if (this.#q.deleteUpload.run(hash).changes) this.#used -= bytes;
+      } catch { /* already gone */ }
       if (this.#used + needed <= this.#maxBytes) return;
     }
   }

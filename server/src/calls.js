@@ -186,7 +186,15 @@ export class Calls {
 
     const meta = { outcome: call.answeredAt ? 'ended' : outcome };
     if (call.answeredAt) meta.durationMs = this.#now() - call.answeredAt;
-    this.#record(conversationId, call.callerId, meta);
+    // Writing the line is a database write, and this often runs from a ring
+    // or grace timer, where a throw -- a full disk -- ends the process. The
+    // call is over whether or not its line could be kept, and both people
+    // still have to hear so.
+    try {
+      this.#record(conversationId, call.callerId, meta);
+    } catch (err) {
+      console.warn(`[calls] could not record the call in conversation ${conversationId}: ${err.message}`);
+    }
     this.#notify([call.callerId, call.calleeId], {
       type: 'call:state',
       call: { ...publicCall(call), state: 'ended', outcome: meta.outcome },

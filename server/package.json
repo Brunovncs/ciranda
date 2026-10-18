@@ -6,15 +6,15 @@
   "type": "module",
   "main": "src/index.js",
   "engines": {
-    "node": ">=22.13"
+    "node": ">=24"
   },
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
-    "test": "node --test test/reservation.test.js test/auth.test.js test/accounts.test.js test/channels.test.js test/realtime.test.js test/chat.test.js test/soundpad.test.js test/profile.test.js test/owner.test.js test/signaling.test.js test/dm.test.js test/ink.test.js test/migrate.test.js test/uploads.test.js test/ops.test.js"
+    "test": "node --test \"test/*.test.js\""
   },
   "dependencies": {
-    "express": "^5.2.1",
+    "express": "^5.3.0",
     "ws": "^8.22.0"
   },
   "license": "MIT"

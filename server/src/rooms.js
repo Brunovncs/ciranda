@@ -128,7 +128,11 @@ export class Rooms {
       // stream that happens to be a webcam, and a client that lists it as
       // "bob-cam" is showing something true and useful. Filtering it would
       // make cameras publishable but invisible.
-      if (name.startsWith('vc-')) continue;
+      //
+      // A private call's paths (`dm.<conversation>.<mid>.<k>`) even more so:
+      // listed, they told everybody on the server who was on a call with whom,
+      // and handed every client a watch URL to try.
+      if (name.startsWith('vc-') || name.startsWith('dm.')) continue;
       live.set(name, { viewers: path.viewers, since: path.readyTime, tracks: path.tracks });
     }
     this.#live = live;

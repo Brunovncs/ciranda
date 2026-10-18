@@ -39,6 +39,20 @@ describe('migrations', () => {
     ]);
   });
 
+  it('index what deleting an upload or an account looks messages up by', () => {
+    const db = new DatabaseSync(':memory:');
+    for (const step of MIGRATIONS.slice(0, 16)) step(db);
+    db.exec('PRAGMA user_version = 16');
+    migrate(db);
+    assert.equal(version(db), SCHEMA_VERSION);
+    assert.ok(SCHEMA_VERSION >= 17);
+
+    const plan = (sql) => db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all().map((r) => r.detail).join(' | ');
+    assert.match(plan('SELECT id FROM messages WHERE user_id = 1'), /USING (COVERING )?INDEX messages_user/);
+    assert.match(plan("SELECT id FROM messages WHERE attachment_hash = 'x'"), /USING (COVERING )?INDEX messages_attachment/);
+    assert.match(plan("SELECT id FROM dm_messages WHERE attachment_hash = 'x'"), /USING (COVERING )?INDEX dm_messages_attachment/);
+  });
+
   it('leave a database of ours at v11 alone', () => {
     const db = new DatabaseSync(':memory:');
     for (const step of MIGRATIONS.slice(0, 11)) step(db);

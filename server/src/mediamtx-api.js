@@ -87,6 +87,7 @@ export class MediaMtxMonitor extends EventEmitter {
   }
 
   async #poll() {
+    let next;
     try {
       // itemsPerPage is generous: one entry per concurrent stream.
       const res = await fetch(`${this.#apiUrl}/v3/paths/list?itemsPerPage=1000`, {
@@ -95,7 +96,7 @@ export class MediaMtxMonitor extends EventEmitter {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const body = await res.json();
 
-      const next = new Map();
+      next = new Map();
       for (const item of body.items ?? []) {
         next.set(item.name, {
           name: item.name,
@@ -107,20 +108,39 @@ export class MediaMtxMonitor extends EventEmitter {
           bytesSent: item.bytesSent ?? 0,
         });
       }
-
-      this.#paths = next;
-      if (!this.#reachable) {
-        this.#reachable = true;
-        this.#warned = false;
-        this.emit('up');
-      }
-      this.emit('paths', next);
     } catch (err) {
       this.#paths = new Map();
       if (this.#reachable || !this.#warned) {
         this.#reachable = false;
         this.#warned = true;
-        this.emit('down', err);
+        this.#tell('down', err);
+      }
+      return;
+    }
+
+    /*
+     * Outside the try above, and each in a try of its own. Inside it, a
+     * listener that threw -- the stream list, say -- was taken for MediaMTX
+     * going away: the paths emptied, the server reported the relay down and
+     * refused every new stream until the next poll that happened not to
+     * throw. What a listener does with the answer is not whether there was one.
+     */
+    this.#paths = next;
+    if (!this.#reachable) {
+      this.#reachable = true;
+      this.#warned = false;
+      this.#tell('up');
+    }
+    this.#tell('paths', next);
+  }
+
+  /** emit(), one listener at a time, so one that throws does not skip the rest. */
+  #tell(event, ...args) {
+    for (const listener of this.listeners(event)) {
+      try {
+        listener.apply(this, args);
+      } catch (err) {
+        console.warn(`[mediamtx] a "${event}" listener failed: ${err?.stack ?? err}`);
       }
     }
   }

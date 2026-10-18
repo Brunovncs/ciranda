@@ -155,8 +155,13 @@ export class Accounts {
       ),
       // A banned account's sessions are dropped when it is banned; this is
       // what still refuses one that slipped in between.
+      //
+      // Named columns, never u.*: this row is req.user for the request and
+      // client.user for the whole life of a socket, and the password hash has
+      // no business sitting in either. Whatever needs it asks byId().
       findSession: db.prepare(
-        'SELECT u.*, s.token_hash, s.last_seen AS session_seen FROM sessions s JOIN users u ON u.id = s.user_id '
+        'SELECT u.id, u.nickname, u.display_name, u.role, u.avatar_hash, u.created_at, u.banned_at, '
+        + 's.token_hash, s.last_seen AS session_seen FROM sessions s JOIN users u ON u.id = s.user_id '
         + 'WHERE s.token_hash = ? AND u.banned_at IS NULL',
       ),
       touchSession: db.prepare('UPDATE sessions SET last_seen = ? WHERE token_hash = ?'),

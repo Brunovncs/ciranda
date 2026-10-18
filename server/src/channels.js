@@ -28,8 +28,9 @@ export const MEDIA_KINDS = { voice: 'v', cam: 'c', screen: 's' };
  * channel hands a slot out on join and keeps it for as long as that person is
  * in the channel, which buys three things: paths stay short and fixed-shape, a
  * reconnecting member reclaims the same slot so subscribers see "the path I was
- * watching came back" instead of needing a roster diff, and a force-mute sticks
- * to the slot across a reconnect.
+ * watching came back" instead of needing a roster diff. A force-mute is kept
+ * by person rather than on the slot (see VoiceRooms), so it sticks across a
+ * reconnect whichever slot they come back to.
  */
 export const channelPath = (cid, mid, kind) =>
   `vc-${cid.toString(36)}-${mid.toString(36)}-${MEDIA_KINDS[kind] ?? kind}`;
@@ -97,12 +98,22 @@ export const TOKEN_FLAGS = { channel: 'rw', call: 'dm' };
 /**
  * A per-member, per-channel capability token.
  *
- *   h1.<cid36>.<mid36>.<flags>.<exp36>.<sig>
+ *   h2.<cid36>.<mid36>.<uid36>.<flags>.<exp36>.<sig>
  *
  * One token serves both reading and publishing; the path comparison in the auth
  * hook is what distinguishes them. Reads only need the channel to match, so any
  * member can watch any other member. Publishing additionally requires the slot
  * to match, so nobody can publish into somebody else's path.
+ *
+ * `uid` is who it was issued to. A slot is handed to the next person once its
+ * holder leaves, and h1 -- the same token without it -- went on opening that
+ * slot for whoever held the token, for the rest of its ten minutes: somebody
+ * who had left could publish into the path of the person who took their place,
+ * and somebody banned, or shut out by a new channel password, could go on
+ * watching. The auth hook now holds the claim against who has the slot NOW.
+ * An h1 token is refused outright: every client takes new ones when it
+ * rejoins after the restart that installs this, and the client only ever
+ * passes a token through, never reads it.
  *
  * The signing secret is PERSISTED rather than generated per process, which
  * fixes the weakness the flat `mediaToken` still has: today every restart
@@ -125,9 +136,9 @@ export function channelSecret(metaStore) {
 const sign = (secret, body) =>
   createHmac('sha256', secret).update(body).digest('base64url').slice(0, 22);
 
-export function mintChannelToken(secret, { cid, mid, flags = 'rw', ttlMs = TOKEN_TTL_MS }) {
+export function mintChannelToken(secret, { cid, mid, uid, flags = 'rw', ttlMs = TOKEN_TTL_MS }) {
   const exp = Math.floor((Date.now() + ttlMs) / 1000).toString(36);
-  const body = `h1.${cid.toString(36)}.${mid.toString(36)}.${flags}.${exp}`;
+  const body = `h2.${cid.toString(36)}.${mid.toString(36)}.${uid.toString(36)}.${flags}.${exp}`;
   return `${body}.${sign(secret, body)}`;
 }
 
@@ -140,10 +151,10 @@ export function mintChannelToken(secret, { cid, mid, flags = 'rw', ttlMs = TOKEN
  */
 export function readChannelToken(secret, token) {
   const parts = String(token ?? '').split('.');
-  if (parts.length !== 6 || parts[0] !== 'h1') return null;
+  if (parts.length !== 7 || parts[0] !== 'h2') return null;
 
-  const [, cid36, mid36, flags, exp36, offered] = parts;
-  const body = `h1.${cid36}.${mid36}.${flags}.${exp36}`;
+  const [, cid36, mid36, uid36, flags, exp36, offered] = parts;
+  const body = `h2.${cid36}.${mid36}.${uid36}.${flags}.${exp36}`;
   const expected = sign(secret, body);
   const a = Buffer.from(offered);
   const b = Buffer.from(expected);
@@ -155,6 +166,7 @@ export function readChannelToken(secret, token) {
   return {
     cid: Number.parseInt(cid36, 36),
     mid: Number.parseInt(mid36, 36),
+    uid: Number.parseInt(uid36, 36),
     flags,
     expiresAt: exp * 1000,
   };
@@ -453,6 +465,11 @@ export class Channels {
   hasGrant(channelId, userId) {
     return Boolean(this.#q.hasGrant.get(channelId, userId));
   }
+
+  /** Let somebody in without asking them for the password. */
+  grant(channelId, userId) {
+    this.#q.grant.run(channelId, userId, Date.now());
+  }
 }
 
 export const publicChannel = (c) => (c ? {
@@ -489,6 +506,21 @@ export const VOICE_HARD_CAP = 16;
 export class VoiceRooms {
   /** @type {Map<number, Map<number, {userId: number, nickname: string, muted: boolean, forceMuted: boolean, publishing: Set<string>}>>} */
   #rooms = new Map();
+
+  /**
+   * Who is force-muted where, by user rather than by slot.
+   *
+   * On the slot alone a force-mute lasted exactly as long as the slot: leave
+   * and come back, or let the socket drop and reconnect, and the new slot
+   * started out unmuted. So the mute is kept here, outlives the slot, and is
+   * put back on whichever slot the person takes next. Only an admin lifting
+   * it, the channel being deleted, or the account being removed ends it.
+   * Still live state, never written down: a restart forgets it, as it
+   * forgets everybody's slot.
+   *
+   * @type {Map<number, Set<number>>} by channel id: user ids
+   */
+  #forceMuted = new Map();
 
   #micLocked;
 
@@ -546,7 +578,7 @@ export class VoiceRooms {
        * listening, and there is no way to tell those apart afterwards.
        */
       deafened: false,
-      forceMuted: false,
+      forceMuted: Boolean(this.#forceMuted.get(channelId)?.has(user.id)),
       publishing: new Set(),
     };
     room.set(mid, member);
@@ -570,6 +602,8 @@ export class VoiceRooms {
   closeRoom(channelId) {
     const room = this.#rooms.get(channelId);
     this.#rooms.delete(channelId);
+    // A new channel can be given the same id, and must not inherit its mutes.
+    this.#forceMuted.delete(channelId);
     return room ? [...room.entries()].map(([mid, m]) => ({ mid, userId: m.userId })) : [];
   }
 
@@ -670,7 +704,26 @@ export class VoiceRooms {
     const member = this.slot(channelId, mid);
     if (!member) return false;
     member.forceMuted = Boolean(forceMuted);
+    let muted = this.#forceMuted.get(channelId);
+    if (member.forceMuted) {
+      if (!muted) this.#forceMuted.set(channelId, muted = new Set());
+      muted.add(member.userId);
+    } else if (muted) {
+      muted.delete(member.userId);
+      if (muted.size === 0) this.#forceMuted.delete(channelId);
+    }
     return true;
+  }
+
+  /**
+   * Forget somebody's force-mutes everywhere: their account is gone, and
+   * SQLite may hand its id to the next person to register.
+   */
+  forgetUser(userId) {
+    for (const [channelId, muted] of this.#forceMuted) {
+      muted.delete(userId);
+      if (muted.size === 0) this.#forceMuted.delete(channelId);
+    }
   }
 
   /** Force-muted, or silenced by the channel's lock: either refuses the publish. */

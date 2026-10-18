@@ -392,16 +392,18 @@ describe('server settings', () => {
     assert.equal(res.body.server.passwordRequired, was.passwordRequired);
   });
 
-  it('say when the media relay is out of step', async () => {
+  it('put the door on the media relay too, with no restart', async () => {
     // This server booted open, so turning the password on is exactly the
-    // case where MediaMTX keeps its boot-time stance until a restart.
+    // case that used to leave the legacy streams open until a restart.
+    const legacyRead = () => api('/mediamtx/auth', { method: 'POST', body: { action: 'read', path: 'somebody', query: '' } });
+    assert.equal((await legacyRead()).status, 204, 'open, as the server is');
     const res = await api('/api/server', {
       method: 'POST', body: { password: 'letmeinplease' }, token: ownerToken,
     });
     assert.equal(res.status, 200);
     assert.equal(res.body.server.passwordRequired, true);
-    assert.equal(res.body.server.restartRequired, true,
-      'saying so is better than hoping nobody notices');
+    assert.equal(res.body.server.restartRequired, false, 'nothing is left waiting for one');
+    assert.equal((await legacyRead()).status, 401, 'no watching without the watch token');
   });
 
   it('CLOSE THE DOOR IMMEDIATELY, token or no token', async () => {
@@ -444,6 +446,8 @@ describe('server settings', () => {
     assert.equal(res.status, 200);
     assert.equal(res.body.server.passwordRequired, false);
     assert.equal((await api('/api/accounts', { token: ownerToken })).status, 200);
+    const read = await api('/mediamtx/auth', { method: 'POST', body: { action: 'read', path: 'somebody', query: '' } });
+    assert.equal(read.status, 204, 'and the relay opens with it');
   });
 
   it('SURVIVE A RESTART', async () => {

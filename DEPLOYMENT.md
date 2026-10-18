@@ -58,7 +58,7 @@ the bar is low and the architecture does not matter.
 | OS | Debian 12+, Ubuntu 22.04+, Raspberry Pi OS Bookworm, or anything systemd-based close to them |
 | RAM | 512 MB is comfortable — nothing is buffered server-side |
 | Disk | ~150 MB installed. Nothing is recorded. |
-| Node | 20.6 or newer — the installer fetches Node 22 if none is present |
+| Node | 24 or newer — the installer fetches Node 24 if none is present |
 | A domain | Needed for TLS. A dynamic-DNS name is fine; keep it updated (`ddclient` works well). |
 
 **Run in production on a Raspberry Pi 5** (8 GB, Ubuntu 26.04 aarch64). The relay
@@ -112,7 +112,7 @@ sudo ./install.sh
 
 The installer is safe to re-run. It:
 
-- picks the MediaMTX build matching `uname -m` and installs **v1.21.0** to
+- picks the MediaMTX build matching `uname -m` and installs **v1.21.2** to
   `/usr/local/bin/mediamtx` (pinned deliberately — MediaMTX removes config keys
   between releases, and an unknown key aborts startup);
 - installs the control server to `/opt/harmony` with `npm ci --omit=dev`;
@@ -596,7 +596,11 @@ guessing.
   authenticated as. Passwords are scrypt-hashed (N=16384), session tokens are
   random 256-bit values stored only as sha256. Until the first account is
   registered the old anonymous flow still works, so an upgraded server does not
-  lock anyone out mid-call.
+  lock anyone out mid-call. Wrong account passwords lock out the address
+  guessing at that nickname (the same ladder as the door), with a ceiling ten
+  times higher on the nickname alone, so nobody can keep the owner locked out
+  from their own connection; and signing up or in is paced per address, since
+  each attempt costs a scrypt.
 - **The owner key is printed to stdout on first start, once.** Anyone who can
   read the log can claim ownership, so claim it immediately. It is not
   regenerated and not reprinted once an owner exists.
@@ -605,13 +609,19 @@ guessing.
   the MediaMTX auth hook checks channel paths *before* the legacy branches —
   otherwise a client holding the process-wide watch token could listen to a
   locked channel, and on a server with no `HARMONY_PASSWORD` a channel password
-  would mean nothing at all.
+  would mean nothing at all. The token names who it was issued to, and the hook
+  refuses it once that person no longer holds the slot, is banned, or has lost
+  the channel's grant -- it does not wait out the token's ten minutes. Private
+  calls work the same way.
 - **Admin force-mute is enforced by refusing the publish**, not by kicking the
   session. Kicking stops the audio within ~3 seconds but the path is
-  immediately re-publishable, so the refusal is what makes it stick.
+  immediately re-publishable, so the refusal is what makes it stick. It is kept
+  by person, so leaving and rejoining, or reconnecting, does not shake it off;
+  only an admin lifting it does (or a server restart).
 - **Uploads are capped four ways**: a largest file the owner sets in Server
   settings (25 MB until they do, 2 GB at most; anything over 25 MB goes up in
-  8 MB pieces), an allowlist of content types (no HTML or scripts, ever),
+  8 MB pieces, and one person's uploads in progress hold no more room between
+  them than that largest file), an allowlist of content types (no HTML or scripts, ever),
   `HARMONY_MAX_DISK_BYTES` (2 GB default) for the total, and
   `HARMONY_DISK_RESERVE_BYTES` (512 MB default) of free disk that uploads never
   take, whatever the total says. The last two are not optional on an SD card:

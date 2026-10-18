@@ -347,7 +347,11 @@ export class Realtime {
       return this.#send(ws, { type: 'voice:error', rid: msg.rid, error: 'not_here' });
     }
 
-    const handler = this.#handlers[msg.type];
+    // Own keys only. `{"type":"constructor"}` used to find Object on the
+    // prototype, call it with the user row, and send the row back -- password
+    // hash and session hash included.
+    const handlers = this.#handlers;
+    const handler = typeof msg.type === 'string' && Object.hasOwn(handlers, msg.type) ? handlers[msg.type] : null;
     if (!handler) return this.#send(ws, { type: 'error', rid: msg.rid, error: 'unknown_type' });
 
     const reply = await handler.call(this, client.user, msg, ws);
@@ -472,7 +476,8 @@ export class Realtime {
         this.#owedRosters.add(key);
         setTimeout(() => {
           this.#owedRosters.delete(key);
-          place.announce();
+          // From a timer, where nothing would catch a throw but the process.
+          try { place.announce(); } catch (err) { console.warn(`[ws] owed roster failed: ${err.message}`); }
         }, 1000).unref();
       }
     }
@@ -875,7 +880,9 @@ export class Realtime {
       if (!client.user || client.scope !== 'full') continue;
       if (!byHost.has(client.host)) byHost.set(client.host, { streams: streamsFor(client.host) });
       const forHost = byHost.get(client.host);
-      if (ws.readyState !== ws.OPEN) continue;
+      // The same test as every other broadcast: a client not reading is hung
+      // up on rather than buffered for.
+      if (!this.#writable(ws)) continue;
       // Stringified once per Host too, the same way #fanOut does it.
       try {
         ws.send(forHost.text ??= JSON.stringify({ type: 'streams', streams: forHost.streams }));
@@ -887,10 +894,17 @@ export class Realtime {
     return this.#clients.size;
   }
 
+  /**
+   * Hang up on everybody, for shutdown. A close frame first, so a client
+   * reads it as the server going away; a second later the socket is cut
+   * whether or not the other end answered, since one that never does would
+   * otherwise hold the shutdown open until ws gives up on it half a minute on.
+   */
   close() {
     clearInterval(this.#timer);
     for (const ws of this.#clients.keys()) {
       try { ws.close(1001, 'server shutting down'); } catch { /* already gone */ }
+      setTimeout(() => ws.terminate(), 1000).unref();
     }
     this.#clients.clear();
     this.#wss.close();
