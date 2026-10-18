@@ -15,6 +15,15 @@
 #ifndef DataDir
   #define DataDir "{userappdata}\Ciranda"
 #endif
+; x64, or arm64 for Windows on Arm (/DArch=arm64).
+#ifndef Arch
+  #define Arch "x64"
+#endif
+#if Arch == "arm64"
+  #define Allowed "arm64"
+#else
+  #define Allowed "x64compatible"
+#endif
 #define Root ".."
 
 [Setup]
