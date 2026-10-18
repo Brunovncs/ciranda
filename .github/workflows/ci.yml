@@ -8,6 +8,8 @@ name: CI
 # below).
 on:
   push:
+    # Both filters: with tags-ignore alone, GitHub runs nothing for branch pushes at all.
+    branches: ["**"]
     tags-ignore: ["v*"]
   pull_request:
 
