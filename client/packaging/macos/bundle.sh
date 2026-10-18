@@ -6,16 +6,33 @@
 # given) and its SHA-256 beside it, in the same form as the Windows release files. The disk image
 # holds the app and a link to /Applications, so installing is dragging one onto the other.
 #
-# The app is signed ad-hoc, with no identity, and not notarized: there is no Apple Developer ID.
-# Apple Silicon refuses to run unsigned code, and an ad-hoc signature also seals Info.plist and
-# the icon. It is signed without the hardened runtime, which only notarization asks for; with it,
-# the microphone and camera would also need entitlements, and without it they need none, so there
-# is no entitlements file. Gatekeeper still blocks an app downloaded unnotarized: on first launch
-# people right-click Ciranda and choose Open (on macOS 15 and later, open it once, then System
-# Settings > Privacy & Security > Open Anyway), or run
+# LICENSE, THIRD_PARTY_NOTICES.md and THIRD_PARTY_LICENSES.txt (the crates' licences, written by
+# cargo-about: see about.toml) go in Contents/Resources. The last is read from
+# target/THIRD_PARTY_LICENSES.txt, or from $CIRANDA_LICENSES.
+#
+# The app is not notarized: there is no Apple Developer ID. It is signed, which Apple silicon needs
+# to run anything at all and which seals Info.plist, the icon and the licences, by one of:
+# - CIRANDA_SIGN_IDENTITY, a certificate's SHA-1 or name in a keychain on the search list.
+#   release.yml imports the self-signed "Ciranda Self-Signed Code Signing" there from the
+#   MACOS_SIGN_P12 secret. The signature's designated requirement then names that certificate,
+#   the same in every release, so macOS keeps the microphone, camera and screen permissions
+#   across updates.
+# - Otherwise ad-hoc, with no identity (forks, pull requests, a build at home). That requirement
+#   is the build's own hash, so after each update macOS asks for all three again.
+# Either way with the hardened runtime and ciranda.entitlements: the hardened runtime refuses the
+# microphone and the camera, without asking the person, to a program that doesn't claim them, and
+# that file claims those two and nothing more. libwebrtc is linked in and generates no code at run
+# time, GPUI's Metal shaders are compiled by the system's own service, and no library but the
+# system's is loaded, so JIT, unsigned executable memory and disabled library validation would
+# only widen what injected code could do. (An old-style virtual camera, a CoreMediaIO plug-in
+# loaded into each app, is refused for that reason; camera extensions run on their own and work.)
+# No secure timestamp: Apple's service is for certificates Apple issued, and nothing checks one
+# without notarization.
+#
+# Gatekeeper still blocks an app downloaded unnotarized: on first launch people right-click
+# Ciranda and choose Open (on macOS 15 and later, open it once, then System Settings > Privacy &
+# Security > Open Anyway), or run
 #   xattr -dr com.apple.quarantine /Applications/Ciranda.app
-# An ad-hoc signature changes with every build, so macOS asks again for the microphone, the camera
-# and the screen after each update.
 set -euo pipefail
 
 usage() {
@@ -36,9 +53,14 @@ arch=${4:-universal}
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 plist_template="$script_dir/Info.plist"
+entitlements="$script_dir/ciranda.entitlements"
 icon_png="$script_dir/../../assets/icon.png"
+licenses=${CIRANDA_LICENSES:-$script_dir/../../target/THIRD_PARTY_LICENSES.txt}
+identity=${CIRANDA_SIGN_IDENTITY:--}
 [ -f "$plist_template" ] || { echo "No Info.plist at $plist_template" >&2; exit 1; }
+[ -f "$entitlements" ] || { echo "No entitlements at $entitlements" >&2; exit 1; }
 [ -f "$icon_png" ] || { echo "No icon at $icon_png" >&2; exit 1; }
+[ -f "$licenses" ] || { echo "No crate licences at $licenses: run cargo about generate (see about.toml)" >&2; exit 1; }
 
 mkdir -p "$out_dir"
 out_dir=$(cd "$out_dir" && pwd)
@@ -71,10 +93,26 @@ for size in 16 32 128 256 512; do
 done
 iconutil -c icns "$iconset" -o "$app/Contents/Resources/ciranda.icns"
 
+cp "$script_dir/../../../LICENSE" "$app/Contents/Resources/LICENSE"
+cp "$script_dir/../../THIRD_PARTY_NOTICES.md" "$app/Contents/Resources/THIRD_PARTY_NOTICES.md"
+cp "$licenses" "$app/Contents/Resources/THIRD_PARTY_LICENSES.txt"
+
 # Extended attributes picked up on the way (quarantine, Finder info) make codesign refuse the bundle.
 xattr -cr "$app"
-codesign --force --deep --sign - "$app"
+sign() {
+  codesign --force --options runtime --timestamp=none --sign "$identity" "$@"
+}
+# Inside out, and not with --deep, which would hand the app's entitlements to everything nested:
+# frameworks, plug-ins and helpers first (there are none today; the program is one file), then the
+# app, which signs its executable with it.
+while IFS= read -r -d '' nested; do
+  sign "$nested"
+done < <(find "$app/Contents" -mindepth 2 \( -name '*.dylib' -o -name '*.framework' -o -name '*.bundle' -o -name '*.app' -o -name '*.xpc' \) -prune -print0)
+sign --entitlements "$entitlements" "$app"
 codesign --verify --deep --strict --verbose=2 "$app"
+# What macOS will hold the permissions to, and what the program claims.
+codesign --display --requirements - "$app"
+codesign --display --entitlements - "$app"
 lipo -info "$app/Contents/MacOS/ciranda"
 
 ln -s /Applications "$work/stage/Applications"

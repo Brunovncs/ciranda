@@ -1,0 +1,10 @@
+# The Rust every build of the client uses, here and in CI, so a new stable release never changes
+# what CI checks (clippy's lints, rustfmt's output) on its own. At the repository root, beside
+# .cargo/config.toml, so rustup finds it from client/ and from anywhere else in the tree. Moving it
+# is a change like any other: bump the version, fix what the new clippy flags, and the release
+# cache warms again from main. CI adds the extra targets it needs (macOS's second architecture)
+# on top of this.
+[toolchain]
+channel = "1.97.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

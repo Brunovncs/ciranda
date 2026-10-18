@@ -1,6 +1,7 @@
 # Third-party material in the client
 
-Everything here ships inside `ciranda.exe`.
+Everything here ships inside the program: `ciranda.exe` on Windows, the AppImage on Linux and
+`Ciranda.app` on macOS.
 
 | What | Where | Licence |
 | --- | --- | --- |
@@ -17,8 +18,12 @@ and the camera backgrounds in `assets/backgrounds/` by `examples/backgrounds.rs`
 `soundboard` and `blur` shapes in `src/icons.rs`, are original to this repository and
 covered by its MIT licence.
 
-Rust crates are listed with their licences in `Cargo.lock`; `cargo about` or `cargo license`
-produces the full list.
+The Rust crates the program is built from, each with its licence's full text, are in
+`THIRD_PARTY_LICENSES.txt`, which every package carries beside this file and `LICENSE`: in the
+install folder on Windows, in `usr/share/doc/ciranda/` inside the AppImage and in
+`Ciranda.app/Contents/Resources` on macOS. The release workflow generates it from `Cargo.lock` with
+cargo-about (`about.toml`, `about.hbs`); `cargo deny check licenses` (`deny.toml`) keeps every
+crate to the licences listed there.
 
 ## Lucide licence
 

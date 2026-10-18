@@ -1,0 +1,71 @@
+# cargo-deny, run by CI from client/: `cargo deny --locked check`. It checks every crate in
+# Cargo.lock that reaches one of the programs Ciranda ships against the RustSec advisories, the
+# licences below, duplicate and wildcard dependencies, and where crates come from.
+# An ignore here needs a reason, and goes when the reason does.
+
+[graph]
+# The platforms Ciranda is built for; crates only Android or the web would pull in are left out.
+targets = [
+  "x86_64-pc-windows-msvc",
+  "aarch64-pc-windows-msvc",
+  "x86_64-unknown-linux-gnu",
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+]
+all-features = false
+
+[advisories]
+# Unmaintained crates are reported wherever they sit in the tree; the ones below are deep in GPUI,
+# which is pinned exactly (=0.3.7, vendor/GPUI_VENDORED.md), so they leave with a GPUI update.
+unmaintained = "all"
+yanked = "deny"
+ignore = [
+  # paste: a proc macro run at build time, through metal and core-video (GPUI on macOS). No code
+  # of it is in the program.
+  { id = "RUSTSEC-2024-0436", reason = "build-time proc macro, through GPUI's metal; goes with a GPUI update" },
+  # rustybuzz and ttf-parser: font shaping and parsing in GPUI's SVG (usvg) and Linux text
+  # (cosmic-text) stacks. The fonts are Ciranda's own, the SVGs its own icons.
+  { id = "RUSTSEC-2026-0206", reason = "rustybuzz unmaintained, through GPUI's usvg; only Ciranda's own icons and fonts reach it" },
+  { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained, through GPUI's usvg and cosmic-text; only Ciranda's own and system fonts reach it" },
+  # zbus's helper crates, folded back into zbus upstream; through GPUI's Linux accessibility
+  # (accesskit_unix, atspi).
+  { id = "RUSTSEC-2026-0370", reason = "zvariant folded into zbus upstream, through GPUI's accesskit_unix" },
+  { id = "RUSTSEC-2026-0371", reason = "zbus_names folded into zbus upstream, through GPUI's accesskit_unix" },
+  { id = "RUSTSEC-2026-0372", reason = "zvariant_derive folded into zbus upstream, through GPUI's accesskit_unix" },
+]
+
+[licenses]
+# Every licence some crate needs, and no more: cargo-deny says when one is no longer used. MPL-2.0
+# (symphonia, dwrote) asks for its files' sources to stay available, which crates.io does.
+allow = [
+  "0BSD",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "CC0-1.0",
+  "ISC",
+  "MIT",
+  "MIT-0",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+  "bzip2-1.0.6",
+]
+confidence-threshold = 0.93
+
+[bans]
+# Many crates come in two versions through GPUI and wgpu; worth seeing, not worth failing over.
+multiple-versions = "warn"
+wildcards = "deny"
+# The patched crates in vendor/ are path dependencies; Cargo.toml still asks for their versions.
+allow-wildcard-paths = true
+highlight = "simplest-path"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

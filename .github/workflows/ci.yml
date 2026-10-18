@@ -1,10 +1,14 @@
 name: CI
 
-# Every push and pull request: the server's tests on Linux, where it is deployed, and the
-# client's on Windows, Linux and macOS. Nothing is published; that is release.yml, on a tag. On main the client is also built for release, only to keep a
-# release-profile cache warm for the next tag (see release-cache below).
+# Every push and pull request: the server's tests on Linux, where it is deployed, and its Docker
+# image for both architectures it is published for; the client's tests, lints and a start of the
+# program on Windows, Linux and macOS, and its dependencies checked. Nothing is published; that is
+# release.yml, on a tag, which is why tag pushes don't run this again. On main the client is also
+# built for release, only to keep a release-profile cache warm for the next tag (see release-cache
+# below).
 on:
   push:
+    tags-ignore: ["v*"]
   pull_request:
 
 permissions:
@@ -14,6 +18,13 @@ permissions:
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
+
+# What dtolnay/rust-toolchain used to set: a CI build is built once, so incremental artifacts
+# would only make the cache bigger. The release jobs set the same, which keeps the cache keys
+# (built from CARGO_* among others) the same as theirs.
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
 
 jobs:
   server:
@@ -33,6 +44,70 @@ jobs:
       - run: npm ci --no-audit --no-fund
       - run: npm test
 
+  # The image docker/ builds, for x86-64 and for arm64 (a Raspberry Pi) under QEMU, so a change
+  # that breaks either shows here and not on someone's server. Built, never pushed; the layers
+  # go to the Actions cache, so an unchanged Dockerfile and package-lock.json cost little.
+  server-docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: server
+          platforms: linux/amd64,linux/arm64
+          push: false
+          cache-from: type=gha,scope=server
+          cache-to: type=gha,scope=server,mode=max
+
+  # Formatting, as client/rustfmt.toml has it. Only the client's own code: the crates in vendor/
+  # keep their upstream formatting.
+  client-fmt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      # The toolchain rust-toolchain.toml pins, with its clippy and rustfmt.
+      - run: rustup toolchain install
+      - run: cargo fmt --check
+
+  # Every crate the client ships, against the RustSec advisories and the licences, duplicates and
+  # sources deny.toml allows; then the licence file the packages carry, so a crate cargo-about
+  # can't place fails here and not in a release. Neither builds anything. The two tools are
+  # downloaded from their releases and checked against pinned hashes; bump version and hash
+  # together.
+  client-deps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - run: rustup toolchain install
+      - name: cargo-deny and cargo-about
+        run: |
+          fetch() {
+            curl -fsSL --retry 3 -o "$RUNNER_TEMP/$1.tar.gz" "https://github.com/EmbarkStudios/$1/releases/download/$2/$1-$2-x86_64-unknown-linux-musl.tar.gz"
+            echo "$3  $RUNNER_TEMP/$1.tar.gz" | sha256sum -c --quiet -
+            tar -xzf "$RUNNER_TEMP/$1.tar.gz" -C "$HOME/.cargo/bin" --strip-components=1 "$1-$2-x86_64-unknown-linux-musl/$1"
+          }
+          fetch cargo-deny 0.20.2 9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
+          fetch cargo-about 0.9.2 9099a59e820c38a68b9d65f300662a567d56562f9a10f6aa4c7e86c17c2566af
+      - name: cargo deny
+        run: cargo deny --locked check
+      - name: Crate licences
+        run: |
+          cargo fetch --locked
+          cargo about generate --locked --fail -o target/THIRD_PARTY_LICENSES.txt about.hbs
+
   client:
     # MSVC: libwebrtc ships built against the static CRT, which /.cargo/config.toml asks for.
     runs-on: windows-latest
@@ -42,9 +117,7 @@ jobs:
         working-directory: client
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-        with:
-          toolchain: stable
+      - run: rustup toolchain install
       # Not saved from a tag: a cache saved under a tag can only ever be restored by that tag.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -60,8 +133,23 @@ jobs:
       - name: Self-test
         timeout-minutes: 5
         run: ./target/debug/ciranda.exe --self-test
+      # Then all the way, as a person starts it: settings, the notification-area icon and the
+      # window, drawn by GPUI's DirectX renderer (on the runner's software adapter). It quits by
+      # itself once the window has been up for a moment (--smoke in src/main.rs).
+      - name: Smoke
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          $out = ./target/debug/ciranda.exe --smoke 2>&1 | Out-String
+          $out
+          if ($LASTEXITCODE -ne 0 -or $out -notmatch 'smoke: window opened') { throw "smoke failed (exit code $LASTEXITCODE)" }
+      # Last, so a lint doesn't hide whether the tests pass. Its own pass over the code
+      # (cargo check's metadata, not the build's objects), so it costs a few minutes more.
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
 
-  # Windows on Arm, built natively: libwebrtc's arm64 archive and GPUI's shaders for it.
+  # Windows on Arm, built natively: libwebrtc's arm64 archive and GPUI's shaders for it. No clippy:
+  # the code is Windows x64's, which the job above lints.
   client-windows-arm64:
     runs-on: windows-11-arm
     timeout-minutes: 90
@@ -70,9 +158,7 @@ jobs:
         working-directory: client
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-        with:
-          toolchain: stable
+      - run: rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: client
@@ -83,6 +169,13 @@ jobs:
       - name: Self-test
         timeout-minutes: 5
         run: ./target/debug/ciranda.exe --self-test
+      - name: Smoke
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          $out = ./target/debug/ciranda.exe --smoke 2>&1 | Out-String
+          $out
+          if ($LASTEXITCODE -ne 0 -or $out -notmatch 'smoke: window opened') { throw "smoke failed (exit code $LASTEXITCODE)" }
 
   # Ubuntu 22.04, as release.yml builds the AppImage on: its glibc is the oldest the AppImage
   # asks of a system. The self-test needs a display for GPUI, so it gets a virtual one.
@@ -94,18 +187,12 @@ jobs:
         working-directory: client
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-      - name: System libraries
-        run: sudo apt-get update -q && sudo apt-get install -yq --no-install-recommends $(cat packaging/linux/build-deps.txt)
-      # libwebrtc is built against Chromium's own libc++, which only a recent clang compiles.
-      - name: Clang 21
-        run: |
-          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
-          sudo bash /tmp/llvm.sh 21
-          echo "CC=clang-21" >> "$GITHUB_ENV"
-          echo "CXX=clang++-21" >> "$GITHUB_ENV"
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      # Mesa's Vulkan drivers bring lavapipe, a Vulkan that runs on the CPU, for the smoke test's
+      # window: the runner has no GPU.
+      - uses: ./.github/actions/linux-build-deps
         with:
-          toolchain: stable
+          extra: mesa-vulkan-drivers
+      - run: rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: client
@@ -116,6 +203,16 @@ jobs:
       - name: Self-test
         timeout-minutes: 5
         run: xvfb-run -a ./target/debug/ciranda --self-test
+      # The window on X11, drawn through wgpu on lavapipe. xvfb-run's own screen is 8 bits deep,
+      # which no Vulkan surface takes, hence the 24-bit one.
+      - name: Smoke
+        shell: bash
+        timeout-minutes: 5
+        run: |
+          xvfb-run -a -s "-screen 0 1920x1080x24" ./target/debug/ciranda --smoke 2>&1 | tee "$RUNNER_TEMP/smoke.log"
+          grep -q 'smoke: window opened' "$RUNNER_TEMP/smoke.log"
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
 
   client-macos:
     runs-on: macos-latest
@@ -125,9 +222,7 @@ jobs:
         working-directory: client
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-        with:
-          toolchain: stable
+      - run: rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: client
@@ -135,29 +230,52 @@ jobs:
           save-if: ${{ !startsWith(github.ref, 'refs/tags/') }}
       - run: cargo test --locked
       - run: cargo build --locked
+      # No smoke test here: the runners are virtual Macs without a GPU for Metal to draw on.
       - name: Self-test
         timeout-minutes: 5
         run: ./target/debug/ciranda --self-test
+      # The runner is newer than 14.2, so it loads either way; on 12.3 and 13 a strong reference
+      # to a process-tap function would stop the program before main.
+      - name: macOS 14.2 symbols are weak
+        run: |
+          refs="$(nm -m target/debug/ciranda | grep -E '_AudioHardware(Create|Destroy)ProcessTap' || true)"
+          echo "$refs"
+          [ -n "$refs" ] && ! grep -qv 'weak' <<<"$refs"
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
 
-  # A tag cannot restore a cache saved by another tag, and main's from the job above is for
+  # A tag cannot restore a cache saved by another tag, and main's from the jobs above are for
   # the dev profile, so every release used to build all its dependencies from nothing. Caches
   # saved on the default branch can be restored from any ref, tags included, so main builds
-  # for release here under the key release.yml restores (shared-key: release). With the cache
-  # already current this is one compile of the crate; it is cold only when Cargo.lock or the
-  # toolchain moves. The tests are built in the same profile because release.yml runs them
-  # with --release, so one cache serves both.
+  # for release here, for each of release.yml's jobs, under the key that job restores
+  # (shared-key: release; rust-cache adds the runner's OS and processor). The steps are that
+  # job's, so the cache holds exactly what it builds. With the cache already current this is one
+  # compile of the crate per platform; it is cold only when Cargo.lock or the toolchain moves.
+  # The tests are built in the same profile because release.yml runs them with --release, so one
+  # cache serves both.
   release-cache:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: windows-latest
-    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: windows-x64, runner: windows-latest }
+          - { platform: windows-arm64, runner: windows-11-arm }
+          - { platform: linux-x64, runner: ubuntu-22.04 }
+          - { platform: macos, runner: macos-latest }
+    name: release-cache (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
     defaults:
       run:
         working-directory: client
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-        with:
-          toolchain: stable
+      - if: matrix.platform == 'linux-x64'
+        uses: ./.github/actions/linux-build-deps
+      - run: rustup toolchain install
+      - if: matrix.platform == 'macos'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: client
@@ -165,5 +283,12 @@ jobs:
           # which the build would take as already extracted.
           prefix-key: v1-rust
           shared-key: release
-      - run: cargo test --release --locked --no-run
-      - run: cargo build --release --locked
+      - if: matrix.platform != 'macos'
+        run: |
+          cargo test --release --locked --no-run
+          cargo build --release --locked
+      - if: matrix.platform == 'macos'
+        run: |
+          cargo test --release --locked --no-run --target aarch64-apple-darwin
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin

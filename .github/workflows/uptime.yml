@@ -1,0 +1,49 @@
+name: Uptime
+
+# The servers seen from outside the house, every 15 minutes: the public name resolves, Caddy's
+# certificate is good, the control server answers and its MediaMTX is up. Everything inside the
+# box (a hung process, a dead MediaMTX) the container's own watchdog already handles; this is for
+# what it can't see: the line down, DuckDNS pointing elsewhere, the router's forward gone, the Pi
+# off. A failed run is mailed by GitHub to whoever last changed this schedule.
+#
+# The addresses are the secret UPTIME_URLS, one base URL per line
+# (https://name.duckdns.org:8444): this repository's logs are public, secrets are masked in them.
+on:
+  schedule:
+    - cron: "7,22,37,52 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Ask every server
+        env:
+          UPTIME_URLS: ${{ secrets.UPTIME_URLS }}
+        run: |
+          [ -n "$UPTIME_URLS" ] || { echo "no UPTIME_URLS secret: nothing to check"; exit 0; }
+          ask() {  # ask <base>: healthy, with MediaMTX up
+            curl -fsS --max-time 15 "${1%/}/api/health" | grep -q '"mediamtx":"up"'
+          }
+          down=0
+          n=0
+          while IFS= read -r url; do
+            url="$(printf '%s' "$url" | tr -d '[:space:]')"
+            [ -n "$url" ] || continue
+            n=$((n + 1))
+            # A blip is not an outage: a second try a minute later before calling it down.
+            if ask "$url" || { sleep 60; ask "$url"; }; then
+              echo "server $n: up"
+            else
+              echo "::error::server $n is down or its media server is (twice, a minute apart)"
+              down=1
+            fi
+          done <<< "$UPTIME_URLS"
+          exit "$down"

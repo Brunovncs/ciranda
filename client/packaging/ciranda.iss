@@ -15,7 +15,8 @@
 #ifndef DataDir
   #define DataDir "{userappdata}\Ciranda"
 #endif
-; x64, or arm64 for Windows on Arm (/DArch=arm64).
+; x64, or arm64 for Windows on Arm (/DArch=arm64). The x64 installer would also run on Arm, under
+; emulation, but turns people there to the Arm one instead (InitializeSetup below).
 #ifndef Arch
   #define Arch "x64"
 #endif
@@ -25,6 +26,10 @@
   #define Allowed "x64compatible"
 #endif
 #define Root ".."
+; The crates' licences, written by cargo-about (see about.toml) before this is built.
+#ifndef Licenses
+  #define Licenses Root + "\target\THIRD_PARTY_LICENSES.txt"
+#endif
 
 [Setup]
 ; core/install.rs names this key; change both together.
@@ -112,6 +117,8 @@ en.RemoveAllNote=Also deletes %1. Without your recovery code, your private messa
 pt.RemoveAllNote=Também apaga %1. Sem o código de recuperação, as mensagens privadas não poderão mais ser lidas.
 en.RemoveGo=Uninstall
 pt.RemoveGo=Desinstalar
+en.UseArm=This installer is for Intel and AMD processors, and this computer has an Arm processor. Ciranda has a version made for it: ciranda-%1-windows-arm64-setup.exe, on the same release page.%n%nOpen that page now?
+pt.UseArm=Este instalador é para processadores Intel e AMD, e este computador tem um processador Arm. Ciranda tem uma versão feita para ele: ciranda-%1-windows-arm64-setup.exe, na mesma página da versão.%n%nAbrir essa página agora?
 
 [Tasks]
 Name: "startmenuicon"; Description: "{cm:StartMenuIcon}"
@@ -121,6 +128,7 @@ Name: "desktopicon"; Description: "{cm:DesktopIcon}"
 Source: "{#Root}\{#Build}\ciranda.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Root}\..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#Root}\THIRD_PARTY_NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#Licenses}"; DestDir: "{app}"; DestName: "THIRD_PARTY_LICENSES.txt"; Flags: ignoreversion
 
 [InstallDelete]
 ; A shortcut left out on reinstall goes, so the choices made now are the ones that hold.
@@ -137,6 +145,9 @@ Type: files; Name: "{app}\ciranda.exe.trial"
 Type: files; Name: "{app}\ciranda.exe.old"
 Type: files; Name: "{app}\ciranda.exe.new"
 Type: files; Name: "{app}\ciranda.exe.trial"
+; Pictures and files downloaded before: a cache, which goes whether or not settings are kept.
+Type: filesandordirs; Name: "{localappdata}\Ciranda\media"
+Type: dirifempty; Name: "{localappdata}\Ciranda"
 
 [Icons]
 Name: "{userprograms}\Ciranda"; Filename: "{app}\ciranda.exe"; WorkingDir: "{app}"; Tasks: startmenuicon
@@ -187,6 +198,21 @@ begin
   if (CompareText(ExtractFileName(Target), 'harmony.exe') = 0) and (Pos('@harmonyclient', Lowercase(Target)) = 0) then
     DeleteFile(Link);
 end;
+
+#if Arch == "x64"
+// On Windows on Arm the x64 program would run emulated, slower, and its updater would keep
+// fetching x64 builds, so this points at the Arm installer and stops. Silent installs just stop.
+function InitializeSetup: Boolean;
+var
+  Code: Integer;
+begin
+  Result := not IsArm64;
+  if Result then
+    exit;
+  if SuppressibleMsgBox(FmtMessage(CustomMessage('UseArm'), ['{#Version}']), mbInformation, MB_YESNO, IDNO) = IDYES then
+    ShellExec('open', 'https://github.com/Brunovncs/ciranda/releases/tag/v{#Version}', '', '', SW_SHOWNORMAL, ewNoWait, Code);
+end;
+#endif
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin

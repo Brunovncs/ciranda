@@ -1,0 +1,53 @@
+# Weekly pull requests for what Ciranda depends on, each ecosystem's updates grouped into one or
+# two, so a week's worth is a handful of PRs that CI checks like any other. Security updates, when
+# they are turned on in the repository's settings, come on their own as soon as there is one.
+version: 2
+updates:
+  # The actions the workflows use, pinned to commits: Dependabot moves the commit and the
+  # "# vX" comment beside it together.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      actions:
+        patterns: ["*"]
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "CI"
+
+  # The client. Not updated here:
+  # - GPUI (gpui-pre*), pinned exactly (=0.3.7) because its API moves with Zed's; two of its crates
+  #   are patched in vendor/ (vendor/GPUI_VENDORED.md), so a new version is a port, done by hand.
+  # - webrtc-sys, vendored with a hardware encoder added (vendor/webrtc-sys/VENDORED.md), and the
+  #   libwebrtc crate, whose version decides which webrtc-sys it needs and so which libwebrtc
+  #   build (pinned by hash in that build.rs).
+  - package-ecosystem: cargo
+    directory: /client
+    schedule:
+      interval: weekly
+      day: monday
+    ignore:
+      - dependency-name: "gpui-pre*"
+      - dependency-name: "webrtc-sys"
+      - dependency-name: "libwebrtc"
+    groups:
+      # Patches and minors in one PR; a major version stays on its own, since it may need code.
+      rust-minor:
+        update-types: ["minor", "patch"]
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "Client"
+
+  - package-ecosystem: npm
+    directory: /server
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      npm-minor:
+        update-types: ["minor", "patch"]
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "Server"

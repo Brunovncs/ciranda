@@ -1,0 +1,38 @@
+# cargo-about, which writes the licences of every Rust crate in the program into the file each
+# package ships beside THIRD_PARTY_NOTICES.md (release.yml, the licenses job):
+#   cargo fetch --locked
+#   cargo about generate --locked --fail -o target/THIRD_PARTY_LICENSES.txt about.hbs
+# The licences accepted are deny.toml's; cargo deny is what fails CI over a new one, and this
+# then needs the same line.
+accepted = [
+  "0BSD",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "CC0-1.0",
+  "ISC",
+  "MIT",
+  "MIT-0",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+  "bzip2-1.0.6",
+]
+# deny.toml's platforms: one file for all of them, so each package lists a few crates it doesn't
+# contain rather than miss one it does.
+targets = [
+  "x86_64-pc-windows-msvc",
+  "aarch64-pc-windows-msvc",
+  "x86_64-unknown-linux-gnu",
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+]
+# Build scripts and proc macros run on the build machine and leave nothing of theirs in the
+# program; tests are not shipped.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+# Crates whose licence files cargo-about can't read on its own.
+workarounds = ["ring"]

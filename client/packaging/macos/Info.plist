@@ -3,7 +3,9 @@
   Info.plist for Ciranda.app, filled in by bundle.sh, which puts the version in for @VERSION@.
   The usage descriptions are not optional: macOS ends an app that reaches the microphone, the
   camera, the screen or the system's audio without one, instead of asking the person. The system
-  shows them in its permission prompts, so they say plainly what Ciranda does with each.
+  shows them in its permission prompts, so they say plainly what Ciranda does with each. macOS 15
+  also asks before an app reaches the local network (a server on the LAN, and WebRTC looking for
+  the shortest path to it), with NSLocalNetworkUsageDescription.
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -49,5 +51,7 @@
 	<string>Ciranda records the screens and windows you choose to share, so the people in your call can watch them.</string>
 	<key>NSAudioCaptureUsageDescription</key>
 	<string>Ciranda captures your computer's sound when you share your screen with audio, so the people in your call can hear it.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Ciranda connects to Ciranda servers and calls on your local network, such as a server running at home.</string>
 </dict>
 </plist>

@@ -1,0 +1,45 @@
+name: Linux build dependencies
+description: >
+  What the client needs to build on Ubuntu 22.04: the packages in
+  client/packaging/linux/build-deps.txt, and clang 21 from apt.llvm.org with CC and CXX pointing
+  at it. ci.yml and release.yml both use this, so the release cache CI warms is keyed on the same
+  compiler the release builds with.
+
+inputs:
+  extra:
+    description: More packages to install in the same apt run.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    # libwebrtc is built against Chromium's own libc++, which only a recent clang compiles; 22.04
+    # has clang 14. The repository's key is checked against the fingerprint LLVM publishes
+    # (https://apt.llvm.org) before apt trusts it, instead of piping llvm.sh into a root shell.
+    - name: Clang 21 from apt.llvm.org
+      shell: bash
+      run: |
+        set -euo pipefail
+        curl -fsSL --retry 3 -o "$RUNNER_TEMP/llvm.asc" https://apt.llvm.org/llvm-snapshot.gpg.key
+        fingerprint=$(gpg --show-keys --with-colons "$RUNNER_TEMP/llvm.asc" | awk -F: '$1 == "fpr" { print $10; exit }')
+        if [ "$fingerprint" != 6084F3CF814B57C1CF12EFD515CF4D18AF4F7421 ]; then
+          echo "apt.llvm.org's key has fingerprint $fingerprint, not the one pinned here" >&2
+          exit 1
+        fi
+        gpg --dearmor < "$RUNNER_TEMP/llvm.asc" | sudo tee /usr/share/keyrings/apt.llvm.org.gpg > /dev/null
+        echo "deb [signed-by=/usr/share/keyrings/apt.llvm.org.gpg] https://apt.llvm.org/jammy/ llvm-toolchain-jammy-21 main" \
+          | sudo tee /etc/apt/sources.list.d/apt.llvm.org.list > /dev/null
+    # clang and lld 21 as llvm.sh installed them, recommends included; the rest as before.
+    - name: Packages
+      shell: bash
+      env:
+        EXTRA: ${{ inputs.extra }}
+      run: |
+        set -euo pipefail
+        sudo apt-get update -q
+        sudo apt-get install -yq clang-21 lld-21
+        # shellcheck disable=SC2046,SC2086 # one package per word
+        sudo apt-get install -yq --no-install-recommends $(cat "$GITHUB_WORKSPACE/client/packaging/linux/build-deps.txt") $EXTRA
+        echo "CC=clang-21" >> "$GITHUB_ENV"
+        echo "CXX=clang++-21" >> "$GITHUB_ENV"

@@ -86,7 +86,8 @@ off.
 
 The same release has `ciranda-<version>-windows-arm64-setup.exe` and
 `ciranda-<version>-windows-arm64.exe`, built for Arm processors (Snapdragon and
-the like). They install and update the same way.
+the like). They install and update the same way. The x64 installer, started on
+an Arm computer, offers to open the release page for the Arm one instead.
 
 ### Client (macOS 12.3 or later, Apple silicon and Intel)
 
@@ -96,7 +97,9 @@ right-click Ciranda and choose **Open**, or on macOS 15 and later try once, then
 go to **System Settings → Privacy & Security** and click **Open Anyway**
 (`xattr -dr com.apple.quarantine /Applications/Ciranda.app` does the same). macOS
 asks for the microphone, the camera and screen recording the first time each is
-used. Settings live in `~/Library/Application Support/Ciranda`.
+used; the app is signed with the same certificate in every release, so those
+answers carry over to the next version. Settings live in
+`~/Library/Application Support/Ciranda`.
 
 ### Client (Linux, x86-64)
 
@@ -104,10 +107,14 @@ Download `ciranda-<version>-linux-x64.AppImage`, make it executable
 (`chmod +x`) and run it. It needs glibc 2.35 or newer (Ubuntu 22.04, Debian 12,
 Fedora 36 and later). On a Wayland desktop it runs through XWayland, which gives
 it a title bar everywhere; `CIRANDA_WAYLAND=1` runs it on Wayland itself, for
-desktops that draw title bars for their windows (KDE, not GNOME).
+desktops that draw title bars for their windows (KDE, not GNOME). The AppImage
+carries its update information, so
+[AppImageUpdate](https://github.com/AppImageCommunity/AppImageUpdate) (or a
+launcher built on it, such as Gear Lever or AppImageLauncher) brings it to the
+latest release, downloading only what changed.
 
-On macOS and Linux an update is a new download: the Update button opens the
-release's page. These are new, so a few things are still Windows only: the
+On macOS and Linux an update from inside Ciranda is a new download: the Update
+button opens the release's page. These are new, so a few things are still Windows only: the
 notification-area icon (closing the window quits), global hotkeys, sharing an
 app's sound, replays and the graphics card's H.264 encoder (video is encoded in
 software).
@@ -152,7 +159,19 @@ on Windows, Xcode's command line tools on macOS, or on Linux clang 21 or later
 cargo build --release --manifest-path client/Cargo.toml   # -> client/target/release/ciranda(.exe)
 ```
 
-A build made this way never replaces itself through the updater.
+rustup installs the Rust version `rust-toolchain.toml` pins, the one CI checks
+with, with its clippy and rustfmt; CI also wants `cargo fmt --check` and
+`cargo clippy --all-targets -- -D warnings` clean, and `cargo deny check`
+(`client/deny.toml`) passing. A build made this way never replaces itself
+through the updater.
+
+The packages (`client/packaging/`: the Inno Setup script, `linux/appimage.sh`,
+`macos/bundle.sh`) carry the crates' licences, written first with
+[cargo-about](https://github.com/EmbarkStudios/cargo-about), from `client/`:
+
+```bash
+cargo about generate --locked -o target/THIRD_PARTY_LICENSES.txt about.hbs
+```
 
 ## Built on
 

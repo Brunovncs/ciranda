@@ -1,3 +1,11 @@
 # libwebrtc ships built against the static CRT (/MT), so everything links against it too.
 [target.'cfg(all(windows, target_env = "msvc"))']
 rustflags = ["-C", "target-feature=+crt-static"]
+
+# The oldest macOS the app runs on, as LSMinimumSystemVersion in packaging/macos/Info.plist says:
+# libwebrtc links ScreenCaptureKit, which arrived in 12.3. rustc builds and links the program for
+# it, and the cc crate compiles webrtc-sys's C++ and Objective-C++ for it, instead of their own
+# defaults (11.0 on Apple silicon, 10.12 on Intel), which promised systems the program can't load
+# on. Other platforms ignore it. A value already in the environment wins.
+[env]
+MACOSX_DEPLOYMENT_TARGET = "12.3"

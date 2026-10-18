@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AppStream metadata for the AppImage, which appimage.sh installs as
+  usr/share/metainfo/io.github.brunovncs.ciranda.appdata.xml, beside ciranda.desktop installed as
+  io.github.brunovncs.ciranda.desktop: the AppImage tool looks for the metadata under the desktop
+  file's name and checks the two together with appstreamcli, which (0.15, on Ubuntu 22.04) fails
+  on any warning, an id that is not reverse-DNS or a file not named after its id among them. The
+  id is the one macOS uses too (CFBundleIdentifier in Info.plist). Software centres and AppImage
+  catalogues read it for the name, the description and the licence.
+-->
+<component type="desktop-application">
+  <id>io.github.brunovncs.ciranda</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Ciranda</name>
+  <summary>Voice, video and text chat with your friends</summary>
+  <summary xml:lang="pt-BR">Chat de voz, vídeo e texto com os seus amigos</summary>
+  <description>
+    <p>
+      Self-hosted voice, screen sharing and chat for a group of friends: voice channels with
+      screen and camera sharing, text channels, and private conversations and calls, on a
+      server you run.
+    </p>
+    <p xml:lang="pt-BR">
+      Voz, compartilhamento de tela e chat para um grupo de amigos, num servidor seu: canais de
+      voz com tela e câmera, canais de texto, e conversas e chamadas privadas.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.brunovncs.ciranda.desktop</launchable>
+  <provides>
+    <binary>ciranda</binary>
+  </provides>
+  <categories>
+    <category>Network</category>
+    <category>InstantMessaging</category>
+  </categories>
+  <url type="homepage">https://github.com/Brunovncs/ciranda</url>
+  <url type="bugtracker">https://github.com/Brunovncs/ciranda/issues</url>
+  <developer_name>Brunovncs</developer_name>
+  <content_rating type="oars-1.1">
+    <content_attribute id="social-chat">intense</content_attribute>
+    <content_attribute id="social-audio">intense</content_attribute>
+    <content_attribute id="social-contacts">intense</content_attribute>
+  </content_rating>
+</component>
