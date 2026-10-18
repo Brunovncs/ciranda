@@ -796,6 +796,7 @@ pub async fn watch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
     use libwebrtc::rtp_sender::VideoEncoderBackend as Backend;
 
     fn cap(mime: &str, fmtp: &str) -> RtpCodecCapability {

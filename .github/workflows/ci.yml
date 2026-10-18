@@ -108,6 +108,7 @@ jobs:
       - name: Crate licences
         run: |
           cargo fetch --locked
+          mkdir -p target
           cargo about generate --locked --fail -o target/THIRD_PARTY_LICENSES.txt about.hbs
 
   client:

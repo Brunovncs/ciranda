@@ -751,7 +751,8 @@ mod tests {
         for bad in ["", "Ctrl", "Ctrl+M+K", "F25", "num10", "Ctrl+Esc", "Ctrl+Banana"] {
             assert_eq!(Combo::parse(bad), None, "{bad}");
         }
-        assert_eq!(Combo::parse("Ctrl+Alt+numdec").unwrap().keycaps(), ["Ctrl", "Alt", "Num ."]);
+        let alt = if cfg!(target_os = "macos") { "Option" } else { "Alt" };
+        assert_eq!(Combo::parse("Ctrl+Alt+numdec").unwrap().keycaps(), ["Ctrl", alt, "Num ."]);
     }
 
     #[test]
