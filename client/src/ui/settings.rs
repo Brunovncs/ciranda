@@ -3,7 +3,7 @@
 //! are made, with no Save button.
 
 mod privacy;
-mod profile;
+pub(crate) mod profile;
 
 use crate::core::settings::{Background, CustomTheme, HotkeyAction};
 use crate::hotkeys::Combo;

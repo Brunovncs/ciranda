@@ -473,6 +473,8 @@ impl ServerView {
             .when(m.publishes("c"), |d| d.child(icon("camera", 13., t.text3)))
             .when(m.muted || m.silenced(), |d| d.child(icon("mic-off", 13., if m.force_muted { t.critical } else { t.text3 })))
             .when(m.deafened, |d| d.child(icon("headphones-off", 13., t.text3)))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| this.open_profile(this.session.clone(), user, e.position(), cx)))
             .when(!me, |d| {
                 d.on_mouse_down(
                     MouseButton::Right,

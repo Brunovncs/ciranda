@@ -92,6 +92,8 @@ pub enum ChatEvent {
     Call(Entity<Session>, ConversationId),
     /// Talk to this person on another server you are both on: the conversation there.
     Elsewhere(Entity<Session>, UserId),
+    /// Show this person's card, with its corner at the click.
+    Profile(Entity<Session>, UserId, gpui::Point<gpui::Pixels>),
 }
 
 pub struct ChatView {
@@ -1333,6 +1335,17 @@ impl ChatView {
         .detach();
     }
 
+    /// `el`, opening `user`'s card when clicked: their picture or their name in the log.
+    fn to_profile(&self, el: gpui::Stateful<gpui::Div>, user: Option<UserId>, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let Some(user) = user else { return el };
+        let session = self.session.clone();
+        el.cursor_pointer().on_click(cx.listener(move |_, e: &ClickEvent, _, cx| {
+            // Not a click on the message too: a second one there would start a reply.
+            cx.stop_propagation();
+            cx.emit(ChatEvent::Profile(session.clone(), user, e.position()));
+        }))
+    }
+
     /// Shows the thumbnail at once and swaps in the full picture when it has decoded.
     fn open_image(&mut self, image: Arc<RenderImage>, hash: String, name: String, how: Fetch, window: &mut Window, cx: &mut Context<Self>) {
         let chat = cx.entity().downgrade();
@@ -1561,7 +1574,19 @@ impl ChatView {
                         .flex()
                         .items_baseline()
                         .gap(px(8.))
-                        .child(div().text_size(px(14.)).font_weight(FontWeight::SEMIBOLD).text_color(t.text).child(name.clone()))
+                        .child(
+                            self.to_profile(
+                                div()
+                                    .id(("author-name", m.id as u64))
+                                    .text_size(px(14.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(t.text)
+                                    .hover(|s| s.underline())
+                                    .child(name.clone()),
+                                m.user_id,
+                                cx,
+                            ),
+                        )
                         .when(role == Some(Role::Owner), |d| d.child(icon("crown", 12., t.caution)))
                         .when(role == Some(Role::Admin), |d| d.child(icon("shield", 12., t.accent)))
                         .child(
@@ -1601,7 +1626,11 @@ impl ChatView {
                         .into_any_element()
                 })
             } else {
-                div().flex_none().pt(px(2.)).child(avatar(&name, avatar_img, 36., None))
+                div().flex_none().pt(px(2.)).child(self.to_profile(
+                    div().id(("author-picture", m.id as u64)).child(avatar(&name, avatar_img, 36., None)),
+                    m.user_id,
+                    cx,
+                ))
             })
             .child(content);
         div()
@@ -1929,7 +1958,7 @@ impl ChatView {
             .px(px(16.))
             .border_b_1()
             .border_color(t.stroke)
-            .child(div().relative().child(avatar(&name, img, 28., None)).when(!background, |d| {
+            .child(self.to_profile(div().id("dm-peer-picture").relative().child(avatar(&name, img, 28., None)), Some(peer), cx).when(!background, |d| {
                 d.child(
                     div()
                         .absolute()
@@ -1947,7 +1976,7 @@ impl ChatView {
                     .flex()
                     .flex_col()
                     .min_w(px(0.))
-                    .child(title(name.clone(), t.text))
+                    .child(self.to_profile(div().id("dm-peer-name").child(title(name.clone(), t.text)), Some(peer), cx))
                     .child(caption(
                         if background {
                             trf!("On {}", "Em {}", where_)

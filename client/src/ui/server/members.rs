@@ -10,7 +10,7 @@ use crate::ui::overlay::{self, Ask, Field};
 use crate::widgets::*;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, App, AppContext, Context, Entity, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
+    AnyElement, App, AppContext, ClickEvent, Context, Entity, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
     StatefulInteractiveElement, Styled, WeakEntity, Window, div, uniform_list,
 };
 use std::cell::RefCell;
@@ -182,17 +182,18 @@ impl ServerView {
             )
             .when(u.role == Role::Owner, |d| d.child(icon("crown", 13., t.caution)))
             .when(u.role == Role::Admin, |d| d.child(icon("shield", 13., t.accent)))
-            // Anybody but you: a click opens your private conversation with them, and the menu
-            // has the rest.
-            .when(u.id != me.id, |d| {
+            // A click shows their card, with a message and a call a click away; for anybody but
+            // you the menu has the rest.
+            .cursor_pointer()
+            .on_click({
                 let id = u.id;
-                d.cursor_pointer()
-                    .tooltip(tip(tr!("Click to send a private message", "Clique para mandar uma mensagem privada"), t))
-                    .on_click(cx.listener(move |this, _, window, cx| this.message_user(id, window, cx)))
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, e: &MouseDownEvent, window, cx| this.member_menu(&user, e.position, window, cx)),
-                    )
+                cx.listener(move |this, e: &ClickEvent, _, cx| this.open_profile(this.session.clone(), id, e.position(), cx))
+            })
+            .when(u.id != me.id, |d| {
+                d.on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, e: &MouseDownEvent, window, cx| this.member_menu(&user, e.position, window, cx)),
+                )
             })
             .into_any_element()
     }

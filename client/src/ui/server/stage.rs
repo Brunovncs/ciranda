@@ -203,6 +203,10 @@ impl ServerView {
                         .when(m.deafened, |d| d.child(icon("headphones-off", 14., t.text3)))
                         .when(m.publishes("s"), |d| d.child(live_chip(t, false))),
                 )
+                .cursor_pointer()
+                .on_click(
+                    cx.listener(move |this, e: &gpui::ClickEvent, _, cx| this.open_profile(this.session.clone(), user, e.position(), cx)),
+                )
                 .when(m.user_id != me, |d| {
                     d.on_mouse_down(
                         MouseButton::Right,

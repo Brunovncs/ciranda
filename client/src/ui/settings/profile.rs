@@ -635,7 +635,7 @@ fn quality(ms: u32) -> &'static str {
 }
 
 /// The day the account was made, and how long ago in words.
-fn joined(created_ms: i64) -> (String, String) {
+pub(crate) fn joined(created_ms: i64) -> (String, String) {
     use chrono::{Local, TimeZone};
     let Some(when) = Local.timestamp_millis_opt(created_ms).single() else {
         return ("–".into(), String::new());

@@ -9,6 +9,7 @@ pub mod emoji_picker;
 mod members;
 mod picker;
 pub mod private;
+mod profile_card;
 pub mod rich;
 mod share;
 pub mod sidebar;
@@ -756,6 +757,7 @@ impl ServerView {
             }
             ChatEvent::Elsewhere(session, user) if *session == self.session => self.message_user(*user, window, cx),
             ChatEvent::Elsewhere(session, user) => self.message_away(session.clone(), *user, window, cx),
+            ChatEvent::Profile(session, user, at) => self.open_profile(session.clone(), *user, *at, cx),
         }
     }
 

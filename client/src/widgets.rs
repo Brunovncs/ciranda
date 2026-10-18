@@ -289,13 +289,24 @@ pub fn keycap(s: impl Into<SharedString>, t: &Theme) -> Div {
         .child(s.into())
 }
 
+/// The colour a person's initials sit on, the same everywhere their name is.
+pub fn name_color(name: &str) -> Hsla {
+    let hue = name.bytes().fold(7u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32)) % 360;
+    gpui::hsla(hue as f32 / 360., 0.45, 0.42, 1.)
+}
+
 /// A round picture, or the person's initials on a colour of their own when there is none.
 pub fn avatar(name: &str, image: Option<std::sync::Arc<gpui::RenderImage>>, size: f32, ring: Option<Hsla>) -> Div {
     let initials: String = name.chars().filter(|c| c.is_alphanumeric()).take(2).collect::<String>().to_uppercase();
-    let hue = name.bytes().fold(7u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32)) % 360;
-    let bg = gpui::hsla(hue as f32 / 360., 0.45, 0.42, 1.);
+    let bg = name_color(name);
     let inner = match image {
-        Some(img) => div().size_full().rounded_full().overflow_hidden().child(gpui::img(img).size_full().rounded_full()),
+        // Filling the circle: a picture that isn't square (one not uploaded through Ciranda) is
+        // cut to it rather than squeezed.
+        Some(img) => div()
+            .size_full()
+            .rounded_full()
+            .overflow_hidden()
+            .child(gpui::StyledImage::object_fit(gpui::img(img).size_full().rounded_full(), gpui::ObjectFit::Cover)),
         None => div()
             .size_full()
             .rounded_full()
