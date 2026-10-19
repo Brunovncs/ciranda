@@ -13,6 +13,9 @@ pub struct Away {
     pub session: Entity<Session>,
     pub url: String,
     pub username: String,
+    /// The server of the call you are in, kept whole behind the one on screen (see
+    /// `Root::send_backstage`): its full socket and its view, not a background session's.
+    pub held: bool,
 }
 
 #[derive(Default)]
@@ -52,10 +55,11 @@ pub fn away_session(id: EntityId, cx: &App) -> Option<Entity<Session>> {
     elsewhere(cx)?.away.iter().find(|a| a.session.entity_id() == id).map(|a| a.session.clone())
 }
 
-/// The background session of this server and username.
+/// The background session of this server and username; not the one held for a call, which is
+/// brought back whole instead.
 pub fn away_for(url: &str, username: &str, cx: &App) -> Option<Entity<Session>> {
     let want = key(url, username);
-    elsewhere(cx)?.away.iter().find(|a| key(&a.url, &a.username) == want).map(|a| a.session.clone())
+    elsewhere(cx)?.away.iter().find(|a| !a.held && key(&a.url, &a.username) == want).map(|a| a.session.clone())
 }
 
 #[cfg(test)]

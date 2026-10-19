@@ -46,9 +46,11 @@ impl Root {
             super::Screen::Connect { .. } => None,
         };
         let dms_open = server_view.as_ref().is_some_and(|v| v.read(cx).dms_open);
+        let call_at = self.call_server(cx);
         let mut list = div().id("rail-servers").flex().flex_col().gap(px(8.)).py(px(2.)).min_h(px(0.)).overflow_y_scroll();
         for (i, s) in servers {
-            list = list.child(self.rail_tile(i, s, active == Some(i) && !dms_open, t, cx));
+            let in_call = call_at.as_ref() == Some(&crate::elsewhere::key(&s.url, &s.username));
+            list = list.child(self.rail_tile(i, s, active == Some(i) && !dms_open, in_call, t, cx));
         }
         let plus_hover = t.control_hover;
         pane(t)
@@ -129,7 +131,15 @@ impl Root {
             .on_click(cx.listener(|this, _, window, cx| this.account_menu(window, cx)))
     }
 
-    fn rail_tile(&mut self, i: usize, s: SavedServer, on: bool, t: &Theme, cx: &mut Context<Root>) -> gpui::Stateful<gpui::Div> {
+    fn rail_tile(
+        &mut self,
+        i: usize,
+        s: SavedServer,
+        on: bool,
+        in_call: bool,
+        t: &Theme,
+        cx: &mut Context<Root>,
+    ) -> gpui::Stateful<gpui::Div> {
         let host = s.host();
         let name = if s.name.is_empty() { host.clone() } else { s.name.clone() };
         let picture = self.rail_picture(&s.icon, &s, false, cx);
@@ -142,6 +152,7 @@ impl Root {
         // Named by address, so a tooltip or hover never sticks to a slot that now holds another server.
         rail_slot(SharedString::from(format!("rail-server-{}", s.url)), on, t)
             .child(tile)
+            .when(in_call, |d| d.child(voice_badge(t)))
             // Not over the tile's own menu, which already names the server.
             .when(!self.overlay.has_menu(), |d| {
                 d.tooltip(move |_, cx| cx.new(|_| ServerTip { name: tip_text.0.clone(), host: tip_text.1.clone(), theme }).into())
@@ -210,8 +221,9 @@ impl Root {
         None
     }
 
-    /// Goes to a saved server: ends the session in use, then signs in with what was kept. The one
-    /// in use, from the conversations, goes back to its channels.
+    /// Goes to a saved server: ends the session in use (or keeps it behind, for the call you are in
+    /// there), then signs in with what was kept. The server of that call comes back at once. The
+    /// one in use, from the conversations, goes back to its channels.
     pub(super) fn switch_server(&mut self, url: &str, username: &str, window: &mut Window, cx: &mut Context<Root>) {
         let p = prefs(cx);
         if p.username == username && same_server(&p.server_url, url) {
@@ -221,6 +233,13 @@ impl Root {
             cx.notify();
             return;
         }
+        if self.bring_back(url, username, window, cx) {
+            return;
+        }
+        if prefs(cx).saved_server_as(url, username).is_none() {
+            return;
+        }
+        self.leave_screen(window, cx);
         let mut found = false;
         set_prefs(cx, |p| found = p.switch_server(url, username));
         if !found {
@@ -432,6 +451,24 @@ fn unread_badge(n: u32, t: &Theme) -> gpui::Div {
         .font_weight(FontWeight::BOLD)
         .text_color(t.on_accent)
         .child(if n > 99 { "99+".to_string() } else { n.to_string() })
+}
+
+/// The server of the voice channel or call you are in, on the other corner of its tile: where you
+/// are heard, whichever server is on screen.
+fn voice_badge(t: &Theme) -> gpui::Div {
+    div()
+        .absolute()
+        .bottom(px(-3.))
+        .right(px(4.))
+        .size(px(18.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .border_2()
+        .border_color(t.pane)
+        .bg(t.success)
+        .child(icon("volume", 10., t.on_accent))
 }
 
 /// A row as wide as the rail, with the active marker on its edge as the settings rail has it.

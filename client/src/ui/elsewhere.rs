@@ -39,13 +39,21 @@ impl Root {
             .map(|e| {
                 e.away
                     .iter()
-                    .filter(|a| !wanted.iter().any(|s| key(&s.url, &s.username) == key(&a.url, &a.username)))
+                    .filter(|a| !a.held && !wanted.iter().any(|s| key(&s.url, &s.username) == key(&a.url, &a.username)))
                     .map(|a| a.session.clone())
                     .collect()
             })
             .unwrap_or_default();
         for session in gone {
             self.drop_away(&session, cx);
+        }
+        // The call's server stays behind whichever account the rail shows, until it leaves the
+        // rail altogether: then the call ends with it.
+        let held = elsewhere::elsewhere(cx).and_then(|e| e.away.iter().find(|a| a.held).map(|a| (a.url.clone(), a.username.clone())));
+        if let Some((url, username)) = held
+            && prefs(cx).saved_server_as(&url, &username).is_none_or(|s| s.session_token.is_empty())
+        {
+            self.release_backstage(window, cx);
         }
         for s in wanted {
             let k = key(&s.url, &s.username);
@@ -108,7 +116,7 @@ impl Root {
             cx.subscribe_in(&session, window, |this, session, ev: &SessionEvent, window, cx| this.on_away_event(session, ev, window, cx)),
         ];
         self.away_subs.insert(id, subs);
-        elsewhere::elsewhere_mut(cx).away.push(Away { session, url, username });
+        elsewhere::elsewhere_mut(cx).away.push(Away { session, url, username, held: false });
         self.redraw_with_away(cx);
     }
 
@@ -129,7 +137,7 @@ impl Root {
     }
 
     /// The rail's badges and the conversation list draw from the background sessions too.
-    fn redraw_with_away(&mut self, cx: &mut Context<Root>) {
+    pub(super) fn redraw_with_away(&mut self, cx: &mut Context<Root>) {
         if let super::Screen::Server(v) = &self.screen {
             v.update(cx, |_, cx| cx.notify());
         }
@@ -175,8 +183,10 @@ impl Root {
             }
         }
         if self.away_ringing.is_none() {
-            let away: Vec<Entity<Session>> =
-                elsewhere::elsewhere(cx).map(|e| e.away.iter().map(|a| a.session.clone()).collect()).unwrap_or_default();
+            // The call's server rings in its own view, behind.
+            let away: Vec<Entity<Session>> = elsewhere::elsewhere(cx)
+                .map(|e| e.away.iter().filter(|a| !a.held).map(|a| a.session.clone()).collect())
+                .unwrap_or_default();
             if let Some((session, id)) = away.into_iter().find_map(|s| me(s.read(cx)).first().copied().map(|id| (s, id))) {
                 self.away_ringing(&session, id, window, cx);
             }
@@ -274,18 +284,17 @@ impl Root {
         window.defer(cx, move |window, cx| super::overlay::open_dialog(view, window, cx));
     }
 
-    /// Goes to another server (and does `then` there): it ends the voice channel or call you are
-    /// in, so it asks first, unless that was turned off.
+    /// Goes to another server (and does `then` there). Going alone keeps you in the voice channel
+    /// or call you are in (see `backstage`); answering or making a call there ends it, so that
+    /// asks first, unless that was turned off.
     pub fn ask_go_to(&mut self, url: &str, username: &str, then: Option<Then>, window: &mut Window, cx: &mut Context<Root>) {
         let p = prefs(cx);
         let here = p.username == username && same_server(&p.server_url, url);
-        let place = match &self.screen {
-            super::Screen::Server(v) => v.read(cx).call.as_ref().map(|c| {
-                let place = c.read(cx).place;
-                v.read(cx).session.read(cx).place_name(place)
-            }),
-            super::Screen::Connect { .. } => None,
-        };
+        let place = self.call_view(cx).filter(|_| then.is_some()).and_then(|v| {
+            let v = v.read(cx);
+            let place = v.call.as_ref()?.read(cx).place;
+            Some(v.session.read(cx).place_name(place))
+        });
         let go = move |root: &mut Root, url: &str, username: &str, window: &mut Window, cx: &mut Context<Root>| match then {
             Some(then) => root.go_to(url, username, then, window, cx),
             None => root.switch_server(url, username, window, cx),

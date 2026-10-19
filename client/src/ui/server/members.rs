@@ -204,24 +204,32 @@ impl ServerView {
         let (id, nick) = (u.id, u.nickname.clone());
         let view = cx.entity().downgrade();
         let (v1, v2) = (view.clone(), view);
-        let mut items = vec![
-            MenuEntry::item("message", tr!("Send a private message", "Mandar mensagem privada"), false, move |window, cx| {
-                if let Some(v) = v1.upgrade() {
-                    v.update(cx, |v, cx| v.message_user(id, window, cx));
-                }
-            }),
-            MenuEntry::item("phone", tr!("Call", "Ligar"), false, move |window, cx| {
-                if let Some(v) = v2.upgrade() {
-                    v.update(cx, |v, cx| v.call_user(id, window, cx));
-                }
-            }),
-        ];
+        // A server older than private messages has no way to write to anyone.
+        let mut items = if self.no_messages(cx) {
+            Vec::new()
+        } else {
+            vec![
+                MenuEntry::item("message", tr!("Send a private message", "Mandar mensagem privada"), false, move |window, cx| {
+                    if let Some(v) = v1.upgrade() {
+                        v.update(cx, |v, cx| v.message_user(id, window, cx));
+                    }
+                }),
+                MenuEntry::item("phone", tr!("Call", "Ligar"), false, move |window, cx| {
+                    if let Some(v) = v2.upgrade() {
+                        v.update(cx, |v, cx| v.call_user(id, window, cx));
+                    }
+                }),
+            ]
+        };
         if !me.role.is_admin() || u.role == Role::Owner {
+            if items.is_empty() {
+                return;
+            }
             let menu = cx.new(|_| Menu { items });
             overlay::open_menu(menu, at, cx);
             return;
         }
-        if u.role == Role::Member || me.role == Role::Owner {
+        if !items.is_empty() && (u.role == Role::Member || me.role == Role::Owner) {
             items.push(MenuEntry::rule());
         }
         if u.role == Role::Member {

@@ -38,7 +38,9 @@ recovery key brings your history to another computer.
   sound: the whole computer except the call, or just the shared app.
 - **Voice channels** with cameras and screen shares, echo cancellation, neural
   noise suppression (DeepFilterNet: keyboards and dogs too, not just fans),
-  per-person volume up to 350%, mute, deafen and a shared soundboard.
+  per-person volume up to 350%, mute, deafen and a shared soundboard. Going to
+  another server keeps you in your voice channel or call; the rail marks where
+  you are heard.
 - **Camera backgrounds**: blur, six bundled pictures or one of your own. The
   person is cut out on your computer by a small segmentation model; only the
   finished picture is sent.

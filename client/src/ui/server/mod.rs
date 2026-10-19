@@ -85,6 +85,9 @@ struct OpenChat {
 pub struct ServerView {
     pub session: Entity<Session>,
     root: WeakEntity<Root>,
+    /// Kept behind another server for the call it holds (see `ui::backstage`): it looks after the
+    /// call, and leaves the focus, the hotkeys and the chats to the server on screen.
+    pub backstage: bool,
     pub center: Center,
     /// The rail's "Direct messages" is open: every server's conversations in place of this one's
     /// channels. This server stays connected underneath, its voice and calls included.
@@ -172,6 +175,12 @@ pub(crate) fn request(session: &Entity<Session>, kind: &'static str, payload: se
     .detach();
 }
 
+/// A 404 with none of the server's own reasons: the server has no such route, being older than
+/// private messages, before its key check said so. (A gone account is a 404 too, but says so.)
+fn no_such_route(e: &crate::core::api::ApiError) -> bool {
+    e.status == 404 && e.code == ErrorCode::Unknown
+}
+
 fn refusal(e: &crate::core::realtime::RequestError) -> gpui::SharedString {
     crate::core::api::friendly(e.code, &e.reply)
         .unwrap_or_else(|| trf!("The server refused that ({}).", "O servidor recusou isso ({}).", e))
@@ -185,8 +194,12 @@ impl ServerView {
             cx.observe(&session, |this, _, cx| this.on_session(cx)),
             cx.subscribe_in(&session, window, |this, _, ev: &SessionEvent, window, cx| this.on_event(ev, window, cx)),
             // The shortcuts are heard here, so focus comes back when a dialog closes or a click
-            // lands on nothing focusable.
-            cx.on_focus_lost(window, |this, window, cx| this.focus.focus(window, cx)),
+            // lands on nothing focusable; not to a server kept behind, which is not on screen.
+            cx.on_focus_lost(window, |this, window, cx| {
+                if !this.backstage {
+                    this.focus.focus(window, cx)
+                }
+            }),
             cx.observe(&ink, |this, _, cx| this.sync_screen_ink(cx)),
         ];
         crate::media::voice::apply_mic_prefs(cx);
@@ -206,6 +219,7 @@ impl ServerView {
         ServerView {
             session,
             root,
+            backstage: false,
             center: Center::Stage,
             dms_open: false,
             last_dm: None,
@@ -244,7 +258,9 @@ impl ServerView {
     fn on_session(&mut self, cx: &mut Context<Self>) {
         let s = self.session.read(cx);
         let server = (s.api.base(), s.clips.iter().map(|c| c.id).collect());
-        crate::ui::hotkeys::set_server(Some(server), cx);
+        if !self.backstage {
+            crate::ui::hotkeys::set_server(Some(server), cx);
+        }
         // Off the stage with no call: back to the chat that was open (the conversation a call was
         // made from, say), or the first text channel once the list arrives.
         if self.center == Center::Stage && self.call.is_none() {
@@ -355,6 +371,9 @@ impl ServerView {
 
     /// Opens the conversation with `user`, making it if needed.
     pub fn message_user(&mut self, user: UserId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.no_messages(cx) {
+            return self.say_no_messages(cx);
+        }
         let task = self.session.update(cx, |s, cx| s.open_dm_with(user, cx));
         let handle = window.window_handle();
         cx.spawn(async move |this, cx| {
@@ -362,6 +381,7 @@ impl ServerView {
             let _ = handle.update(cx, |_, window, cx| {
                 let _ = this.update(cx, |this, cx| match got {
                     Ok(id) => this.open_room(Room::Dm(id), window, cx),
+                    Err(e) if no_such_route(&e) => this.say_no_messages(cx),
                     Err(e) => overlay::toast(e.message, cx),
                 });
             });
@@ -371,6 +391,9 @@ impl ServerView {
 
     /// Opens the conversation with `user` and rings them.
     pub fn call_user(&mut self, user: UserId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.no_messages(cx) {
+            return self.say_no_messages(cx);
+        }
         let task = self.session.update(cx, |s, cx| s.open_dm_with(user, cx));
         let handle = window.window_handle();
         cx.spawn(async move |this, cx| {
@@ -381,11 +404,31 @@ impl ServerView {
                         this.open_room(Room::Dm(id), window, cx);
                         this.start_call(id, window, cx);
                     }
+                    Err(e) if no_such_route(&e) => this.say_no_messages(cx),
                     Err(e) => overlay::toast(e.message, cx),
                 });
             });
         })
         .detach();
+    }
+
+    /// This server has no private messages, being older than them: nobody can be written to or
+    /// called here. Someone on another of your servers too is written to there, from the
+    /// conversations; nothing here can tell that it is the same person.
+    pub fn no_messages(&self, cx: &App) -> bool {
+        matches!(self.session.read(cx).vault.state, crate::dm::KeyState::Unsupported)
+    }
+
+    fn say_no_messages(&self, cx: &mut Context<Self>) {
+        let name = self.session.read(cx).server_name.clone();
+        overlay::toast(
+            trf!(
+                "{} has no private messages: its server is older than them.",
+                "{} não tem mensagens privadas: o servidor é anterior a elas.",
+                name
+            ),
+            cx,
+        );
     }
 
     /// Rings the other person of a private conversation.
@@ -412,6 +455,7 @@ impl ServerView {
             return;
         }
         let (muted, deafened) = self.carried_mute(cx);
+        self.end_call_behind(cx);
         self.hang_up(false, cx);
         match Call::dial(self.session.clone(), conversation, muted, deafened, cx) {
             Ok(call) => self.adopt_call(call, window, cx),
@@ -463,6 +507,7 @@ impl ServerView {
     fn answer_call(&mut self, conversation: ConversationId, window: &mut Window, cx: &mut Context<Self>) {
         self.ringing = None;
         let (muted, deafened) = self.carried_mute(cx);
+        self.end_call_behind(cx);
         self.hang_up(false, cx);
         match Call::answer(self.session.clone(), conversation, muted, deafened, cx) {
             Some(call) => {
@@ -480,7 +525,8 @@ impl ServerView {
     /// The mute and deafen a new call starts with: as the call before had them, and muted when
     /// that is the setting.
     fn carried_mute(&self, cx: &App) -> (bool, bool) {
-        let (muted, deafened) = self.call.as_ref().map(|c| (c.read(cx).muted, c.read(cx).deafened)).unwrap_or((false, false));
+        let call = self.call.clone().or_else(|| self.call_behind(cx)?.read(cx).call.clone());
+        let (muted, deafened) = call.map(|c| (c.read(cx).muted, c.read(cx).deafened)).unwrap_or((false, false));
         (muted || prefs(cx).join_muted, deafened)
     }
 
@@ -505,6 +551,7 @@ impl ServerView {
         crate::ui::tray::set_call(Some(&call), cx);
         self.call = Some(call);
         crate::ui::updates::call_changed(true, cx);
+        self.redraw_rail(cx);
         self.show_stage(cx);
         cx.notify();
     }
@@ -521,8 +568,70 @@ impl ServerView {
     pub fn shutdown(&mut self, cx: &mut Context<Self>) {
         self.leave_voice(cx);
         self.leave_away(cx);
-        crate::ui::hotkeys::set_server(None, cx);
+        // Behind, the hotkeys were never this server's.
+        if !self.backstage {
+            crate::ui::hotkeys::set_server(None, cx);
+        }
         self.session.update(cx, |s, _| s.stop());
+    }
+
+    /// Kept behind another server for the call (see `ui::backstage`), or back on screen as it was.
+    pub fn set_backstage(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.backstage = on;
+        if on {
+            // The dialog went with the screen; a call still ringing here rings on, unanswered.
+            if let Some(r) = self.ringing.take() {
+                r.update(cx, |r, cx| r.close(cx));
+            }
+            // Nothing here is being looked at any more, so nothing is read by it, and others'
+            // cameras and screens aren't turned into pictures. Drawing it again sets that back.
+            self.leave_away(cx);
+            self.session.update(cx, |s, cx| s.leave_chat(cx));
+            if let Some(voice) = self.call.as_ref().and_then(|c| c.read(cx).voice.as_ref()) {
+                voice.read(cx).hide_streams(true);
+            }
+        } else {
+            match self.center {
+                Center::Chat(room) => self.session.update(cx, |s, cx| s.open(room, cx)),
+                Center::Away(..) => {
+                    if let Some((session, id)) = self.away_center(cx) {
+                        session.update(cx, |s, cx| s.open(Room::Dm(id), cx));
+                    }
+                }
+                Center::Inbox | Center::Stage => {}
+            }
+            self.on_session(cx);
+            self.focus.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// The call kept behind on another server, while this one is on screen without one.
+    fn call_behind(&self, cx: &App) -> Option<Entity<ServerView>> {
+        if self.backstage || self.call.is_some() {
+            return None;
+        }
+        crate::ui::backstage(cx).filter(|v| v.read(cx).call.is_some())
+    }
+
+    /// A call starting here: the one kept behind on another server ends first, quietly, as
+    /// switching channels does.
+    fn end_call_behind(&mut self, cx: &mut Context<Self>) {
+        if let Some(behind) = self.call_behind(cx) {
+            behind.update(cx, |v, cx| v.hang_up(false, cx));
+        }
+    }
+
+    /// Back to the server of the call kept behind.
+    fn go_to_call(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(behind) = self.call_behind(cx) else { return };
+        let (url, user) = {
+            let s = behind.read(cx).session.read(cx);
+            (s.api.base(), s.me.nickname.clone())
+        };
+        if let Some(root) = self.root.upgrade() {
+            window.defer(cx, move |window, cx| root.update(cx, |r, cx| r.ask_go_to(&url, &user, None, window, cx)));
+        }
     }
 
     /// Does what another server's conversation or call asked for, now that this one is on screen.
@@ -579,6 +688,12 @@ impl ServerView {
             return;
         }
         self.dms_open = on;
+        self.redraw_rail(cx);
+    }
+
+    /// The rail draws what this view says (the conversations open, the server of the call), once
+    /// this update is over.
+    fn redraw_rail(&self, cx: &mut Context<Self>) {
         let root = self.root.clone();
         cx.defer(move |cx| {
             let _ = root.update(cx, |_, cx| cx.notify());
@@ -755,8 +870,6 @@ impl ServerView {
                     window.defer(cx, move |window, cx| root.update(cx, |r, cx| r.ask_go_to(&url, &user, then, window, cx)));
                 }
             }
-            ChatEvent::Elsewhere(session, user) if *session == self.session => self.message_user(*user, window, cx),
-            ChatEvent::Elsewhere(session, user) => self.message_away(session.clone(), *user, window, cx),
             ChatEvent::Profile(session, user, at) => self.open_profile(session.clone(), *user, *at, cx),
         }
     }
@@ -781,9 +894,18 @@ impl ServerView {
         }
         let Some(channel) = self.session.read(cx).channel(id).cloned() else { return };
         let owner = self.session.read(cx).me.role == Role::Owner;
-        let mut text = match self.call_channel(cx).and_then(|c| self.session.read(cx).channel(c)) {
-            Some(now) => trf!("You will leave {} and join this one.", "Você vai sair de {} e entrar neste.", now.name),
-            None => tr!("Everyone in it will be able to hear you.", "Todos que estão nele vão poder te ouvir.").into(),
+        // The call kept behind on another server ends too: only joining another call does that.
+        let behind = self.call_behind(cx).and_then(|b| {
+            let b = b.read(cx);
+            let s = b.session.read(cx);
+            Some((s.place_name(b.call.as_ref()?.read(cx).place), s.server_name.clone()))
+        });
+        let mut text = match (self.call_channel(cx).and_then(|c| self.session.read(cx).channel(c)), behind) {
+            (Some(now), _) => trf!("You will leave {} and join this one.", "Você vai sair de {} e entrar neste.", now.name),
+            (None, Some((place, server))) => {
+                trf!("You will leave {} on {} and join this one.", "Você vai sair de {} em {} e entrar neste.", place, server)
+            }
+            (None, None) => tr!("Everyone in it will be able to hear you.", "Todos que estão nele vão poder te ouvir.").into(),
         };
         if channel.mic_locked && !owner {
             text = trf!(
@@ -821,6 +943,7 @@ impl ServerView {
         }
         let (muted, deafened) = self.carried_mute(cx);
         // Quietly: the new channel's connect is the sound of switching.
+        self.end_call_behind(cx);
         self.hang_up(false, cx);
         let call = Call::join(self.session.clone(), id, password, muted, deafened, cx);
         self.adopt_call(call, window, cx);
@@ -844,6 +967,7 @@ impl ServerView {
             if cue && connected {
                 voice_cue(Cue::Disconnect, cx);
             }
+            self.redraw_rail(cx);
         }
         if self.center == Center::Stage {
             self.on_session(cx);
@@ -887,6 +1011,9 @@ impl ServerView {
     }
 
     pub fn toggle_mute(&mut self, cx: &mut Context<Self>) {
+        if let Some(behind) = self.call_behind(cx) {
+            return behind.update(cx, |v, cx| v.toggle_mute(cx));
+        }
         if let Some(call) = &self.call {
             call.update(cx, |c, cx| {
                 let m = !c.muted;
@@ -896,6 +1023,9 @@ impl ServerView {
     }
 
     pub fn toggle_deafen(&mut self, cx: &mut Context<Self>) {
+        if let Some(behind) = self.call_behind(cx) {
+            return behind.update(cx, |v, cx| v.toggle_deafen(cx));
+        }
         if let Some(call) = &self.call {
             call.update(cx, |c, cx| {
                 let d = !c.deafened;
@@ -1229,10 +1359,15 @@ impl ServerView {
     fn render_self(&mut self, t: &Theme, cx: &mut Context<Self>) -> gpui::Div {
         let me = self.session.read(cx).me.clone();
         let img = self.session.update(cx, |s, cx| s.avatar(me.id, cx));
-        let call = self.call.as_ref().map(|c| c.read(cx));
+        // The call kept behind on another server is yours too; you are someone else there.
+        let (call, my_id) = match self.call_behind(cx) {
+            Some(b) => (b.read(cx).call.clone(), b.read(cx).session.read(cx).me.id),
+            None => (self.call.clone(), me.id),
+        };
+        let call = call.as_ref().map(|c| c.read(cx));
         let (muted, deafened) = call.map(|c| (c.muted, c.deafened)).unwrap_or((false, false));
         let in_call = call.is_some();
-        let speaking = call.is_some_and(|c| c.is_speaking(me.id, cx));
+        let speaking = call.is_some_and(|c| c.is_speaking(my_id, cx));
         let status = if !in_call {
             tr!("Online", "Online")
         } else if deafened {
@@ -1319,8 +1454,61 @@ impl ServerView {
             )
     }
 
+    /// The call kept behind on another server, in this one's corner: its state, where it is, a
+    /// click to go back to it, and hanging up.
+    fn render_behind_panel(&mut self, t: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let behind = self.call_behind(cx)?;
+        let b = behind.read(cx);
+        let call = b.call.clone()?;
+        let c = call.read(cx);
+        let s = b.session.read(cx);
+        let (place, server) = (s.place_name(c.place), s.server_name.clone());
+        let private = c.place.conversation().is_some();
+        let ringing = c.ringing(cx);
+        let ping = c.voice.as_ref().and_then(|v| v.read(cx).ping_ms);
+        let (label_text, color) = match c.state.clone() {
+            _ if ringing => (tr!("Ringing…", "Chamando…"), t.caution),
+            CallState::Connected if private => (tr!("In a private call", "Em chamada privada"), t.success),
+            CallState::Connected => (tr!("Voice connected", "Voz conectada"), t.success),
+            CallState::Joining => (tr!("Connecting…", "Conectando…"), t.caution),
+            CallState::Reconnecting => (tr!("Reconnecting…", "Reconectando…"), t.caution),
+        };
+        Some(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .mx(px(8.))
+                .p(px(10.))
+                .rounded(px(radius::CARD))
+                .bg(t.layer)
+                .border_1()
+                .border_color(color.opacity(0.65))
+                .child(signal_bars(ping, t))
+                .child(
+                    div()
+                        .id("voice-behind")
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .cursor_pointer()
+                        .child(div().text_size(px(13.)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(color).child(label_text))
+                        .child(div().truncate().text_size(px(12.)).text_color(t.text2).child(format!("{place} · {server}")))
+                        .tooltip(tip(trf!("Back to {}", "Voltar para {}", server), t))
+                        .on_click(cx.listener(|this, _, window, cx| this.go_to_call(window, cx))),
+                )
+                .child(
+                    tool_button("hang-up-behind", "phone-off", false, t.critical, t)
+                        .tooltip(tip(if private { tr!("Hang up", "Desligar") } else { tr!("Leave the channel", "Sair do canal") }, t))
+                        .on_click(cx.listener(move |_, _, _, cx| behind.update(cx, |v, cx| v.leave_voice(cx)))),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_voice_panel(&mut self, t: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let call = self.call.clone()?;
+        let Some(call) = self.call.clone() else { return self.render_behind_panel(t, cx) };
         let c = call.read(cx);
         let name = self.session.read(cx).place_name(c.place);
         let private = c.place.conversation().is_some();

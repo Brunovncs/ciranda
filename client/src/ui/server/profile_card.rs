@@ -214,7 +214,17 @@ impl gpui::Render for ProfileCard {
                 ))
             });
 
-        let actions = if f.me {
+        let no_messages = matches!(self.session.read(cx).vault.state, crate::dm::KeyState::Unsupported);
+        let actions = if no_messages && !f.me {
+            div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap(px(6.))
+                .py(px(4.))
+                .child(icon("lock", 12., t.text3))
+                .child(caption(tr!("This server has no private messages.", "Este servidor não tem mensagens privadas."), t.text3))
+        } else if f.me {
             div().child(
                 icon_label_button("profile-edit", "edit", tr!("Edit your profile", "Editar seu perfil"), Kind::Standard, &t)
                     .w_full()

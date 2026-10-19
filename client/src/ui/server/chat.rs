@@ -90,8 +90,6 @@ struct Quoted {
 pub enum ChatEvent {
     /// Ring the other person of this private conversation, on the server of this session.
     Call(Entity<Session>, ConversationId),
-    /// Talk to this person on another server you are both on: the conversation there.
-    Elsewhere(Entity<Session>, UserId),
     /// Show this person's card, with its corner at the click.
     Profile(Entity<Session>, UserId, gpui::Point<gpui::Pixels>),
 }
@@ -1878,67 +1876,10 @@ impl ChatView {
         Some(row.into_any_element())
     }
 
-    /// Someone with this person's nickname on the other servers you are signed in to, where
-    /// private messages work: (server name, its session, who they are there). A nickname is unique
-    /// only within its server, so the menu says to check it is the same person.
-    fn elsewhere(&self, peer: UserId, cx: &App) -> Vec<(String, Entity<Session>, UserId)> {
-        let Some(nick) = self.session.read(cx).users.get(&peer).map(|u| u.nickname.clone()) else { return Vec::new() };
-        crate::elsewhere::sessions(cx)
-            .into_iter()
-            .filter(|other| *other != self.session)
-            .filter_map(|other| {
-                let o = other.read(cx);
-                if matches!(o.vault.state, crate::dm::KeyState::Unsupported) {
-                    return None;
-                }
-                let user = o.user_by_nick(&nick).filter(|u| u.id != o.me.id)?.id;
-                Some((o.server_name.clone(), other.clone(), user))
-            })
-            .collect()
-    }
-
-    /// Which server this conversation is on, and the others where the same person is, to move to.
-    fn server_menu(&mut self, peer: UserId, at: gpui::Point<gpui::Pixels>, cx: &mut Context<Self>) {
-        let here = self.session.read(cx).server_name.clone();
-        let nick = self.session.read(cx).users.get(&peer).map(|u| u.nickname.clone()).unwrap_or_default();
-        let mut items = vec![
-            MenuEntry::custom(move |t, _, _| {
-                div()
-                    .px(px(10.))
-                    .pt(px(6.))
-                    .pb(px(4.))
-                    .max_w(px(260.))
-                    .child(caption(
-                        trf!(
-                            "@{} on your other servers. A nickname is only unique within its server, so check it is them; each server keeps its own conversation and history.",
-                            "@{} nos seus outros servidores. Um apelido só é único dentro do próprio servidor, então confira se é a mesma pessoa; cada servidor guarda a sua própria conversa e histórico.",
-                            nick
-                        ),
-                        t.text3,
-                    ))
-                    .into_any_element()
-            }),
-            MenuEntry::item("check", here, false, |_, _| {}),
-        ];
-        let me = cx.entity().downgrade();
-        for (name, session, user) in self.elsewhere(peer, cx) {
-            let me = me.clone();
-            items.push(MenuEntry::item("server", name, false, move |_, cx| {
-                if let Some(me) = me.upgrade() {
-                    let session = session.clone();
-                    me.update(cx, |_, cx| cx.emit(ChatEvent::Elsewhere(session, user)));
-                }
-            }));
-        }
-        let menu = cx.new(|_| Menu { items });
-        overlay::open_menu(menu, at, cx);
-    }
-
     /// A private conversation's header: who it is with and whether they are around (or which
-    /// server it is on), that it is sealed end to end, other servers to talk on, and the call button.
+    /// server it is on), that it is sealed end to end, and the call button.
     fn render_dm_header(&mut self, conversation: ConversationId, peer: UserId, t: &Theme, cx: &mut Context<Self>) -> gpui::Div {
         let img = self.session.update(cx, |s, cx| s.avatar(peer, cx));
-        let elsewhere = !self.elsewhere(peer, cx).is_empty();
         let s = self.session.read(cx);
         let name = s.display_name(Some(peer), None);
         let online = s.online.contains(&peer);
@@ -2015,19 +1956,6 @@ impl ChatView {
                     .on_click(move |_, window, cx| super::private::safety_number(&session, peer, window, cx)),
             )
             .child(div().flex_1())
-            .when(elsewhere, |d| {
-                d.child(
-                    tool_button("dm-server", "server", false, t.text2, t)
-                        .tooltip(tip(trf!("On {} · talk on another server", "Em {} · conversar em outro servidor", where_), t))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, e: &MouseDownEvent, _, cx| {
-                                cx.stop_propagation();
-                                this.server_menu(peer, e.position, cx);
-                            }),
-                        ),
-                )
-            })
             .child(
                 tool_button("dm-call", "phone", in_call, if in_call { t.success } else if can_call { t.text2 } else { t.text3 }, t)
                     .when(!can_call, |d| d.opacity(0.5))

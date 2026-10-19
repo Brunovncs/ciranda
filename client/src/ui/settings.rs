@@ -471,8 +471,8 @@ impl Settings {
                 "confirm-server-switch",
                 tr!("Ask before leaving a call for another server", "Perguntar antes de sair de uma chamada para outro servidor"),
                 tr!(
-                    "Going to another server ends the voice channel or call you are in, so a click on it asks first.",
-                    "Ir para outro servidor encerra o canal de voz ou a chamada em que você está, então o clique pergunta antes."
+                    "Going to another server keeps you in your voice channel or call; answering or making a call there ends it, so that asks first.",
+                    "Ir para outro servidor mantém você no canal de voz ou na chamada; atender ou fazer uma chamada lá encerra ela, então isso pergunta antes."
                 ),
                 p.confirm_server_switch,
                 t,

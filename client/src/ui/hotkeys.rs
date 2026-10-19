@@ -149,11 +149,14 @@ fn on_event(ev: Event, cx: &mut App) {
             }
         }
         Event::Pressed(action) => {
-            let root = cx.try_global::<overlay::RootHandle>().and_then(|h| h.0.upgrade());
-            let view = root.and_then(|r| match &r.read(cx).screen {
-                Screen::Server(v) => Some(v.clone()),
-                Screen::Connect { .. } => None,
-            });
+            // Mute and deafen are the call's, wherever it is; the rest is the server on screen's.
+            let view = match action {
+                HotkeyAction::Mute | HotkeyAction::Deafen | HotkeyAction::Overlay | HotkeyAction::Ink => crate::ui::call_view(cx),
+                _ => cx.try_global::<overlay::RootHandle>().and_then(|h| h.0.upgrade()).and_then(|r| match &r.read(cx).screen {
+                    Screen::Server(v) => Some(v.clone()),
+                    Screen::Connect { .. } => None,
+                }),
+            };
             if let Some(view) = view {
                 view.update(cx, |v, cx| v.on_hotkey(action, cx));
             }

@@ -4,8 +4,6 @@
 //! mute, deafen and disconnect in a call instead; there and on Linux, what needs you while the
 //! window is in the background reaches you through the system's notifications.
 
-use super::Screen;
-use super::overlay::RootHandle;
 use super::server::ServerView;
 use crate::core::settings::HotkeyAction;
 use crate::media::call::Call;
@@ -239,12 +237,9 @@ fn show(cx: &mut App) {
     .detach();
 }
 
+/// The server with the call: on screen, or kept behind it for the call.
 fn server_view(cx: &App) -> Option<Entity<ServerView>> {
-    let root = cx.try_global::<RootHandle>()?.0.upgrade()?;
-    match &root.read(cx).screen {
-        Screen::Server(v) => Some(v.clone()),
-        Screen::Connect { .. } => None,
-    }
+    crate::ui::call_view(cx)
 }
 
 /// Muted and deafened, in a call.

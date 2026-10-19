@@ -1,6 +1,7 @@
 //! The window's root: the sign-in screen or the server, the theme, and what floats over them
 //! (dialogs, menus, toasts).
 
+mod backstage;
 pub mod camera;
 pub mod connect;
 mod elsewhere;
@@ -20,6 +21,7 @@ use crate::prefs::prefs;
 use crate::session::{Link, Session, SessionEvent};
 use crate::theme::{self, CustomColors, FONT, Theme, px, radius};
 use crate::widgets::*;
+pub use backstage::{backstage, call_view};
 use connect::{ConnectEvent, ConnectView, Connected};
 use gpui::prelude::FluentBuilder;
 use gpui::{
@@ -64,6 +66,8 @@ pub struct Root {
     pending: Option<(String, String, Then)>,
     /// What to do on the server on screen once its socket is up.
     then: Option<Then>,
+    /// What the server kept behind for its call is listened to with (see `backstage`).
+    backstage_subs: Vec<Subscription>,
 }
 
 impl Focusable for Root {
@@ -157,6 +161,7 @@ impl Root {
             away_cue_at: None,
             pending: None,
             then: None,
+            backstage_subs: Vec::new(),
         };
         root.subscribe_connect(&view, window, cx);
         root
@@ -319,8 +324,11 @@ impl Render for Root {
 
 impl Root {
     /// The sign-in screen for the active server, which goes straight in when a sign-in is kept.
+    /// The server on screen ends, its call with it, unless `leave_screen` kept it behind first.
     pub fn show_connect(&mut self, error: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
-        if let Screen::Server(v) = &self.screen {
+        if let Screen::Server(v) = &self.screen
+            && backstage(cx).as_ref() != Some(v)
+        {
             v.update(cx, |v, cx| v.shutdown(cx));
         }
         crate::elsewhere::elsewhere_mut(cx).home = None;
@@ -346,10 +354,12 @@ impl Root {
     /// Starts the session a sign-in handed over, in place of whatever was open. A server that was
     /// kept in the background goes on with the session it had, so a call ringing there still rings.
     fn enter(&mut self, done: &Connected, window: &mut Window, cx: &mut Context<Self>) {
-        if let Screen::Server(v) = &self.screen {
-            v.update(cx, |v, cx| v.shutdown(cx));
-        }
         let (base, nickname) = (done.api.base(), done.me.nickname.clone());
+        // The server of the call you are in, signed in to again: the one kept behind comes back.
+        if self.bring_back(&base, &nickname, window, cx) {
+            return;
+        }
+        self.leave_screen(window, cx);
         let session = match self.take_away(&base, &nickname, cx) {
             Some(session) => {
                 session.update(cx, |s, cx| {
@@ -378,6 +388,13 @@ impl Root {
     }
 
     fn open_server(&mut self, session: Entity<Session>, window: &mut Window, cx: &mut Context<Self>) {
+        let root = cx.entity().downgrade();
+        let view = cx.new(|cx| ServerView::new(session.clone(), root, window, cx));
+        self.show_server(view, session, window, cx);
+    }
+
+    /// `view` of `session` on screen, listened to as the server on screen is.
+    fn show_server(&mut self, view: Entity<ServerView>, session: Entity<Session>, window: &mut Window, cx: &mut Context<Self>) {
         self.screen_subs.clear();
         crate::elsewhere::elsewhere_mut(cx).home = Some(session.clone());
         // What `go_to` came here to do, once the socket is up.
@@ -401,8 +418,6 @@ impl Root {
         });
         self.screen_subs.push(sub);
         self.screen_subs.push(cx.observe(&session, |_, session, cx| rail::keep_session_news(&session, cx)));
-        let root = cx.entity().downgrade();
-        let view = cx.new(|cx| ServerView::new(session, root, window, cx));
         self.screen = Screen::Server(view);
         cx.notify();
     }
