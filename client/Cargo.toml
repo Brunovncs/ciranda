@@ -66,6 +66,10 @@ symphonia = { version = "0.5", default-features = false, features = ["mp3", "wav
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
 tokio-tungstenite = { version = "0.30", features = ["__rustls-tls"] }
 tract-onnx = "0.23"
+# DeepFilterNet's streaming nets run pulsed, one 10 ms frame at a time (media/deepfilter.rs), and
+# its STFT is a real FFT.
+tract-pulse = "0.23"
+realfft = "3"
 unicode-segmentation = "1"
 url = "2"
 

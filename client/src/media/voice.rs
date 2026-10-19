@@ -908,6 +908,7 @@ pub fn apply_mic_prefs(cx: &App) {
     let a = audio::audio();
     a.mic.echo_cancellation.store(p.echo_cancellation, std::sync::atomic::Ordering::Relaxed);
     a.mic.noise_suppression.store(p.noise_suppression, std::sync::atomic::Ordering::Relaxed);
+    a.mic.neural.store(p.noise_suppressor != "classic", std::sync::atomic::Ordering::Relaxed);
     a.set_input(&p.voice_input_id);
     super::rtc::set_hardware_encoding(p.hardware_encoding != "off");
 }

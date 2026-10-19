@@ -421,7 +421,7 @@ impl Settings {
             .child(toggle_row(
                 "noise",
                 tr!("Noise suppression", "Supressão de ruído"),
-                tr!("Takes out fans, keyboards and hum.", "Tira ventiladores, teclados e zumbidos."),
+                tr!("Takes the background noise out of your microphone.", "Tira o ruído de fundo do seu microfone."),
                 p.noise_suppression,
                 t,
                 cx,
@@ -430,6 +430,31 @@ impl Settings {
                     apply_mic_prefs(cx);
                 },
             ))
+            .when(p.noise_suppression, |d| {
+                let classic = p.noise_suppressor == "classic";
+                let kinds = vec![("neural", tr!("AI", "IA").into()), ("classic", tr!("Traditional", "Tradicional").into())];
+                d.child(row_field(
+                    tr!("Suppressor", "Supressor"),
+                    div().w(px(260.)).child(segmented("noise-kind", kinds, if classic { "classic" } else { "neural" }, t, cx, |_, kind, _, cx| {
+                        set_prefs(cx, |p| p.noise_suppressor = kind.into());
+                        apply_mic_prefs(cx);
+                    })),
+                ))
+                .child(caption(
+                    if classic {
+                        tr!(
+                            "Takes out steady noise, like fans and hum, and costs next to nothing. Keyboards and anything sudden get through.",
+                            "Tira ruídos constantes, como ventiladores e zumbidos, e quase não pesa. Teclados e barulhos repentinos passam."
+                        )
+                    } else {
+                        tr!(
+                            "A neural network that knows what a voice sounds like takes out the rest, keyboards and dogs included. It uses a little of the processor and adds 30 ms.",
+                            "Uma rede neural que sabe como uma voz soa tira o resto, teclados e cachorros incluídos. Usa um pouco do processador e acrescenta 30 ms."
+                        )
+                    },
+                    t.text3,
+                ))
+            })
             .child(toggle_row(
                 "confirm-join",
                 tr!("Ask before joining a voice channel", "Perguntar antes de entrar num canal de voz"),

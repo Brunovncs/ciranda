@@ -5,6 +5,7 @@ pub mod background;
 pub mod call;
 pub mod camera;
 pub mod composite;
+pub mod deepfilter;
 pub mod diagnose;
 #[cfg_attr(not(windows), allow(dead_code))]
 pub mod loopback;

@@ -36,9 +36,9 @@ recovery key brings your history to another computer.
 
 - **Screen or window sharing** at up to native resolution and 120 fps, with its
   sound: the whole computer except the call, or just the shared app.
-- **Voice channels** with cameras and screen shares, echo cancellation and noise
-  suppression, per-person volume up to 350%, mute, deafen and a shared
-  soundboard.
+- **Voice channels** with cameras and screen shares, echo cancellation, neural
+  noise suppression (DeepFilterNet: keyboards and dogs too, not just fans),
+  per-person volume up to 350%, mute, deafen and a shared soundboard.
 - **Camera backgrounds**: blur, six bundled pictures or one of your own. The
   person is cut out on your computer by a small segmentation model; only the
   finished picture is sent.
@@ -180,6 +180,7 @@ cargo about generate --locked -o target/THIRD_PARTY_LICENSES.txt about.hbs
 [LiveKit's libwebrtc bindings](https://github.com/livekit/rust-sdks) ·
 [tract](https://github.com/sonos/tract) ·
 [MediaPipe selfie segmentation](https://huggingface.co/onnx-community/mediapipe_selfie_segmentation) ·
+[DeepFilterNet](https://github.com/Rikorose/DeepFilterNet) ·
 [Figtree](https://github.com/erikdkennedy/figtree) ·
 [Geist Mono](https://vercel.com/font) ·
 [Lucide](https://lucide.dev/)

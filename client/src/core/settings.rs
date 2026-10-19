@@ -67,6 +67,9 @@ pub struct Settings {
     /// Asks GitHub for a newer version at start and every few hours.
     pub check_updates: bool,
     pub noise_suppression: bool,
+    /// Which suppressor: "neural" (DeepFilterNet, see `media::deepfilter`) or "classic" (the
+    /// processing module's own).
+    pub noise_suppressor: String,
     pub echo_cancellation: bool,
     pub camera_background: Background,
     pub custom_backgrounds: Vec<String>,
@@ -632,6 +635,7 @@ impl Default for Settings {
             window_audio_fallback: "silent".into(),
             check_updates: true,
             noise_suppression: true,
+            noise_suppressor: "neural".into(),
             echo_cancellation: true,
             camera_background: Background::None,
             custom_backgrounds: Vec::new(),

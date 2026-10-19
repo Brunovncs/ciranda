@@ -3,10 +3,12 @@
 //! canceller hears exactly what the speakers play.
 //!
 //! The speakers play a mix of sources (each voice, a screen's audio, cues, soundpad clips). The
-//! microphone goes through the audio processing module (echo cancellation and noise suppression,
-//! fed the mix as its reference), then the input volume and the noise gate, then to whatever
-//! WebRTC source is listening. Everything inside runs at 48 kHz.
+//! microphone goes through the audio processing module (echo cancellation, fed the mix as its
+//! reference, and the classic noise suppression), then DeepFilterNet when it suppresses the noise
+//! instead, then the input volume and the noise gate, then to whatever WebRTC source is
+//! listening. Everything inside runs at 48 kHz.
 
+use super::deepfilter::{self, DeepFilter};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SizedSample};
 use libwebrtc::native::apm::AudioProcessingModule;
@@ -797,6 +799,8 @@ pub struct Mic {
     pub muted: AtomicBool,
     pub echo_cancellation: AtomicBool,
     pub noise_suppression: AtomicBool,
+    /// Noise suppressed by DeepFilterNet rather than by the processing module.
+    pub neural: AtomicBool,
     /// Loudest 10 ms since last read, after the input volume, before the gate.
     pub level: AtomicF32,
     /// Whether the gate let the last frame through.
@@ -900,6 +904,7 @@ impl Audio {
             muted: AtomicBool::new(false),
             echo_cancellation: AtomicBool::new(true),
             noise_suppression: AtomicBool::new(true),
+            neural: AtomicBool::new(true),
             level: AtomicF32::default(),
             open: AtomicBool::new(false),
             capturing: AtomicBool::new(false),
@@ -1466,12 +1471,67 @@ fn raise_priority() {
     }
 }
 
+/// The most DeepFilterNet takes off the noise, in dB. Taken all the way down, the room vanishes
+/// between words and comes back under them, which people hear as cuts and a metallic hiss.
+const NEURAL_LIMIT_DB: f32 = 30.;
+
+const _: () = assert!(FRAME == deepfilter::HOP);
+
+/// DeepFilterNet on the processing thread. Building it would stall the microphone, so that
+/// happens on a thread of its own the first time it is wanted, with the processing module's
+/// suppressor standing in until it is ready, and for good if it fails.
+enum Neural {
+    Idle,
+    Loading(mpsc::Receiver<anyhow::Result<DeepFilter>>),
+    Ready(Box<DeepFilter>),
+    Failed,
+}
+
+impl Neural {
+    /// The filter once it is built; the first call starts building it.
+    fn get(&mut self) -> Option<&mut DeepFilter> {
+        if let Neural::Idle = self {
+            let (tx, rx) = mpsc::channel();
+            let spawned = std::thread::Builder::new().name("ciranda-deepfilter".into()).spawn(move || {
+                let started = Instant::now();
+                let loaded = DeepFilter::load().map(|mut df| {
+                    df.set_attenuation_limit(NEURAL_LIMIT_DB);
+                    df
+                });
+                log::info!("noise suppression: DeepFilterNet built in {} ms", started.elapsed().as_millis());
+                let _ = tx.send(loaded);
+            });
+            *self = if spawned.is_ok() { Neural::Loading(rx) } else { Neural::Failed };
+        }
+        if let Neural::Loading(rx) = self {
+            match rx.try_recv() {
+                Ok(Ok(df)) => *self = Neural::Ready(Box::new(df)),
+                Ok(Err(e)) => {
+                    log::warn!("noise suppression: DeepFilterNet failed to load, using the processing module's: {e:#}");
+                    *self = Neural::Failed;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => *self = Neural::Failed,
+            }
+        }
+        match self {
+            Neural::Ready(df) => Some(df),
+            _ => None,
+        }
+    }
+}
+
 /// Turns raw microphone audio into what the call sends: echo cancelled against the mix, noise
 /// suppressed, at the input volume, gated.
 fn dsp_thread(mixer: Arc<Mixer>, mic: Arc<Mic>, near: Near) {
     raise_priority();
     let mut apm: Option<(bool, bool, AudioProcessingModule)> = None;
+    let mut neural = Neural::Idle;
+    // Whether the last frame went through it: one that comes back to it after a pause or the
+    // other suppressor starts from silence, not from what it heard back then.
+    let mut was_neural = false;
     let mut frame = vec![0f32; FRAME];
+    let mut clean = vec![0f32; FRAME];
     let mut pcm = vec![0i16; FRAME];
     let mut far = vec![0i16; FRAME];
     // The speakers' mix, taken from the mixer whole and worked through here, so the output
@@ -1483,6 +1543,10 @@ fn dsp_thread(mixer: Arc<Mixer>, mic: Arc<Mic>, near: Near) {
     let tick = Duration::from_millis(10);
     let mut next_silence = Instant::now() + tick;
     loop {
+        // Built ahead, so the first call already has it.
+        if mic.noise_suppression.load(Ordering::Relaxed) && mic.neural.load(Ordering::Relaxed) {
+            neural.get();
+        }
         let heard = {
             let (buf, cv) = &*near;
             let mut b = buf.lock();
@@ -1521,6 +1585,7 @@ fn dsp_thread(mixer: Arc<Mixer>, mic: Arc<Mic>, near: Near) {
             // again, ahead of the first captured frame, and throw its delay estimate off.
             mixer.far.lock().clear();
             far_pending.clear();
+            was_neural = false;
             if let Some(sink) = mic.sink.lock().as_mut() {
                 pcm.fill(0);
                 sink(&pcm);
@@ -1528,8 +1593,17 @@ fn dsp_thread(mixer: Arc<Mixer>, mic: Arc<Mic>, near: Near) {
             continue;
         }
         let (aec, ns) = (mic.echo_cancellation.load(Ordering::Relaxed), mic.noise_suppression.load(Ordering::Relaxed));
-        if apm.as_ref().is_none_or(|(a, n, _)| (*a, *n) != (aec, ns)) {
-            apm = Some((aec, ns, AudioProcessingModule::new(aec, false, true, ns)));
+        let mut df = if ns && mic.neural.load(Ordering::Relaxed) { neural.get() } else { None };
+        if let Some(df) = df.as_mut()
+            && !was_neural
+        {
+            df.reset();
+        }
+        was_neural = df.is_some();
+        // Never both suppressors: the second would eat what the first left of the voice.
+        let apm_ns = ns && df.is_none();
+        if apm.as_ref().is_none_or(|(a, n, _)| (*a, *n) != (aec, apm_ns)) {
+            apm = Some((aec, apm_ns, AudioProcessingModule::new(aec, false, true, apm_ns)));
         }
         let (_, _, module) = apm.as_mut().unwrap();
         // The far end first: everything the speakers played since the last frame. The swap
@@ -1548,6 +1622,27 @@ fn dsp_thread(mixer: Arc<Mixer>, mic: Arc<Mic>, near: Near) {
             *d = (s.clamp(-1., 1.) * 32767.) as i16;
         }
         let _ = module.process_stream(&mut pcm, RATE as i32, 1);
+        // After the echo canceller: the network was never taught what an echo is.
+        let failed = df.as_mut().is_some_and(|df| {
+            for (d, &s) in frame.iter_mut().zip(&pcm) {
+                *d = s as f32 / 32768.;
+            }
+            match df.process(&frame, &mut clean) {
+                Ok(_) => {
+                    for (d, &s) in pcm.iter_mut().zip(&clean) {
+                        *d = (s.clamp(-1., 1.) * 32767.) as i16;
+                    }
+                    false
+                }
+                Err(e) => {
+                    log::warn!("noise suppression: DeepFilterNet failed, using the processing module's: {e:#}");
+                    true
+                }
+            }
+        });
+        if failed {
+            neural = Neural::Failed;
+        }
 
         let gain = mic.gain.get();
         let mut sum = 0f32;

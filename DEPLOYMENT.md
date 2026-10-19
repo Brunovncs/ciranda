@@ -507,6 +507,15 @@ module (echo cancellation, noise suppression) on the microphone with the mix the
 speakers play as its reference. That is what makes per-person volume up to 350%,
 deafening that spares the soundpad, and the noise gate possible.
 
+**Noise suppression.** By default DeepFilterNet3 (MIT) suppresses the noise
+instead of the processing module, after the echo canceller: a neural network,
+run on the CPU through tract, that also takes out keyboards and other sudden
+noise. It adds 30 ms and about 0.25 ms of work per 10 ms frame on a Ryzen 5
+7600 (3% of one core); the noise is lowered by at most 30 dB, never cut to
+nothing. Settings, Voice and sound, "Traditional" goes
+back to the processing module's suppressor. `cargo run --release --example
+denoise -- file.wav` runs a 48 kHz recording through both, to compare them.
+
 **Screen sound.** Through Windows' process loopback (Windows 10 2004 or later):
 a screen share sends everything the computer plays except Ciranda itself, so
 viewers never hear the call back; a window share can send only that

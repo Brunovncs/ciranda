@@ -8,6 +8,7 @@ Everything here ships inside the program: `ciranda.exe` on Windows, the AppImage
 | Figtree, by Erik Kennedy and the Figtree Project Authors (static Regular to Bold instances of the variable font, cut down to Latin, Greek and Cyrillic) | `assets/fonts/Figtree-*.ttf` | SIL Open Font License 1.1, in `assets/fonts/OFL.txt` |
 | Geist Mono, by Vercel | `assets/fonts/GeistMono-*.ttf` | SIL Open Font License 1.1, in `assets/fonts/OFL.txt` |
 | MediaPipe selfie segmentation, by Google, as converted to ONNX by onnx-community | `assets/models/selfie_segmentation.onnx` | Apache 2.0 |
+| DeepFilterNet3, by Hendrik Schröter: the published ONNX export, and libDF's STFT, features and streaming loop, ported to this client's tract | `assets/models/deepfilternet3/`, `src/media/deepfilter.rs` | MIT or Apache 2.0; MIT taken, below |
 | Lucide icons, by the Lucide contributors (path data, every icon but `soundboard` and `blur`) | `src/icons.rs` | ISC, below |
 | The text field, the theme's Windows accent reader and the widget patterns, from OpenController by Brunovncs | `src/text_field.rs`, `src/theme.rs`, `src/widgets.rs` | MIT |
 | libwebrtc, by the WebRTC project, through LiveKit's `libwebrtc` and `webrtc-sys` crates | linked in; `webrtc-sys` vendored in `vendor/webrtc-sys` with a Media Foundation encoder added | BSD 3-Clause (libwebrtc), Apache 2.0 (bindings) |
@@ -51,6 +52,29 @@ The Feather portions are under the MIT licence:
 The MIT License (MIT)
 
 Copyright (c) 2013-2022 Cole Bemis
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
+associated documentation files (the "Software"), to deal in the Software without restriction,
+including without limitation the rights to use, copy, modify, merge, publish, distribute,
+sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or
+substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT
+NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT
+OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+```
+
+## DeepFilterNet licence
+
+```
+The MIT License (MIT)
+
+Copyright (c) 2021 Hendrik Schröter
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
 associated documentation files (the "Software"), to deal in the Software without restriction,
