@@ -418,43 +418,7 @@ impl Settings {
                     apply_mic_prefs(cx);
                 },
             ))
-            .child(toggle_row(
-                "noise",
-                tr!("Noise suppression", "Supressão de ruído"),
-                tr!("Takes the background noise out of your microphone.", "Tira o ruído de fundo do seu microfone."),
-                p.noise_suppression,
-                t,
-                cx,
-                |cx| {
-                    set_prefs(cx, |p| p.noise_suppression = !p.noise_suppression);
-                    apply_mic_prefs(cx);
-                },
-            ))
-            .when(p.noise_suppression, |d| {
-                let classic = p.noise_suppressor == "classic";
-                let kinds = vec![("neural", tr!("AI", "IA").into()), ("classic", tr!("Traditional", "Tradicional").into())];
-                d.child(row_field(
-                    tr!("Suppressor", "Supressor"),
-                    div().w(px(260.)).child(segmented("noise-kind", kinds, if classic { "classic" } else { "neural" }, t, cx, |_, kind, _, cx| {
-                        set_prefs(cx, |p| p.noise_suppressor = kind.into());
-                        apply_mic_prefs(cx);
-                    })),
-                ))
-                .child(caption(
-                    if classic {
-                        tr!(
-                            "Takes out steady noise, like fans and hum, and costs next to nothing. Keyboards and anything sudden get through.",
-                            "Tira ruídos constantes, como ventiladores e zumbidos, e quase não pesa. Teclados e barulhos repentinos passam."
-                        )
-                    } else {
-                        tr!(
-                            "A neural network that knows what a voice sounds like takes out the rest, keyboards and dogs included. It uses a little of the processor and adds 30 ms.",
-                            "Uma rede neural que sabe como uma voz soa tira o resto, teclados e cachorros incluídos. Usa um pouco do processador e acrescenta 30 ms."
-                        )
-                    },
-                    t.text3,
-                ))
-            })
+            .child(noise_row(&p, t, cx))
             .child(toggle_row(
                 "confirm-join",
                 tr!("Ask before joining a voice channel", "Perguntar antes de entrar num canal de voz"),
@@ -1156,6 +1120,97 @@ fn toggle_row(
             f(cx);
             cx.notify();
         }))
+}
+
+/// Noise suppression off, the classic one or Ciranda's, in one row: Ciranda's wears the icon's
+/// colours.
+fn noise_row(p: &crate::core::settings::Settings, t: &Theme, cx: &mut Context<Settings>) -> gpui::Div {
+    let picked = match (p.noise_suppression, p.noise_suppressor.as_str()) {
+        (false, _) => "off",
+        (true, "classic") => "classic",
+        (true, _) => "neural",
+    };
+    let choices = [
+        ("off", tr!("Off", "Desligada"), tr!("Everything the microphone hears is sent.", "Tudo o que o microfone capta é enviado.")),
+        (
+            "classic",
+            tr!("Traditional", "Tradicional"),
+            tr!("Steady noise like fans and hum; light on the processor.", "Ruídos constantes, como ventilador e zumbido; quase não pesa."),
+        ),
+        (
+            "neural",
+            "Ciranda",
+            tr!(
+                "Keyboards, dogs and anything sudden too; adds 30 ms.",
+                "Teclado, cachorro e barulhos repentinos também; acrescenta 30 ms."
+            ),
+        ),
+    ];
+    let (blue, violet): (gpui::Hsla, gpui::Hsla) = (gpui::rgb(0x5b8cff).into(), gpui::rgb(0xa07cff).into());
+    let mut picker =
+        div().flex_none().flex().gap(px(2.)).p(px(3.)).rounded(px(radius::CONTROL)).bg(t.well).border_1().border_color(t.stroke);
+    for (i, (kind, name, hint)) in choices.into_iter().enumerate() {
+        let on = kind == picked;
+        let ciranda = kind == "neural";
+        let hover = t.text;
+        picker = picker.child(
+            div()
+                .id(("noise-kind", i))
+                .flex()
+                .items_center()
+                .gap(px(5.))
+                .h(px(28.))
+                .px(px(10.))
+                .rounded(px(radius::INNER))
+                .cursor_pointer()
+                .text_size(px(13.))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .tooltip(tip(hint, t))
+                .when(ciranda, |d| d.child(icon("sparkles", 13., if on { gpui::white() } else { violet })))
+                .when(on && ciranda, |d| {
+                    d.bg(gpui::linear_gradient(90., gpui::linear_color_stop(blue, 0.), gpui::linear_color_stop(violet, 1.)))
+                        .text_color(gpui::white())
+                })
+                .when(on && !ciranda, |d| d.bg(t.accent_soft).text_color(t.accent))
+                .when(!on && ciranda, |d| d.text_color(violet).hover(move |s| s.bg(violet.opacity(0.12))))
+                .when(!on && !ciranda, |d| d.text_color(t.text2).hover(move |s| s.text_color(hover)))
+                .child(name)
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    set_prefs(cx, |p| {
+                        p.noise_suppression = kind != "off";
+                        if kind != "off" {
+                            p.noise_suppressor = kind.into();
+                        }
+                    });
+                    apply_mic_prefs(cx);
+                    cx.notify();
+                })),
+        );
+    }
+    div()
+        .flex()
+        .items_center()
+        .gap(px(16.))
+        .px(px(14.))
+        .py(px(12.))
+        .rounded(px(radius::CARD))
+        .bg(t.layer)
+        .border_1()
+        .border_color(t.stroke)
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w(px(0.))
+                .gap(px(2.))
+                .child(body(tr!("Noise suppression", "Supressão de ruído"), t.text))
+                .child(caption(
+                    tr!("Takes the background noise out of your microphone.", "Tira o ruído de fundo do seu microfone."),
+                    t.text2,
+                )),
+        )
+        .child(picker)
 }
 
 /// A field that shows the current choice and opens a menu of the others.
