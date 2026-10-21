@@ -12,7 +12,7 @@ use crate::media::video::{Tile, TileKind};
 use crate::media::voice::Voice;
 use crate::prefs::{prefs, set_prefs};
 use crate::session::Session;
-use crate::theme::{MONO, Theme, current, px, radius};
+use crate::theme::{MONO, Theme, current, px, radius, text};
 use crate::ui::hotkeys::Recorder;
 use crate::ui::ink::{self, InkLayer, Share};
 use crate::ui::overlay::{self, Dismiss, menu_card, menu_item, menu_rule};
@@ -119,7 +119,14 @@ impl ServerView {
             .border_color(t.stroke)
             .child(icon(if private { "phone" } else { "volume" }, 18., t.success))
             .child(title(name, t.text))
-            .when(!private, |d| d.child(mono(trf!("{} here", "{} aqui", roster.len()), t.text3)))
+            // In the title's own font and line, so the two share a baseline.
+            .when(!private, |d| {
+                d.child(div().text_size(px(13.)).line_height(px(text::TITLE.1)).text_color(t.text3).relative().top(px(1.)).child(trf!(
+                    "{} here",
+                    "{} aqui",
+                    roster.len()
+                )))
+            })
             .when(private, |d| {
                 d.child(chip(
                     if ringing { tr!("Ringing…", "Chamando…") } else { tr!("End-to-end encrypted", "Criptografia de ponta a ponta") },

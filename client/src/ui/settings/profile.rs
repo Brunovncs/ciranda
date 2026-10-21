@@ -254,7 +254,7 @@ impl Settings {
         };
 
         let header = card(t)
-            .child(div().h(px(78.)).bg(linear_gradient(
+            .child(div().h(px(78.)).rounded_t(px(radius::CARD - 1.)).bg(linear_gradient(
                 100.,
                 linear_color_stop(t.accent.opacity(0.75), 0.),
                 linear_color_stop(t.accent.opacity(0.18), 1.),
@@ -267,7 +267,7 @@ impl Settings {
                             .items_center()
                             .gap(px(8.))
                             .child(mono(format!("@{}", me.nickname), t.text2))
-                            .child(chip(role_name, role_color))
+                            .child(chip(role_name.to_lowercase(), role_color))
                             .child(
                                 div()
                                     .flex()
@@ -417,8 +417,8 @@ impl Settings {
                     .child(div().flex_1().min_w(px(0.)).child(body(what, if ok { t.text } else { t.text3 })))
                     .when(!ok, |d| {
                         d.child(match need {
-                            1 => chip(tr!("Admin", "Admin"), t.text3),
-                            _ => chip(tr!("Owner", "Dono"), t.text3),
+                            1 => chip(tr!("admin", "admin"), t.text3),
+                            _ => chip(tr!("owner", "dono"), t.text3),
                         })
                     }),
             );

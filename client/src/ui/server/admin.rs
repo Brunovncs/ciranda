@@ -1375,9 +1375,9 @@ fn lock_note(reason: &'static str, t: &Theme) -> gpui::Div {
 
 pub fn role_chip(role: Role, t: &Theme) -> gpui::Div {
     match role {
-        Role::Owner => chip(tr!("Owner", "Dono"), t.caution),
-        Role::Admin => chip(tr!("Admin", "Admin"), t.accent),
-        Role::Member => chip(tr!("Member", "Membro"), t.text2),
+        Role::Owner => chip(tr!("owner", "dono"), t.caution),
+        Role::Admin => chip(tr!("admin", "admin"), t.accent),
+        Role::Member => chip(tr!("member", "membro"), t.text2),
     }
 }
 

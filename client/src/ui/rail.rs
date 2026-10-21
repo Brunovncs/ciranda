@@ -7,10 +7,12 @@
 use super::Root;
 use super::connect::{AddServer, Adding, ConnectEvent, Me};
 use super::overlay::{self, Ask, Dismiss, menu_card, menu_item, menu_rule};
+use super::server::ServerView;
 use super::server::sidebar::{Menu, MenuEntry};
 use crate::core::api::Api;
 use crate::core::cache::Cache;
 use crate::core::settings::{Account, SavedServer, same_server};
+use crate::core::types::{ConversationId, Room, UserId};
 use crate::core::{self};
 use crate::prefs::{prefs, set_prefs};
 use crate::session::{Session, decode_picture};
@@ -60,8 +62,10 @@ impl Root {
             .ml(px(GUTTER))
             .py(px(GUTTER))
             .gap(px(8.))
-            .when(server_view.is_some(), |d| {
-                d.child(self.dms_tile(dms_open, t, cx)).child(div().mx(px(14.)).h(px(1.)).flex_none().bg(t.stroke))
+            .when_some(server_view, |d, view| {
+                d.child(self.dms_tile(dms_open, t, cx))
+                    .children(self.unread_dms(&view, t, cx))
+                    .child(div().mx(px(14.)).h(px(1.)).flex_none().bg(t.stroke))
             })
             .child(list)
             .child(div().mx(px(14.)).h(px(1.)).flex_none().bg(t.stroke))
@@ -113,6 +117,49 @@ impl Root {
                 }
                 cx.notify();
             }))
+    }
+
+    /// Under "Direct messages", whoever wrote you something you have not read yet, newest first,
+    /// on any server whose messages open here. A click opens the conversation, and reading it
+    /// takes them off the rail.
+    fn unread_dms(&mut self, view: &Entity<ServerView>, t: &Theme, cx: &mut Context<Root>) -> Vec<gpui::Stateful<gpui::Div>> {
+        const MOST: usize = 5;
+        let home = view.read(cx).session.clone();
+        let mut unread: Vec<(i64, Entity<Session>, ConversationId, UserId, u32)> = Vec::new();
+        for session in crate::elsewhere::sessions(cx) {
+            let s = session.read(cx);
+            if session != home && !s.vault.ready() {
+                continue;
+            }
+            unread.extend(
+                s.dms.values().filter(|d| d.info.unread > 0).map(|d| (d.info.last_at, session.clone(), d.info.id, d.peer, d.info.unread)),
+            );
+        }
+        unread.sort_by_key(|u| std::cmp::Reverse((u.0, u.2)));
+        unread
+            .into_iter()
+            .take(MOST)
+            .map(|(_, session, conversation, peer, n)| {
+                let picture = session.update(cx, |s, cx| s.avatar(peer, cx));
+                let name = session.read(cx).display_name(Some(peer), None);
+                let here = session == home;
+                let view = view.clone();
+                rail_slot(SharedString::from(format!("rail-dm-{}-{conversation}", session.entity_id())), false, t)
+                    .child(div().rounded_full().hover(|s| s.opacity(0.85)).child(avatar(&name, picture, TILE, None)))
+                    .child(unread_badge(n, t))
+                    .tooltip(tip(name, t))
+                    .on_click(cx.listener(move |_, _, window, cx| {
+                        view.update(cx, |v, cx| {
+                            if here {
+                                v.open_room(Room::Dm(conversation), window, cx)
+                            } else {
+                                v.open_away(session.clone(), conversation, window, cx)
+                            }
+                        });
+                        cx.notify();
+                    }))
+            })
+            .collect()
     }
 
     fn account_button(&mut self, a: &Account, t: &Theme, cx: &mut Context<Root>) -> gpui::Stateful<gpui::Div> {
@@ -437,14 +484,14 @@ fn unread_badge(n: u32, t: &Theme) -> gpui::Div {
         .absolute()
         .top(px(-3.))
         .right(px(4.))
-        .h(px(18.))
+        .h(px(17.))
         // A circle for one digit; wider only when the number is.
-        .map(|d| if n < 10 { d.w(px(18.)) } else { d.px(px(5.)) })
+        .map(|d| if n < 10 { d.w(px(17.)) } else { d.px(px(5.)) })
         .flex()
         .items_center()
         .justify_center()
         .rounded_full()
-        .border_2()
+        .border_1()
         .border_color(t.pane)
         .bg(t.critical)
         .text_size(px(10.5))
@@ -460,12 +507,12 @@ fn voice_badge(t: &Theme) -> gpui::Div {
         .absolute()
         .bottom(px(-3.))
         .right(px(4.))
-        .size(px(18.))
+        .size(px(17.))
         .flex()
         .items_center()
         .justify_center()
         .rounded_full()
-        .border_2()
+        .border_1()
         .border_color(t.pane)
         .bg(t.success)
         .child(icon("volume", 10., t.on_accent))

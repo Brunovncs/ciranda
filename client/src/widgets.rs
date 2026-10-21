@@ -174,20 +174,17 @@ pub fn chip(s: impl Into<SharedString>, color: Hsla) -> Div {
         .flex()
         .flex_none()
         .items_center()
-        .h(px(16.))
-        .px(px(5.))
-        // Mono capitals ride high in their line; this centres the letters themselves.
-        .pt(px(2.))
-        .rounded(px(4.))
+        .h(px(18.))
+        .px(px(7.))
+        .rounded_full()
         .border_1()
         .border_dashed()
         .border_color(color.opacity(0.55))
-        .font_family(MONO)
-        .text_size(px(9.5))
-        .line_height(px(12.))
+        .text_size(px(11.5))
+        .line_height(px(14.))
         .font_weight(FontWeight::MEDIUM)
         .text_color(color.opacity(0.9))
-        .child(s.into().to_uppercase())
+        .child(s.into())
 }
 
 /// A dot that glows in its colour: connected, speaking, live.

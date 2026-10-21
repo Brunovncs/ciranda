@@ -131,7 +131,7 @@ pub fn palettes() -> [(&'static str, &'static str); 10] {
 fn palette(name: &str) -> Option<Palette> {
     Some(match name {
         "midnight" => pal(
-            [0x0f1116, 0x171a21, 0x1f232c, 0x2a2f3a, 0x3b4252, 0xe6e8ee, 0x8b93a7, 0x5b8cff, 0xe05561, 0x3fd07f, 0xe3a008, 0x07090d],
+            [0x0f1116, 0x171a21, 0x1f232c, 0x2a2f3a, 0x3b4252, 0xe6e8ee, 0x8b93a7, 0x6682ff, 0xe05561, 0x3fd07f, 0xe3a008, 0x07090d],
             false,
         ),
         "dark" => pal(
@@ -159,7 +159,7 @@ fn palette(name: &str) -> Option<Palette> {
             false,
         ),
         "daylight" => pal(
-            [0xf2f3f5, 0xffffff, 0xebedef, 0xd4d7dc, 0xb6bbc4, 0x22262b, 0x5c6670, 0x3a6df0, 0xc4303a, 0x1a9550, 0x9a6a00, 0x16181d],
+            [0xf2f3f5, 0xffffff, 0xebedef, 0xd4d7dc, 0xb6bbc4, 0x22262b, 0x5c6670, 0x0b2ecb, 0xc4303a, 0x1a9550, 0x9a6a00, 0x16181d],
             true,
         ),
         _ => return None,
@@ -190,7 +190,7 @@ impl CustomColors {
     }
 
     pub fn midnight() -> CustomColors {
-        CustomColors { bg: 0x0f1116, surface: 0x171a21, text: 0xe6e8ee, accent: 0x5b8cff }
+        CustomColors { bg: 0x0f1116, surface: 0x171a21, text: 0xe6e8ee, accent: 0x6682ff }
     }
 }
 
@@ -321,7 +321,8 @@ impl Theme {
     }
 }
 
-/// Follows Windows: its light or dark mode, and its accent colour.
+/// Follows Windows: its light or dark mode, and its accent colour, or Ciranda's own blue when
+/// that is a grey.
 fn system(window: WindowAppearance) -> Palette {
     let dark = matches!(window, WindowAppearance::Dark | WindowAppearance::VibrantDark);
     let accent = windows_accent(dark).map(|a| {
@@ -330,14 +331,14 @@ fn system(window: WindowAppearance) -> Palette {
     });
     if dark {
         let mut p = pal(
-            [0x111214, 0x1a1b1f, 0x26282d, 0x2c2e34, 0x3c3f46, 0xf3f4f6, 0x9da3ad, 0x60cdff, 0xff6b78, 0x6ccb5f, 0xfcc419, 0x08090b],
+            [0x111214, 0x1a1b1f, 0x26282d, 0x2c2e34, 0x3c3f46, 0xf3f4f6, 0x9da3ad, 0x6682ff, 0xff6b78, 0x6ccb5f, 0xfcc419, 0x08090b],
             false,
         );
         p.accent = accent.unwrap_or(p.accent);
         p
     } else {
         let mut p = pal(
-            [0xf2f3f5, 0xffffff, 0xf1f2f4, 0xdfe1e5, 0xc4c7cd, 0x1b1c1f, 0x5f6570, 0x005fb8, 0xc42b1c, 0x0f7b0f, 0x9d5d00, 0x16181d],
+            [0xf2f3f5, 0xffffff, 0xf1f2f4, 0xdfe1e5, 0xc4c7cd, 0x1b1c1f, 0x5f6570, 0x0b2ecb, 0xc42b1c, 0x0f7b0f, 0x9d5d00, 0x16181d],
             true,
         );
         p.accent = accent.unwrap_or(p.accent);

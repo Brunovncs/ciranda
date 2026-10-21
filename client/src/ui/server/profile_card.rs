@@ -187,7 +187,9 @@ impl gpui::Render for ProfileCard {
                     .items_center()
                     .gap(px(6.))
                     .child(div().truncate().text_size(px(18.)).font_weight(FontWeight::SEMIBOLD).text_color(t.text).child(f.name.clone()))
-                    .when_some(rank, |d, (glyph, _, color)| d.child(icon(glyph, 15., color))),
+                    .when_some(rank, |d, (glyph, text, color)| {
+                        d.child(div().id("profile-rank").child(icon(glyph, 15., color)).tooltip(tip(text, &t)))
+                    }),
             )
             .when_some(f.nickname.clone(), |d, n| d.child(div().truncate().text_size(px(13.)).text_color(t.text2).child(format!("@{n}"))));
 
@@ -270,8 +272,9 @@ impl gpui::Render for ProfileCard {
             .shadow_lg()
             .overflow_hidden()
             .occlude()
-            // Their colour, dimmed, so the initials on it in full stand out from it.
-            .child(div().h(px(BANNER)).bg(name_color(&f.name).opacity(0.55)))
+            // Their colour, dimmed, so the initials on it in full stand out from it. Rounded itself:
+            // `overflow_hidden` clips to the square, not to the card's corners.
+            .child(div().h(px(BANNER)).rounded_t(px(radius::PANE + 1.)).bg(name_color(&f.name).opacity(0.55)))
             .child(div().mt(px(-(PICTURE / 2. + 4.))).px(px(12.)).flex().child(self.picture(&f, image, &t, cx)))
             .child(div().pt(px(6.)).pb(px(12.)).child(names))
             .child(facts)
