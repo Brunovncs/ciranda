@@ -1093,7 +1093,7 @@ dependencies = [
 
 [[package]]
 name = "ciranda"
-version = "4.6.3"
+version = "4.6.4"
 dependencies = [
  "anyhow",
  "async-channel",
