@@ -445,10 +445,10 @@ impl Settings {
             ))
             .child(toggle_row(
                 "join-muted",
-                tr!("Join voice channels muted", "Entrar mutado nos canais de voz"),
+                tr!("Join calls and voice channels muted", "Entrar mutado nas chamadas e canais de voz"),
                 tr!(
-                    "Your microphone starts off in every voice channel; unmute when you want to talk.",
-                    "Seu microfone começa desligado em todo canal de voz; desmute quando quiser falar."
+                    "Your microphone starts off in every voice channel and call, switching rooms included; unmute when you want to talk.",
+                    "Seu microfone começa desligado em todo canal de voz e chamada, inclusive ao trocar de sala; desmute quando quiser falar."
                 ),
                 p.join_muted,
                 t,
@@ -1091,6 +1091,7 @@ fn row_field(name: &'static str, control: impl IntoElement) -> gpui::Div {
     div().flex().flex_col().gap(px(6.)).child(label(name, &t)).child(control)
 }
 
+/// A switch with its title; what it does shows on hover.
 fn toggle_row(
     id: &'static str,
     title_text: &'static str,
@@ -1114,7 +1115,8 @@ fn toggle_row(
         .border_color(t.stroke)
         .cursor_pointer()
         .hover(move |s| s.bg(hover))
-        .child(div().flex().flex_col().flex_1().min_w(px(0.)).gap(px(2.)).child(body(title_text, t.text)).child(caption(hint, t.text2)))
+        .tooltip(tip(hint, t))
+        .child(div().flex_1().min_w(px(0.)).child(body(title_text, t.text)))
         .child(switch(on, t))
         .on_click(cx.listener(move |_, _, _, cx| {
             f(cx);

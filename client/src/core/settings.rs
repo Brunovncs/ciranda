@@ -83,7 +83,7 @@ pub struct Settings {
     pub confirm_voice_join: bool,
     /// Going to another server while in a voice channel or a call asks first: it ends them.
     pub confirm_server_switch: bool,
-    /// Every voice channel is entered with the microphone off, switching between them included.
+    /// Every voice channel and call is entered with the microphone off, switching between them included.
     pub join_muted: bool,
     /// Where the window was and whether it was maximised, to open it there again.
     pub window: Option<WindowPlace>,
