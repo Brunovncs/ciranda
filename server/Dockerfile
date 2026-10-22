@@ -23,8 +23,8 @@
 # same Node and the same Alpine, and a retagged image cannot slip in. Bumping
 # them is deliberate -- take the new tag's digest from Docker Hub, or
 #   docker buildx imagetools inspect node:<tag>
-ARG NODE_VERSION=24.22.0-alpine3.24@sha256:44fce696f38ba8c987c4db89954051000bbd05ffd8d8659ba15ed4a8602e937f
-ARG ALPINE_VERSION=3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+ARG NODE_VERSION=24.22.1-alpine3.24@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c934d3ecec86c33918b53
+ARG ALPINE_VERSION=3.24.3@sha256:b3413572228e34bd1c9245f5565e6cd127005655e8a7899aef33d8e83255c9e6
 
 # Pinned for the same reason install.sh pins it: MediaMTX removes configuration
 # keys between releases, and an unknown key aborts startup rather than warning.
