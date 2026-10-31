@@ -1,7 +1,7 @@
 //! Runs a recording through both noise suppressors the way a call does, to hear them side by side:
 //! `<name>.classic.wav` has the processing module's suppressor, `<name>.neural.wav` DeepFilterNet
-//! after the same module with its suppressor off. The input is a 48 kHz WAV, 16-bit or float,
-//! mixed down to mono.
+//! after the same module with its suppressor off, and `<name>.agc.wav` that with the automatic gain
+//! on top, as a call sends it. The input is a 48 kHz WAV, 16-bit or float, mixed down to mono.
 //!
 //!     cargo run --release --example denoise -- recording.wav [--limit dB] [--raw]
 //!
@@ -59,6 +59,15 @@ fn main() -> anyhow::Result<()> {
         out.extend_from_slice(&clean);
     }
     write_wav(&with_suffix(&input, "neural"), &out)?;
+
+    let mut agc = AudioProcessingModule::new(false, true, false, false);
+    let mut gained = Vec::with_capacity(out.len());
+    for chunk in out.chunks_exact(HOP) {
+        let mut pcm: Vec<i16> = chunk.iter().map(|s| (s.clamp(-1., 1.) * 32767.) as i16).collect();
+        let _ = agc.process_stream(&mut pcm, 48_000, 1);
+        gained.extend(pcm.iter().map(|&s| s as f32 / 32768.));
+    }
+    write_wav(&with_suffix(&input, "agc"), &gained)?;
 
     times.sort();
     let ms = |d: Duration| d.as_secs_f64() * 1000.;

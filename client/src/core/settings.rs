@@ -71,6 +71,8 @@ pub struct Settings {
     /// processing module's own).
     pub noise_suppressor: String,
     pub echo_cancellation: bool,
+    /// The microphone evened out to one speaking level, as Discord does by default.
+    pub auto_gain: bool,
     pub camera_background: Background,
     pub custom_backgrounds: Vec<String>,
     /// "en", "pt", or empty to follow the system.
@@ -637,6 +639,7 @@ impl Default for Settings {
             noise_suppression: true,
             noise_suppressor: "neural".into(),
             echo_cancellation: true,
+            auto_gain: true,
             camera_background: Background::None,
             custom_backgrounds: Vec::new(),
             language: String::new(),

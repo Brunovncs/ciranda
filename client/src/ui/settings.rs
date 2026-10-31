@@ -418,6 +418,21 @@ impl Settings {
                     apply_mic_prefs(cx);
                 },
             ))
+            .child(toggle_row(
+                "auto-gain",
+                tr!("Automatic gain", "Ganho automático"),
+                tr!(
+                    "Evens out your voice, so a quiet microphone is heard as well as a loud one.",
+                    "Iguala o volume da sua voz, para um microfone baixo ser ouvido tão bem quanto um alto."
+                ),
+                p.auto_gain,
+                t,
+                cx,
+                |cx| {
+                    set_prefs(cx, |p| p.auto_gain = !p.auto_gain);
+                    apply_mic_prefs(cx);
+                },
+            ))
             .child(noise_row(&p, t, cx))
             .child(toggle_row(
                 "confirm-join",

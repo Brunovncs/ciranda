@@ -801,7 +801,10 @@ pub struct Mic {
     pub noise_suppression: AtomicBool,
     /// Noise suppressed by DeepFilterNet rather than by the processing module.
     pub neural: AtomicBool,
-    /// Loudest 10 ms since last read, after the input volume, before the gate.
+    /// Speech brought to one level after the suppressor, so a quiet microphone is heard as well.
+    pub auto_gain: AtomicBool,
+    /// Loudest 10 ms since last read, after the input volume and the automatic gain, before the
+    /// gate.
     pub level: AtomicF32,
     /// Whether the gate let the last frame through.
     pub open: AtomicBool,
@@ -905,6 +908,7 @@ impl Audio {
             echo_cancellation: AtomicBool::new(true),
             noise_suppression: AtomicBool::new(true),
             neural: AtomicBool::new(true),
+            auto_gain: AtomicBool::new(true),
             level: AtomicF32::default(),
             open: AtomicBool::new(false),
             capturing: AtomicBool::new(false),
@@ -1522,10 +1526,13 @@ impl Neural {
 }
 
 /// Turns raw microphone audio into what the call sends: echo cancelled against the mix, noise
-/// suppressed, at the input volume, gated.
+/// suppressed, at the input volume, evened out, gated.
 fn dsp_thread(mixer: Arc<Mixer>, mic: Arc<Mic>, near: Near) {
     raise_priority();
     let mut apm: Option<(bool, bool, AudioProcessingModule)> = None;
+    // A module of its own, after DeepFilterNet: in the first one it would raise the noise the
+    // network then has to take out, and hold its gain down for noise that never gets sent.
+    let mut agc: Option<AudioProcessingModule> = None;
     let mut neural = Neural::Idle;
     // Whether the last frame went through it: one that comes back to it after a pause or the
     // other suppressor starts from silence, not from what it heard back then.
@@ -1645,12 +1652,17 @@ fn dsp_thread(mixer: Arc<Mixer>, mic: Arc<Mic>, near: Near) {
         }
 
         let gain = mic.gain.get();
-        let mut sum = 0f32;
         for s in pcm.iter_mut() {
-            let v = (*s as f32 * gain).clamp(-32768., 32767.);
-            sum += (v / 32768.) * (v / 32768.);
-            *s = v as i16;
+            *s = (*s as f32 * gain).clamp(-32768., 32767.) as i16;
         }
+        let auto_gain = mic.auto_gain.load(Ordering::Relaxed);
+        if auto_gain != agc.is_some() {
+            agc = auto_gain.then(|| AudioProcessingModule::new(false, true, false, false));
+        }
+        if let Some(agc) = agc.as_mut() {
+            let _ = agc.process_stream(&mut pcm, RATE as i32, 1);
+        }
+        let sum = pcm.iter().map(|&s| (s as f32 / 32768.).powi(2)).sum::<f32>();
         let rms = (sum / FRAME as f32).sqrt();
         mic.level.max(rms);
 
