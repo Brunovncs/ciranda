@@ -5,7 +5,8 @@ use crate::theme::{FONT, MONO, Theme, px, radius, text};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Bounds, Context, Div, DragMoveEvent, ElementId, FontWeight, Hsla, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement, Pixels, Render, SharedString, Stateful, StatefulInteractiveElement, Styled, Window, canvas, div,
+    MouseDownEvent, ParentElement, Pixels, Point, Render, SharedString, Stateful, StatefulInteractiveElement, Styled, Window, canvas, div,
+    linear_color_stop, linear_gradient,
 };
 use std::cell::Cell;
 use std::rc::Rc;
@@ -433,4 +434,76 @@ pub fn track(id: impl Into<ElementId>, s: Slider, t: &Theme, on_change: impl Fn(
                 c2(fraction(e.bounds, e.event.position.x), cx);
             }
         })
+}
+
+/// Where a point falls in `b`, 0..=1 across and down.
+fn spot(b: Bounds<Pixels>, p: Point<Pixels>) -> (f32, f32) {
+    let f = |v: Pixels, o: Pixels, len: Pixels| if f32::from(len) <= 0. { 0. } else { (f32::from(v - o) / f32::from(len)).clamp(0., 1.) };
+    (f(p.x, b.origin.x, b.size.width), f(p.y, b.origin.y, b.size.height))
+}
+
+/// Something to drag across: `on_change` gets where the pointer is, 0..=1 across and down, from
+/// the press and all through the drag, past the edges included.
+fn drag_area(id: ElementId, on_change: impl Fn((f32, f32), &mut App) + 'static) -> Stateful<Div> {
+    let bounds: Rc<Cell<Bounds<Pixels>>> = Rc::new(Cell::new(Bounds::default()));
+    let on_change = Rc::new(on_change);
+    let (b1, b2) = (bounds.clone(), bounds);
+    let (c1, c2) = (on_change.clone(), on_change);
+    let mine = id.clone();
+    div()
+        .id(id.clone())
+        .relative()
+        .child(canvas(move |b, _, _| b2.set(b), |_, _, _, _| {}).absolute().inset_0())
+        .on_mouse_down(MouseButton::Left, move |e: &MouseDownEvent, _, cx| {
+            c1(spot(b1.get(), e.position), cx);
+            cx.stop_propagation();
+        })
+        .on_drag(SliderDrag(id), |d, _, _, cx| cx.new(|_| SliderDrag(d.0.clone())))
+        .on_drag_move(move |e: &DragMoveEvent<SliderDrag>, _, cx| {
+            if e.drag(cx).0 == mine {
+                c2(spot(e.bounds, e.event.position), cx);
+            }
+        })
+}
+
+/// A colour picker: a square with saturation across and brightness up, and the hue wheel laid out
+/// as a rainbow under it. `hsv` is [hue 0..1, saturation, value]; `on_change` gets the new one
+/// while dragging. The hue is carried apart from the colour so a grey keeps the hue it came from.
+pub fn colour_picker<V: 'static>(
+    id: &str,
+    hsv: [f32; 3],
+    cx: &mut Context<V>,
+    on_change: impl Fn(&mut V, [f32; 3], &mut Context<V>) + 'static,
+) -> Div {
+    let view = cx.entity().downgrade();
+    let on_change = Rc::new(move |hsv: [f32; 3], cx: &mut App| {
+        let _ = view.update(cx, |this, cx| on_change(this, hsv, cx));
+    });
+    let [h, s, v] = hsv;
+    let hue = |h: f32| -> Hsla { gpui::rgb(crate::theme::from_hsv([h, 1., 1.])).into() };
+    let colour: Hsla = gpui::rgb(crate::theme::from_hsv(hsv)).into();
+    let thumb =
+        |fill: Hsla| div().absolute().size(px(14.)).ml(px(-7.)).rounded_full().bg(fill).border_2().border_color(gpui::white()).shadow_md();
+    let layer = || div().absolute().inset_0().rounded(px(radius::CONTROL));
+    let c1 = on_change.clone();
+    let pad = drag_area(ElementId::Name(format!("{id}-pad").into()), move |(x, y), cx| c1([h, x, 1. - y], cx))
+        .h(px(150.))
+        .cursor_crosshair()
+        .child(layer().bg(hue(h)))
+        .child(layer().bg(linear_gradient(90., linear_color_stop(gpui::white(), 0.), linear_color_stop(gpui::white().opacity(0.), 1.))))
+        .child(layer().bg(linear_gradient(180., linear_color_stop(gpui::black().opacity(0.), 0.), linear_color_stop(gpui::black(), 1.))))
+        .child(thumb(colour).left(gpui::relative(s)).top(gpui::relative(1. - v)).mt(px(-7.)));
+    let mut rainbow = div().absolute().left_0().right_0().top(px(5.)).h(px(10.)).rounded(px(5.)).overflow_hidden().flex();
+    for i in 0..6 {
+        let (a, b) = (i as f32 / 6., (i + 1) as f32 / 6.);
+        rainbow =
+            rainbow.child(div().flex_1().h_full().bg(linear_gradient(90., linear_color_stop(hue(a), 0.), linear_color_stop(hue(b), 1.))));
+    }
+    let c2 = on_change;
+    let bar = drag_area(ElementId::Name(format!("{id}-hue").into()), move |(x, _), cx| c2([x.min(0.9999), s, v], cx))
+        .h(px(20.))
+        .cursor_pointer()
+        .child(rainbow)
+        .child(thumb(hue(h)).left(gpui::relative(h)).top(px(3.)));
+    div().flex().flex_col().gap(px(12.)).child(pad).child(bar)
 }

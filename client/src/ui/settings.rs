@@ -59,6 +59,8 @@ pub struct Settings {
     server: WeakEntity<ServerView>,
     profile: profile::Profile,
     custom: [Entity<TextField>; 4],
+    /// The custom colour whose picker is open, and where the picker stands on it.
+    picking: Option<(usize, [f32; 3])>,
     appearance: WindowAppearance,
     test_steps: Vec<diagnose::Step>,
     test_outcome: Option<diagnose::Outcome>,
@@ -95,20 +97,26 @@ impl Settings {
             text: "#e6e8ee".into(),
             accent: "#5b8cff".into(),
         });
-        let field = |value: String, cx: &mut Context<Self>| {
+        let field = |i: usize, value: String, cx: &mut Context<Self>| {
             let f = cx.new(|cx| {
                 let mut f = TextField::new(cx, false, 7);
                 f.set_text(&value, cx);
                 f
             });
-            cx.subscribe(&f, |this: &mut Settings, _, ev: &TextFieldEvent, cx| {
-                let _ = ev;
+            cx.subscribe(&f, move |this: &mut Settings, f, _: &TextFieldEvent, cx| {
+                // A colour typed in moves its open picker there.
+                if let Some((open, hsv)) = &mut this.picking
+                    && *open == i
+                    && let Some(c) = hex(&f.read(cx).text())
+                {
+                    *hsv = theme::to_hsv(c);
+                }
                 this.apply_custom(cx);
             })
             .detach();
             f
         };
-        let custom = [field(c.bg, cx), field(c.surface, cx), field(c.text, cx), field(c.accent, cx)];
+        let custom = [field(0, c.bg, cx), field(1, c.surface, cx), field(2, c.text, cx), field(3, c.accent, cx)];
         cx.observe(&session, |_, _, cx| cx.notify()).detach();
         let profile = profile::Profile::new(&session, cx);
         let meter = cx.spawn(async move |this, cx| {
@@ -143,6 +151,7 @@ impl Settings {
             server,
             profile,
             custom,
+            picking: None,
             appearance,
             test_steps: Vec::new(),
             test_outcome: None,
@@ -264,6 +273,24 @@ impl Settings {
         }
     }
 
+    /// Opens the picker on one custom colour, or closes it if it was open there.
+    fn toggle_picker(&mut self, i: usize, cx: &mut Context<Self>) {
+        self.picking = match self.picking {
+            Some((open, _)) if open == i => None,
+            _ => Some((i, theme::to_hsv(hex(&self.custom[i].read(cx).text()).unwrap_or(0)))),
+        };
+        cx.notify();
+    }
+
+    fn pick_colour(&mut self, hsv: [f32; 3], cx: &mut Context<Self>) {
+        let Some((i, _)) = self.picking else { return };
+        self.picking = Some((i, hsv));
+        let text = to_hex(theme::from_hsv(hsv));
+        self.custom[i].update(cx, |f, cx| f.set_text(&text, cx));
+        self.apply_custom(cx);
+        cx.notify();
+    }
+
     fn pick_palette(&mut self, name: &str, cx: &mut Context<Self>) {
         if name == "custom" && prefs(cx).custom_theme.is_none() {
             // Custom starts from the palette in use.
@@ -278,10 +305,16 @@ impl Settings {
                 f.update(cx, |f, cx| f.set_text(v, cx));
             }
             self.apply_custom(cx);
-            return;
+        } else {
+            let n = name.to_string();
+            set_prefs(cx, |p| p.theme = n);
         }
-        let n = name.to_string();
-        set_prefs(cx, |p| p.theme = n);
+        if name != "custom" {
+            self.picking = None;
+        } else if self.picking.is_none() {
+            // Straight to the accent, the colour most often wanted changed.
+            self.toggle_picker(3, cx);
+        }
         cx.notify();
     }
 
@@ -559,24 +592,34 @@ impl Settings {
                 let mut row = div().flex().gap(px(10.));
                 for (i, f) in self.custom.iter().enumerate() {
                     let color = hex(&f.read(cx).text()).map(|c| gpui::rgb(c).into()).unwrap_or(t.well);
+                    let open = matches!(self.picking, Some((o, _)) if o == i);
+                    let hover = t.text3;
                     row = row.child(
                         div().flex_1().flex().flex_col().gap(px(6.)).child(label(names[i], t)).child(
                             div()
                                 .flex()
                                 .items_center()
                                 .gap(px(6.))
-                                .child(div().flex_none().size(px(28.)).rounded(px(7.)).border_1().border_color(t.stroke_strong).bg(color))
+                                .child(
+                                    div()
+                                        .id(("custom-swatch", i))
+                                        .flex_none()
+                                        .size(px(28.))
+                                        .rounded(px(7.))
+                                        .cursor_pointer()
+                                        .when(open, |d| d.border_2().border_color(t.text))
+                                        .when(!open, |d| d.border_1().border_color(t.stroke_strong).hover(move |s| s.border_color(hover)))
+                                        .bg(color)
+                                        .on_click(cx.listener(move |s, _, _, cx| s.toggle_picker(i, cx))),
+                                )
                                 .child(f.clone()),
                         ),
                     );
                 }
-                d.child(row).child(caption(
-                    tr!(
-                        "Hex colours, like #5b8cff. Everything else is worked out from these four.",
-                        "Cores em hexadecimal, como #5b8cff. O resto é calculado a partir destas quatro."
-                    ),
-                    t.text3,
-                ))
+                let picker = self
+                    .picking
+                    .map(|(_, hsv)| colour_picker("custom-picker", hsv, cx, |s: &mut Settings, hsv, cx| s.pick_colour(hsv, cx)));
+                d.child(row).children(picker)
             })
             .child(
                 div()

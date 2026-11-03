@@ -67,7 +67,13 @@ pub fn set_prefs(cx: &mut App, f: impl FnOnce(&mut Settings)) {
         }
         p.redraw = !p.store.values.same_but_levels(&before);
         follow(&p.store.values);
-        if p.redraw {
+        // A colour being dragged across the picker redraws everything but is written once it settles.
+        let colour_only = {
+            let mut b = before.clone();
+            b.custom_theme.clone_from(&p.store.values.custom_theme);
+            b == p.store.values
+        };
+        if p.redraw && !colour_only {
             p.save(cx);
         } else {
             p.pending = Some(cx.spawn(async |cx| {

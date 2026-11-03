@@ -204,6 +204,41 @@ pub fn to_hex(c: u32) -> String {
     format!("#{c:06x}")
 }
 
+/// A colour as hue (0..1, round the wheel), saturation and value (0..=1).
+pub fn to_hsv(c: u32) -> [f32; 3] {
+    let ch = |s: u32| ((c >> s) & 0xff) as f32 / 255.;
+    let (r, g, b) = (ch(16), ch(8), ch(0));
+    let max = r.max(g).max(b);
+    let d = max - r.min(g).min(b);
+    let h = if d == 0. {
+        0.
+    } else if max == r {
+        ((g - b) / d).rem_euclid(6.)
+    } else if max == g {
+        (b - r) / d + 2.
+    } else {
+        (r - g) / d + 4.
+    };
+    [h / 6., if max == 0. { 0. } else { d / max }, max]
+}
+
+pub fn from_hsv([h, s, v]: [f32; 3]) -> u32 {
+    let h = h.rem_euclid(1.) * 6.;
+    let (s, v) = (s.clamp(0., 1.), v.clamp(0., 1.));
+    let c = v * s;
+    let x = c * (1. - (h % 2. - 1.).abs());
+    let (r, g, b) = match h as u32 {
+        0 => (c, x, 0.),
+        1 => (x, c, 0.),
+        2 => (0., c, x),
+        3 => (0., x, c),
+        4 => (x, 0., c),
+        _ => (c, 0., x),
+    };
+    let ch = |u: f32| ((u + v - c) * 255.).round().clamp(0., 255.) as u32;
+    ch(r) << 16 | ch(g) << 8 | ch(b)
+}
+
 fn mix(a: u32, b: u32, t: f32) -> u32 {
     let ch = |v: u32, s: u32| ((v >> s) & 0xff) as f32;
     let m = |s: u32| ((ch(a, s) + (ch(b, s) - ch(a, s)) * t).round().clamp(0., 255.) as u32) << s;
@@ -407,5 +442,14 @@ mod tests {
         assert_eq!(hex("#fff"), Some(0xffffff));
         assert_eq!(hex("5b8cff"), Some(0x5b8cff));
         assert_eq!(hex("nope"), None);
+    }
+
+    #[test]
+    fn hsv_round_trips() {
+        for c in [0x000000, 0xffffff, 0xff0000, 0x00ff00, 0x0000ff, 0x5b8cff, 0x0f1116, 0xe6e8ee, 0xff7a4d, 0x808080] {
+            assert_eq!(from_hsv(to_hsv(c)), c, "{c:06x}");
+        }
+        assert_eq!(from_hsv([1. / 3., 1., 1.]), 0x00ff00);
+        assert_eq!(from_hsv([1., 1., 1.]), 0xff0000);
     }
 }
