@@ -317,13 +317,15 @@ describe('a media token', () => {
 
 describe('the public stream list', () => {
   it('leaves out voice channels and private calls', async () => {
+    // Connected before anything goes live: the list is pushed only when it
+    // changes, so a watcher that said hello after the change would never hear it.
+    const watcher = connect(ownerToken);
+    await watcher.hello();
     livePaths = [
       { name: 'dm.5.1.v', ready: true, readyTime: null, tracks: ['Opus'], readers: [] },
       { name: 'vc-1-1-v', ready: true, readyTime: null, tracks: ['Opus'], readers: [] },
       { name: 'streamer', ready: true, readyTime: null, tracks: ['H264'], readers: [] },
     ];
-    const watcher = connect(ownerToken);
-    await watcher.hello();
     let listed = [];
     for (let i = 0; i < 50 && !listed.includes('streamer'); i += 1) {
       listed = (await api('/api/streams')).body.streams.map((s) => s.username);

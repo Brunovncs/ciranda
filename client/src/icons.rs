@@ -167,6 +167,17 @@ pub fn shapes(name: &str) -> &'static str {
         }
         "chevron-up" => r#"<path d="M6 15l6-6 6 6"/>"#,
         "play" => r#"<path d="M7 4.5v15a.8.8 0 0 0 1.2.7l12-7.5a.8.8 0 0 0 0-1.4l-12-7.5A.8.8 0 0 0 7 4.5Z"/>"#,
+        // Cirandinha's controls.
+        "pause" => r#"<rect x="14" y="4" width="4" height="16" rx="1"/><rect x="6" y="4" width="4" height="16" rx="1"/>"#,
+        "skip-back" => r#"<path d="M19 20 9 12l10-8v16ZM5 19V5"/>"#,
+        "skip-forward" => r#"<path d="m5 4 10 8-10 8V4ZM19 5v14"/>"#,
+        "shuffle" => {
+            r#"<path d="m18 14 4 4-4 4M18 2l4 4-4 4M2 18h2a4 4 0 0 0 3.3-1.7l5.4-8.6A4 4 0 0 1 16 6h6M2 6h2a4 4 0 0 1 3.6 2.2M22 18h-6a4 4 0 0 1-3.3-1.8l-.4-.4"/>"#
+        }
+        "repeat" => r#"<path d="m17 2 4 4-4 4M3 11v-1a4 4 0 0 1 4-4h14M7 22l-4-4 4-4M21 13v1a4 4 0 0 1-4 4H3"/>"#,
+        "repeat-one" => r#"<path d="m17 2 4 4-4 4M3 11v-1a4 4 0 0 1 4-4h14M7 22l-4-4 4-4M21 13v1a4 4 0 0 1-4 4H3M11 10h1v4"/>"#,
+        "playlist" => r#"<path d="M21 15V6M12 12H3M16 6H3M12 18H3"/><path d="M18.5 18a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5Z"/>"#,
+        "play-next" => r#"<path d="M16 12H3M16 18H3M10 6H3M21 18V8a2 2 0 0 0-2-2h-5M16 8l-2-2 2-2"/>"#,
         _ => r#"<circle cx="12" cy="12" r="2"/>"#,
     }
 }

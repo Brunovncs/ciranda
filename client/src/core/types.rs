@@ -104,6 +104,19 @@ pub enum ErrorCode {
     NoSuchCall,
     NotAnswered,
     PeerOffline,
+    // Cirandinha.
+    MusicOff,
+    NothingToAdd,
+    QueueFull,
+    NothingPlaying,
+    NoSuchTrack,
+    NothingToMix,
+    BadMode,
+    BadLink,
+    Unsupported,
+    Unavailable,
+    NoAudio,
+    SpotifyChanged,
     #[serde(other)]
     Unknown,
 }
@@ -713,6 +726,17 @@ pub struct ServerInfo {
     pub max_file_bytes: Option<u64>,
     /// The most the owner may set that to.
     pub max_file_limit: Option<u64>,
+    /// Cirandinha can run there (the server has yt-dlp); None from a server that does not know it.
+    pub music_available: Option<bool>,
+    /// The owner has Cirandinha on.
+    pub music_enabled: bool,
+}
+
+impl ServerInfo {
+    /// Cirandinha's button and strip are there to use.
+    pub fn music_on(&self) -> bool {
+        self.music_enabled && self.music_available == Some(true)
+    }
 }
 
 /// `ServerInfo` as either line's server sends it. Both names at once must parse: a serde alias
@@ -735,6 +759,10 @@ struct ServerInfoWire {
     max_file_bytes: Option<u64>,
     #[serde(default, deserialize_with = "lenient_opt")]
     max_file_limit: Option<u64>,
+    #[serde(default, deserialize_with = "lenient_opt")]
+    music_available: Option<bool>,
+    #[serde(default)]
+    music_enabled: bool,
 }
 
 impl From<ServerInfoWire> for ServerInfo {
@@ -746,8 +774,146 @@ impl From<ServerInfoWire> for ServerInfo {
             restart_required: w.restart_required,
             max_file_bytes: w.max_file_bytes.filter(|n| *n > 0),
             max_file_limit: w.max_file_limit.filter(|n| *n > 0),
+            music_available: w.music_available,
+            music_enabled: w.music_enabled,
         }
     }
+}
+
+/// Where a voice channel's music is: Cirandinha's state as the server keeps it, in `music:state`,
+/// `music:sync` and `voice:joined`.
+#[derive(Clone, Debug, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct MusicState {
+    #[serde(default)]
+    pub rev: u64,
+    #[serde(default)]
+    pub status: MusicStatus,
+    /// The id of the track that is playing (or paused, or loading).
+    #[serde(default)]
+    pub current: Option<String>,
+    /// The server's clock, in ms, when the current track was at 0:00; only while playing.
+    #[serde(default)]
+    pub started_at: f64,
+    /// Where the track stopped, while paused.
+    #[serde(default)]
+    pub position_ms: f64,
+    #[serde(default)]
+    pub shuffle: bool,
+    #[serde(default)]
+    pub repeat: Repeat,
+    /// In the order it will be played.
+    #[serde(default, deserialize_with = "lenient")]
+    pub queue: Vec<MusicTrack>,
+}
+
+impl MusicState {
+    pub fn current_track(&self) -> Option<&MusicTrack> {
+        let id = self.current.as_deref()?;
+        self.queue.iter().find(|t| t.id == id)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MusicStatus {
+    /// The track's file is being fetched; its clock has not started.
+    Loading,
+    Playing,
+    Paused,
+    #[default]
+    #[serde(other)]
+    Idle,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Repeat {
+    All,
+    One,
+    #[default]
+    #[serde(other)]
+    Off,
+}
+
+impl Repeat {
+    pub fn wire(self) -> &'static str {
+        match self {
+            Repeat::Off => "off",
+            Repeat::All => "all",
+            Repeat::One => "one",
+        }
+    }
+
+    /// What pressing the button goes to.
+    pub fn next(self) -> Repeat {
+        match self {
+            Repeat::Off => Repeat::All,
+            Repeat::All => Repeat::One,
+            Repeat::One => Repeat::Off,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct MusicTrack {
+    pub id: String,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub artist: String,
+    #[serde(default, deserialize_with = "lenient_opt")]
+    pub duration_ms: Option<u64>,
+    #[serde(default)]
+    pub thumb_hash: Option<String>,
+    #[serde(default)]
+    pub added_by: Option<String>,
+    /// The file, once the server has it.
+    #[serde(default)]
+    pub hash: Option<String>,
+    /// Why it could not be fetched; it is passed over.
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// A `music:state` push (and what `voice:joined` and `music:sync` carry): the state, and what the
+/// server's clock read when it was sent.
+#[derive(Clone, Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MusicPush {
+    pub state: MusicState,
+    #[serde(default)]
+    pub server_now: f64,
+}
+
+/// One thing `POST /api/music/resolve` found, sent back as it is in `music:add`.
+#[derive(Clone, Debug, Deserialize, Serialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct MusicFound {
+    pub source: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub artist: String,
+    #[serde(default, deserialize_with = "lenient_opt")]
+    pub duration_ms: Option<u64>,
+    #[serde(default)]
+    pub thumb_hash: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MusicResolved {
+    #[serde(default)]
+    pub kind: String,
+    /// A video opened from inside a playlist: the playlist's id, to offer the whole of it.
+    #[serde(default)]
+    pub playlist: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub items: Vec<MusicFound>,
 }
 
 /// `GET /api/health`.

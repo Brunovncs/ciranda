@@ -47,6 +47,11 @@ import {
   MAX_FILE_LIMIT, MIN_FILE_LIMIT, DEFAULT_FILE_BYTES,
 } from './chat.js';
 import { CHUNK_BYTES, UploadSessions } from './upload-sessions.js';
+import { YtDlp, MusicError } from './music/ytdlp.js';
+import { MusicLibrary } from './music/library.js';
+import { Music } from './music/service.js';
+import { classify } from './music/classify.js';
+import { Spotify } from './music/spotify.js';
 
 const app = express();
 app.disable('x-powered-by');
@@ -129,6 +134,34 @@ const serverSettings = new ServerSettings(metaStore, {
   relayGuarded: () => Boolean(config.mediaToken),
 });
 chat.maxFileBytes = serverSettings.maxFileBytes ?? DEFAULT_FILE_BYTES;
+
+/*
+ * Cirandinha: yt-dlp to find and fetch the audio, the library to keep it as
+ * ordinary uploads, and the service that runs each voice channel's queue.
+ * Nothing is fetched until somebody in a voice channel asks for a song, and
+ * whether yt-dlp is there at all is asked once, in the background.
+ */
+const ytdlp = new YtDlp({
+  bin: config.ytdlpBin,
+  cookies: config.ytdlpCookies,
+  maxSeconds: config.musicMaxSeconds,
+  tmpDir: join(config.dataDir, 'music-tmp'),
+});
+const musicLibrary = new MusicLibrary({ db, chat, ytdlp, thumbnails: process.env.HARMONY_MUSIC_NO_THUMBNAILS !== '1' });
+// Spotify links are only read for their list of songs; each is then looked for
+// on YouTube (music/spotify.js). HARMONY_SPOTIFY_BASE is for the tests.
+const spotify = new Spotify({ ytdlp, base: process.env.HARMONY_SPOTIFY_BASE });
+const music = new Music({
+  library: musicLibrary,
+  spotify,
+  push: (channelId, payload) => realtime?.toChannel(channelId, payload),
+  maxQueue: config.musicQueueMax,
+});
+const musicResolveThrottle = new Throttle({ burst: 12, perSecond: 0.5 });
+ytdlp.version().then((version) => {
+  if (version) console.log(`[harmony] yt-dlp ${version}: Cirandinha ${serverSettings.musicEnabled ? 'is on' : 'is available (off)'}`);
+  else console.log(`[harmony] Cirandinha is not available: yt-dlp could not be run (${ytdlp.why || 'no answer'})`);
+});
 
 /**
  * The legacy watch token follows the door, wherever the door was changed.
@@ -816,6 +849,8 @@ const serverView = () => ({
   ...serverSettings.publicView(),
   maxFileBytes: chat.maxFileBytes,
   maxFileLimit: MAX_FILE_LIMIT,
+  // Only whether there is a yt-dlp to use: where it is, and any cookies, stay on the server.
+  musicAvailable: ytdlp.available,
 });
 
 app.get('/api/server', requireLogin, (_req, res) => {
@@ -896,6 +931,11 @@ app.post('/api/server', requireRole('owner'), (req, res) => {
   if (limit !== undefined) {
     serverSettings.setMaxFileBytes(limit);
     chat.maxFileBytes = serverSettings.maxFileBytes ?? DEFAULT_FILE_BYTES;
+  }
+  if (typeof req.body?.musicEnabled === 'boolean') {
+    serverSettings.setMusicEnabled(req.body.musicEnabled);
+    // Switched off, it is off now: every channel's music ends, and its files are let go of.
+    if (!req.body.musicEnabled) music.stopAll();
   }
 
   const view = serverView();
@@ -1916,6 +1956,73 @@ app.post('/api/soundpad/:id/delete', requireAdmin, (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Cirandinha
+// ---------------------------------------------------------------------------
+
+/**
+ * What a link or some words in Cirandinha's box are: the tracks they name, to
+ * choose from. Nothing is fetched or queued here (that is music:add, over the
+ * socket, by somebody in the voice channel); this only looks, so anybody
+ * signed in may.
+ */
+const MUSIC_ERRORS = {
+  timeout: [504, 'YouTube took too long to answer.'],
+  unavailable: [503, 'This server cannot reach yt-dlp.'],
+  too_long: [422, 'That is too long to play here.'],
+  no_audio: [422, 'There is no audio to play for that.'],
+  spotify_changed: [502, 'Could not read that Spotify link: Spotify may have changed the page this reads.'],
+};
+app.post('/api/music/resolve', requireLogin, async (req, res) => {
+  if (!serverSettings.musicEnabled || !ytdlp.available) {
+    return res.status(409).json({ error: 'music_off', message: 'Cirandinha is not turned on for this server.' });
+  }
+  const gate = musicResolveThrottle.take(req.user.id);
+  if (!gate.allowed) {
+    res.set('Retry-After', String(gate.retryAfterSec));
+    return res.status(429).json({ error: 'slow_down', retryAfterSec: gate.retryAfterSec });
+  }
+
+  const found = classify(req.body?.input);
+  try {
+    let items;
+    let playlist = null;
+    switch (found.kind) {
+      case 'refused':
+        return res.status(400).json({
+          error: found.reason,
+          message: found.reason === 'empty' ? 'Type a link or some words.' : 'Only YouTube and Spotify links work here.',
+        });
+      case 'search':
+        items = await ytdlp.search(found.query, 10);
+        break;
+      case 'youtube-video':
+        items = [await ytdlp.video(found.id)];
+        // A video opened from inside a playlist: the whole list is offered too.
+        playlist = found.list;
+        break;
+      case 'youtube-playlist':
+        items = await ytdlp.playlist(found.id, 100);
+        break;
+      case 'spotify-track':
+      case 'spotify-album':
+      case 'spotify-playlist':
+        // What it lists; each song is looked for on YouTube later, when it is
+        // about to play. No pictures: Spotify's are Spotify's.
+        items = await spotify.tracksOf(found.kind.slice('spotify-'.length), found.id);
+        break;
+      default:
+        return res.status(400).json({ error: 'unsupported', message: 'That is not something Cirandinha can play.' });
+    }
+    if (found.kind.startsWith('spotify-')) return res.json({ kind: found.kind, playlist: null, items });
+    return res.json({ kind: found.kind, playlist, items: await musicLibrary.withThumbnails(items) });
+  } catch (err) {
+    if (!(err instanceof MusicError)) throw err;
+    const [status, message] = MUSIC_ERRORS[err.code] ?? [502, 'Could not look that up.'];
+    return res.status(status).json({ error: err.code, message });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // MediaMTX auth hook
 //
 // MediaMTX POSTs { user, password, token, ip, action, path, protocol, id,
@@ -2189,6 +2296,8 @@ realtime = new Realtime({
   channels,
   voice,
   soundpad,
+  music,
+  musicEnabled: () => serverSettings.musicEnabled && ytdlp.available,
   dms,
   calls,
   issueTokens,
@@ -2244,6 +2353,7 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
     console.log(`\n[harmony] ${signal} -- shutting down`);
     monitor.stop();
     calls.close();
+    music.stopAll();
     realtime?.close();
     clearInterval(sessionSweeper);
     // server.close() only stops new connections and waits for the open ones,

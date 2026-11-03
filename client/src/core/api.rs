@@ -347,6 +347,18 @@ impl Api {
         Ok(self.post::<ServerReply>("/api/server", json!({ "maxFileBytes": bytes })).await?.server)
     }
 
+    /// Cirandinha on or off; only the owner may.
+    pub async fn set_music_enabled(&self, on: bool) -> Result<ServerInfo> {
+        Ok(self.post::<ServerReply>("/api/server", json!({ "musicEnabled": on })).await?.server)
+    }
+
+    /// What a link or some words name, for Cirandinha: nothing is queued yet. The server asks
+    /// YouTube with yt-dlp, which can take a while on a small machine.
+    pub async fn music_resolve(&self, input: &str) -> Result<MusicResolved> {
+        let url = format!("{}/api/music/resolve", self.base());
+        self.send(self.http.post(url).json(&json!({ "input": input })), Duration::from_secs(75)).await
+    }
+
     pub async fn storage(&self) -> Result<Storage> {
         self.get("/api/server/storage").await
     }
@@ -619,6 +631,12 @@ impl Api {
 
     pub async fn download(&self, hash: &str) -> Result<(Vec<u8>, String)> {
         self.file(&format!("/api/uploads/{hash}"), self.file_cap()).await
+    }
+
+    /// A Cirandinha track. Not held to the largest file people may send: the server fetched it
+    /// itself, under a cap of its own (24 MB).
+    pub async fn download_track(&self, hash: &str) -> Result<(Vec<u8>, String)> {
+        self.file(&format!("/api/uploads/{hash}"), 32 << 20).await
     }
 
     /// A stored file that is to be drawn: an avatar, an emoji, a picture in the chat. Refused
@@ -1045,6 +1063,19 @@ pub fn friendly(code: ErrorCode, body: &Value) -> Option<String> {
         E::NoSuchCall | E::NotAnswered => tr!("That call has ended.", "Essa chamada já terminou."),
         E::PeerOffline => tr!("They're offline. They'll see you called.", "A pessoa está offline. Ela vai ver que você ligou."),
         E::NotYourself => tr!("That's you.", "Essa pessoa é você."),
+        E::MusicOff => tr!("Cirandinha is not on for this server.", "A Cirandinha não está ligada neste servidor."),
+        E::NothingToAdd => tr!("There was nothing to add.", "Não havia nada para adicionar."),
+        E::QueueFull => tr!("The queue is full.", "A fila está cheia."),
+        E::NothingPlaying => tr!("Nothing is playing.", "Nada está tocando."),
+        E::NoSuchTrack => tr!("That song is not in the queue any more.", "Essa música não está mais na fila."),
+        E::NothingToMix => tr!("There is nothing left to shuffle.", "Não há mais nada para embaralhar."),
+        E::BadLink | E::Unsupported => tr!("Only YouTube and Spotify links work here.", "Só links do YouTube e do Spotify funcionam aqui."),
+        E::Unavailable => tr!("This server cannot reach yt-dlp.", "Este servidor não consegue usar o yt-dlp."),
+        E::NoAudio => tr!("There is no audio to play for that.", "Não há áudio para tocar aí."),
+        E::SpotifyChanged => tr!(
+            "Could not read that Spotify link: Spotify may have changed its page.",
+            "Não foi possível ler esse link do Spotify: o Spotify pode ter mudado a página."
+        ),
         _ => return None,
     };
     Some(text.into())

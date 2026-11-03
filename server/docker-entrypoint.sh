@@ -28,6 +28,33 @@ if [ -z "${MTX_WEBRTCADDITIONALHOSTS:-}" ]; then
   log '         Set it to the public hostname or IP clients will use.'
 fi
 
+# Cirandinha's yt-dlp. The image's copy is as old as the image, and YouTube
+# breaks old versions within weeks, so the server runs a copy kept in the data
+# volume (the root filesystem is read-only) that updates itself: seeded from
+# the image the first time, then `yt-dlp -U` a minute after start and daily
+# after that (below). -U checks what it downloads against the release's
+# SHA2-256SUMS. Best effort and quiet -- nothing else depends on it, and with no
+# volume copy the image's is used. HARMONY_YTDLP_AUTOUPDATE=0 keeps the image's;
+# a HARMONY_YTDLP_BIN of your own is left alone. A volume copy that cannot run
+# is replaced by the image's: an image that switched builds (the standalone one
+# could not run here; see the Dockerfile) must not keep using the old one.
+ytdlp_volume=''
+if [ "${HARMONY_YTDLP_AUTOUPDATE:-1}" != 0 ] && [ -z "${HARMONY_YTDLP_BIN:-}" ] \
+    && [ -x /usr/local/bin/yt-dlp ] && [ -n "${HARMONY_DATA_DIR:-}" ] \
+    && mkdir -p "$HARMONY_DATA_DIR/bin" 2>/dev/null; then
+  if [ ! -x "$HARMONY_DATA_DIR/bin/yt-dlp" ] \
+      || ! timeout 60 "$HARMONY_DATA_DIR/bin/yt-dlp" --version >/dev/null 2>&1; then
+    { cp /usr/local/bin/yt-dlp "$HARMONY_DATA_DIR/bin/yt-dlp.new" \
+        && chmod 0755 "$HARMONY_DATA_DIR/bin/yt-dlp.new" \
+        && mv -f "$HARMONY_DATA_DIR/bin/yt-dlp.new" "$HARMONY_DATA_DIR/bin/yt-dlp"; } 2>/dev/null \
+      || rm -f "$HARMONY_DATA_DIR/bin/yt-dlp.new" 2>/dev/null || true
+  fi
+  if [ -x "$HARMONY_DATA_DIR/bin/yt-dlp" ]; then
+    ytdlp_volume="$HARMONY_DATA_DIR/bin/yt-dlp"
+    export HARMONY_YTDLP_BIN="$ytdlp_volume"
+  fi
+fi
+
 node /opt/harmony/src/index.js &
 control_pid=$!
 
@@ -84,11 +111,33 @@ if [ "$WATCHDOG_INTERVAL" -gt 0 ]; then
   watchdog_pid=$!
 fi
 
+# The volume's yt-dlp, kept current (see above). After the start rather than
+# before it, so a slow or unreachable GitHub never holds the server up. Not
+# waited on below: an update that fails is a line in the log, not a reason to
+# stop the container. The server picks a new version up at its next yt-dlp run.
+ytdlp_updater() {
+  sleep 60
+  while :; do
+    local out
+    if out="$("$ytdlp_volume" -U 2>&1)"; then
+      log "yt-dlp: $(printf '%s\n' "$out" | tail -n1)"
+    else
+      log "yt-dlp could not update itself: $(printf '%s\n' "$out" | tail -n1)"
+    fi
+    sleep 86400
+  done
+}
+ytdlp_pid=''
+if [ -n "$ytdlp_volume" ]; then
+  ytdlp_updater &
+  ytdlp_pid=$!
+fi
+
 shutdown() {
   trap - TERM INT
   log 'shutting down'
   # shellcheck disable=SC2086 # empty when the watchdog is off, and must then vanish
-  kill -TERM $watchdog_pid "$mediamtx_pid" "$control_pid" 2>/dev/null || true
+  kill -TERM $watchdog_pid $ytdlp_pid "$mediamtx_pid" "$control_pid" 2>/dev/null || true
   wait "$mediamtx_pid" "$control_pid" 2>/dev/null || true
   exit 0
 }
@@ -110,7 +159,7 @@ else
   log "the control server exited (status ${status}) -- stopping mediamtx"
 fi
 # shellcheck disable=SC2086
-kill -TERM $watchdog_pid "$mediamtx_pid" "$control_pid" 2>/dev/null || true
+kill -TERM $watchdog_pid $ytdlp_pid "$mediamtx_pid" "$control_pid" 2>/dev/null || true
 wait 2>/dev/null || true
 
 # Never exit 0 here. Reaching this point means a process ended by itself rather

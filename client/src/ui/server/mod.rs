@@ -7,6 +7,7 @@ pub mod chat;
 mod composer;
 pub mod emoji_picker;
 mod members;
+mod music;
 mod picker;
 pub mod private;
 mod profile_card;
@@ -113,6 +114,8 @@ pub struct ServerView {
     theater_bar_hover: bool,
     /// Draws again when the controls are due to hide.
     theater_wake: gpui::Task<()>,
+    /// Cirandinha's strip in the call's card, made for the call's player.
+    music_strip: Option<Entity<music::MusicStrip>>,
     /// The pointer is on the connection dot, which opens to say what it means.
     link_hover: bool,
     /// When the last message tone played, so a burst of messages makes one sound.
@@ -233,6 +236,7 @@ impl ServerView {
             theater_moved: std::time::Instant::now(),
             theater_bar_hover: false,
             theater_wake: gpui::Task::ready(()),
+            music_strip: None,
             link_hover: false,
             message_cue_at: None,
             ringing: None,
@@ -1518,6 +1522,24 @@ impl ServerView {
         let ping = voice.as_ref().and_then(|v| v.read(cx).ping_ms);
         let mic_failed = voice.as_ref().is_some_and(|v| v.read(cx).mic_failed());
         let (camera_on, screen_on) = stage::sharing(&self.session, voice.as_ref(), cx);
+        // Cirandinha: in a voice channel, on a server that has it on.
+        let music_on = !private && self.session.read(cx).server_info.as_ref().is_some_and(|i| i.music_on());
+        let player = c.music.clone().filter(|_| music_on);
+        let channel = c.place.channel();
+        let strip = match (&player, channel) {
+            (Some(player), Some(channel)) => {
+                if self.music_strip.as_ref().is_none_or(|s| s.read(cx).player() != player) {
+                    let (session, player) = (self.session.clone(), player.clone());
+                    self.music_strip = Some(cx.new(|cx| music::MusicStrip::new(session, player, channel, cx)));
+                }
+                let playing = self.session.read(cx).music.as_ref().is_some_and(|m| m.channel == channel && m.state.current.is_some());
+                self.music_strip.clone().filter(|_| playing)
+            }
+            _ => {
+                self.music_strip = None;
+                None
+            }
+        };
         let (label_text, color) = match state {
             _ if ringing => (tr!("Ringing…", "Chamando…"), t.caution),
             CallState::Connected if private => (tr!("In a private call", "Em chamada privada"), t.success),
@@ -1572,6 +1594,7 @@ impl ServerView {
                                 .on_click(cx.listener(|this, _, _, cx| this.leave_voice(cx))),
                         ),
                 )
+                .children(strip)
                 .child(
                     div()
                         .flex()
@@ -1620,6 +1643,17 @@ impl ServerView {
                                             this.open_soundpad(e.position, window, cx)
                                         }),
                                     ),
+                            )
+                        })
+                        .when_some(player.zip(channel), |d, (player, channel)| {
+                            let session = self.session.clone();
+                            d.child(
+                                panel_button("music", "music", false, t)
+                                    .tooltip(tip(tr!("Cirandinha: music for everyone here", "Cirandinha: música para todos aqui"), t))
+                                    .on_mouse_down(MouseButton::Left, move |e: &MouseDownEvent, window, cx| {
+                                        cx.stop_propagation();
+                                        music::open(session.clone(), player.clone(), channel, e.position, window, cx)
+                                    }),
                             )
                         }),
                 )

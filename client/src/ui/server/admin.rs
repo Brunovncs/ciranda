@@ -630,6 +630,7 @@ impl ServerAdmin {
             .child(icon_block)
             .child(door_card)
             .children(files_card)
+            .children(super::music::owner_card(&self.session, info.as_ref(), owner, t))
             .child(div().flex().flex_col().gap(px(8.)).child(label(tr!("At a glance", "Resumo"), t)).child(tiles))
             .into_any_element()
     }

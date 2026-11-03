@@ -4,6 +4,7 @@
 //! a key the caller makes and only the two of them can open (see `rtc::FrameKey`).
 
 use super::audio::Cue;
+use super::music::MusicPlayer;
 use super::rtc::FrameKey;
 use super::voice::{Voice, roster_cues, voice_cue};
 use crate::core::api::ApiError;
@@ -45,6 +46,8 @@ pub struct Call {
     /// Deafening muted a microphone that was open, so undeafening opens it again.
     muted_by_deafen: bool,
     pub voice: Option<Entity<Voice>>,
+    /// Cirandinha, in a voice channel: made at the first join, gone with the call.
+    pub music: Option<Entity<MusicPlayer>>,
     password: Option<String>,
     /// A private call's media key; none in a voice channel.
     key: Option<[u8; 32]>,
@@ -181,6 +184,7 @@ impl Call {
                 deafened,
                 muted_by_deafen: false,
                 voice: None,
+                music: None,
                 password,
                 key,
                 cue_roster: None,
@@ -248,6 +252,18 @@ impl Call {
                 Ok(v) => {
                     let tokens: Option<VoiceTokens> = serde_json::from_value(v.clone()).ok();
                     this.mid = v.get("mid").and_then(|m| m.as_i64());
+                    // Joined in the middle of a song: the music is already where it is.
+                    if let Place::Channel(id) = this.place {
+                        let music = v.get("music").cloned().and_then(|m| serde_json::from_value::<MusicPush>(m).ok());
+                        this.session.update(cx, |s, cx| {
+                            s.set_music(id, music);
+                            cx.notify();
+                        });
+                        if this.music.is_none() {
+                            let session = this.session.clone();
+                            this.music = Some(cx.new(|cx| MusicPlayer::new(session, id, cx)));
+                        }
+                    }
                     if let Some(roster) = v.get("roster").and_then(|r| serde_json::from_value::<Vec<Member>>(r.clone()).ok()) {
                         let place = this.place;
                         this.session.update(cx, |s, cx| {
@@ -475,6 +491,16 @@ impl Call {
         let told = std::mem::replace(&mut self.left, true);
         if let Some(v) = self.voice.take() {
             v.update(cx, |v, cx| v.shutdown(cx));
+        }
+        // The music is the call's: it stops with it.
+        self.music = None;
+        if let Place::Channel(id) = self.place {
+            self.session.update(cx, |s, cx| {
+                if s.music.as_ref().is_some_and(|m| m.channel == id) {
+                    s.set_music(id, None);
+                    cx.notify();
+                }
+            });
         }
         self._refresh = Task::ready(());
         let rt = self.session.read(cx).realtime.clone();

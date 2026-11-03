@@ -9,6 +9,7 @@ pub mod deepfilter;
 pub mod diagnose;
 #[cfg_attr(not(windows), allow(dead_code))]
 pub mod loopback;
+pub mod music;
 #[cfg_attr(not(windows), allow(dead_code))]
 pub mod replay;
 pub mod rtc;

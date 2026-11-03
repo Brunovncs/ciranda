@@ -32,6 +32,8 @@
 #   CF_API_TOKEN         certbot route only; Zone > DNS > Edit on the domain
 #   HARMONY_PUBLIC_URL   none route only; the URL clients use
 #   HARMONY_PASSWORD     server password; empty means none
+#   HARMONY_YTDLP        0 leaves yt-dlp out. It is what Cirandinha (music in
+#                        voice channels) fetches audio with; see DEPLOYMENT.md.
 
 set -euo pipefail
 
@@ -52,7 +54,7 @@ for arg in "$@"; do
     --no-setup) SETUP=no ;;
     --update) UPDATE=yes ;;
     --no-pull) PULL=no ;;
-    -h|--help) sed -n '2,35p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,37p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "Unknown option: $arg (try --help)" >&2; exit 2 ;;
   esac
 done
@@ -162,6 +164,43 @@ else
   echo "    $(/usr/local/bin/mediamtx --version 2>&1 | head -n1)"
 fi
 
+# --- yt-dlp (Cirandinha) ---------------------------------------------------------
+# What Cirandinha looks songs up and fetches their audio with. The standalone
+# build needs no Python and no ffmpeg (the audio is kept as YouTube serves it).
+# It goes in /usr/local/bin, owned by root, so the harmony user (which has no
+# write access there, by design) can run it but never replace it; a timer keeps
+# it current, because YouTube breaks old versions often. Checked against the
+# release's SHA2-256SUMS. A machine it has no build for, or a download that
+# fails, only leaves Cirandinha unavailable: nothing else depends on it.
+YTDLP_OK=no
+if [[ ${HARMONY_YTDLP:-1} != 0 ]]; then
+  case "$(uname -m)" in
+    x86_64)        YTDLP_ASSET=yt-dlp_linux ;;
+    aarch64|arm64) YTDLP_ASSET=yt-dlp_linux_aarch64 ;;
+    *)             YTDLP_ASSET= ;;
+  esac
+  if [[ -z $YTDLP_ASSET ]]; then
+    echo "==> yt-dlp: no build for $(uname -m); Cirandinha will not be available"
+  else
+    echo "==> Installing yt-dlp (for Cirandinha)"
+    YTDLP_TMP="$(mktemp -d)"
+    YTDLP_URL=https://github.com/yt-dlp/yt-dlp/releases/latest/download
+    if curl -fsSL -o "$YTDLP_TMP/$YTDLP_ASSET" "$YTDLP_URL/$YTDLP_ASSET" \
+        && curl -fsSL -o "$YTDLP_TMP/SHA2-256SUMS" "$YTDLP_URL/SHA2-256SUMS" \
+        && (cd "$YTDLP_TMP" && grep -E "  ${YTDLP_ASSET}\$" SHA2-256SUMS | sha256sum -c --quiet -) \
+        && install -m 0755 "$YTDLP_TMP/$YTDLP_ASSET" /usr/local/bin/yt-dlp.new \
+        && /usr/local/bin/yt-dlp.new --version >/dev/null 2>&1; then
+      mv -f /usr/local/bin/yt-dlp.new /usr/local/bin/yt-dlp
+      YTDLP_OK=yes
+      echo "    yt-dlp $(/usr/local/bin/yt-dlp --version)"
+    else
+      rm -f /usr/local/bin/yt-dlp.new
+      echo "    could not install yt-dlp; Cirandinha will not be available (re-run to try again)"
+    fi
+    rm -rf "$YTDLP_TMP"
+  fi
+fi
+
 # --- update: a copy of the database --------------------------------------------
 # The new code may migrate the schema the moment it starts, and there is no
 # migrating back. VACUUM INTO takes a consistent copy of a live database, so
@@ -237,8 +276,17 @@ install -m 0755 "$SRC_DIR/ip-watch.sh" /usr/local/bin/harmony-ip-watch.sh
 install -m 0644 "$SRC_DIR/systemd/harmony-ip-watch.service" /etc/systemd/system/harmony-ip-watch.service
 install -m 0644 "$SRC_DIR/systemd/harmony-ip-watch.timer" /etc/systemd/system/harmony-ip-watch.timer
 
+# A daily look for a newer yt-dlp, where there is one.
+if [[ $YTDLP_OK == yes || -x /usr/local/bin/yt-dlp ]]; then
+  install -m 0644 "$SRC_DIR/systemd/harmony-ytdlp-update.service" /etc/systemd/system/harmony-ytdlp-update.service
+  install -m 0644 "$SRC_DIR/systemd/harmony-ytdlp-update.timer" /etc/systemd/system/harmony-ytdlp-update.timer
+fi
+
 systemctl daemon-reload
 systemctl enable harmony-server mediamtx harmony-ip-watch.timer
+if [[ -f /etc/systemd/system/harmony-ytdlp-update.timer ]]; then
+  systemctl enable --now harmony-ytdlp-update.timer
+fi
 
 # =============================================================================
 # Setup: domain, HTTPS, configuration, first start

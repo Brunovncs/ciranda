@@ -334,6 +334,15 @@ impl Fetch {
     }
 }
 
+/// The music of the voice channel you are in, as the server last told it.
+pub struct MusicLive {
+    pub channel: ChannelId,
+    pub state: MusicState,
+    /// The server's clock when it was sent, and this computer's when it arrived.
+    pub server_now: f64,
+    pub at: Instant,
+}
+
 /// Something the rest of the window should react to, beyond redrawing.
 pub enum SessionEvent {
     /// A message mentioning you arrived in a channel that is not open.
@@ -398,6 +407,9 @@ pub struct Session {
     pub ice_servers: Vec<IceServer>,
     pub emojis: Vec<CustomEmoji>,
     pub clips: Vec<Clip>,
+    /// Cirandinha in the voice channel you are in: what the server last said, and when.
+    pub music: Option<MusicLive>,
+    music_syncing: bool,
     pub chats: HashMap<Room, ChatLog>,
     /// The rooms opened last, the latest at the end: theirs are the histories kept (`KEEP_LOGS`).
     recent: Vec<Room>,
@@ -558,6 +570,8 @@ impl Session {
             ice_servers,
             emojis: Vec::new(),
             clips: Vec::new(),
+            music: None,
+            music_syncing: false,
             chats: HashMap::new(),
             recent: Vec::new(),
             mentioned: HashMap::new(),
@@ -949,6 +963,40 @@ impl Session {
                 cx.emit(SessionEvent::SoundpadPlay { hash });
                 return false;
             }
+            "music:state" => {
+                let channel = v.get("channelId").and_then(Value::as_i64).unwrap_or(-1);
+                match serde_json::from_value::<MusicPush>(v.clone()) {
+                    Ok(push) => self.set_music(channel, Some(push)),
+                    Err(e) => log::warn!("music: a state this client does not understand: {e}"),
+                }
+            }
+            "music:tick" => {
+                let channel = v.get("channelId").and_then(Value::as_i64).unwrap_or(-1);
+                let rev = v.get("rev").and_then(Value::as_u64);
+                let num = |k: &str| v.get(k).and_then(Value::as_f64).unwrap_or(0.);
+                match self.music.as_mut().filter(|m| m.channel == channel && Some(m.state.rev) == rev) {
+                    Some(m) => {
+                        if let Ok(status) = serde_json::from_value::<MusicStatus>(v.get("status").cloned().unwrap_or_default()) {
+                            m.state.status = status;
+                        }
+                        m.state.started_at = num("startedAt");
+                        m.state.position_ms = num("positionMs");
+                        m.server_now = num("serverNow");
+                        m.at = Instant::now();
+                    }
+                    // Something changed that this client has not heard of: the whole of it, again.
+                    None => self.resync_music(channel, cx),
+                }
+            }
+            "music:error" => {
+                let title = v.get("title").and_then(Value::as_str).filter(|t| !t.is_empty()).unwrap_or(tr!("Untitled", "Sem título"));
+                cx.emit(SessionEvent::Toast(trf!(
+                    "Could not get “{}”, so it was skipped.",
+                    "Não foi possível obter “{}”, então ela foi pulada.",
+                    title
+                )));
+                return false;
+            }
             "voice:moved" => {
                 let to = v.get("channelId").and_then(Value::as_i64);
                 let by = v.get("by").and_then(Value::as_str).unwrap_or(tr!("an admin", "um admin"));
@@ -962,6 +1010,31 @@ impl Session {
             _ => return false,
         }
         true
+    }
+
+    /// Cirandinha's state for a voice channel you are in, or none (no music, or you left).
+    pub fn set_music(&mut self, channel: ChannelId, push: Option<MusicPush>) {
+        self.music = push.map(|p| MusicLive { channel, state: p.state, server_now: p.server_now, at: Instant::now() });
+    }
+
+    /// Asks for the music as it is now, once at a time.
+    fn resync_music(&mut self, channel: ChannelId, cx: &mut Context<Self>) {
+        if std::mem::replace(&mut self.music_syncing, true) {
+            return;
+        }
+        let reply = Session::request(self.realtime.clone(), "music:sync", serde_json::json!({ "channelId": channel }));
+        cx.spawn(async move |this, cx| {
+            let reply = reply.await;
+            let _ = this.update(cx, |s, cx| {
+                s.music_syncing = false;
+                if let Ok(v) = reply {
+                    let push = v.get("music").cloned().and_then(|m| serde_json::from_value::<MusicPush>(m).ok());
+                    s.set_music(channel, push);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     // Lookups.
@@ -1135,6 +1208,11 @@ impl Session {
         self.api.note_file_limits(&info);
         self.server_name = info.name.clone();
         self.server_icon = info.icon_hash.clone();
+        // The owner turned Cirandinha off: every channel's music ended on the server without a word
+        // to the channel, so it goes quiet here at once.
+        if !info.music_on() {
+            self.music = None;
+        }
         self.server_info = Some(info);
         self.update_keep_set(cx);
     }

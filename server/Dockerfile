@@ -62,6 +62,29 @@ RUN set -eu; \
     install -m 0755 /tmp/mediamtx /mediamtx
 
 # --------------------------------------------------------------------------
+# yt-dlp, for Cirandinha (music in voice channels; see DEPLOYMENT.md)
+#
+# The zipapp, run by the image's Python: one file for every platform, and no
+# ffmpeg -- the audio is kept as YouTube serves it. Not the standalone
+# "musllinux" build: that is a PyInstaller one-file program, which unpacks its
+# own libraries into /tmp on every run and loads them from there, and a
+# read-only container's /tmp is a noexec tmpfs, so it dies before it starts
+# ("Error loading shared library libz.so.1: Operation not permitted"). The
+# zipapp unpacks nothing, so it also starts faster on a Pi and costs no RAM
+# in /tmp.
+#
+# Pinned and checked like MediaMTX, from the release's SHA2-256SUMS. Unlike
+# MediaMTX it goes stale fast -- YouTube breaks old versions within weeks --
+# so this is only the copy a new volume starts from: the entrypoint keeps a
+# current one in the data volume and updates it daily (HARMONY_YTDLP_AUTOUPDATE).
+# --------------------------------------------------------------------------
+FROM --platform=$BUILDPLATFORM alpine:${ALPINE_VERSION} AS ytdlp
+ARG YTDLP_VERSION=2026.10.26
+ARG YTDLP_SHA256=e51e69e89489f199530f13d32a4342da3ddb2cf34842f364603a066db05afbf3
+RUN apk add --no-cache curl
+RUN set -eu;     mkdir -p /out;     curl -fsSL -o /out/yt-dlp       "https://github.com/yt-dlp/yt-dlp/releases/download/${YTDLP_VERSION}/yt-dlp";     echo "${YTDLP_SHA256}  /out/yt-dlp" | sha256sum -c -       || { echo "yt-dlp ${YTDLP_VERSION}: checksum mismatch; was the hash updated with the version?" >&2; exit 1; };     chmod 0755 /out/yt-dlp
+
+# --------------------------------------------------------------------------
 # Production dependencies
 #
 # Also on the build platform: the only dependency is Express, which is pure
@@ -96,9 +119,15 @@ LABEL org.opencontainers.image.title="Harmony server" \
 # build of a package in a branch, so an exact pin (bash=5.3.9-r1) stops the
 # image building the day a security fix lands. `~` takes that fix and no
 # new release line. Alpine 3.24 has tini 0.19.0 and bash 5.3.9.
-RUN apk add --no-cache "tini~0.19" "bash~5.3"
+#
+# python3 runs yt-dlp's zipapp (see the ytdlp stage), and ca-certificates is
+# what its HTTPS checks against. Left to the base's own Python release line:
+# yt-dlp asks only for a supported one.
+RUN apk add --no-cache "tini~0.19" "bash~5.3" python3 ca-certificates
 
 COPY --from=mediamtx /mediamtx /usr/local/bin/mediamtx
+# yt-dlp, the zipapp; it runs through its `#!/usr/bin/env python3`.
+COPY --from=ytdlp /out/ /usr/local/bin/
 
 WORKDIR /opt/harmony
 COPY --from=deps /opt/harmony/node_modules ./node_modules

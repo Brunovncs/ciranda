@@ -66,6 +66,8 @@ pub enum SourceKind {
     Stream,
     /// Cues and soundpad clips.
     Effect,
+    /// Cirandinha's music: silenced by deafening, as voices are.
+    Music,
 }
 
 /// Something the speakers play: interleaved stereo at 48 kHz, pushed by whoever produces it.
@@ -96,6 +98,10 @@ enum Feed {
     /// A soundpad clip, played straight from its shared samples (and how far it got) instead of
     /// being copied.
     Clip(Arc<[i16]>, AtomicUsize),
+    /// A music track, decoded ahead by a thread of its own (`media::music`) into a queue only the
+    /// output callback reads. `played` counts the frames that went out, which is where the track
+    /// is; `ended`: the decoder has nothing more to give.
+    Track { output: Mutex<Consumer<f32>>, played: AtomicU64, ended: AtomicBool },
 }
 
 /// `CIRANDA_AUDIO_DEBUG` is set; looked up once, since it is asked every 10 ms for each stream.
@@ -114,6 +120,30 @@ impl Source {
             _ => Feed::Queue { buf: Mutex::new(VecDeque::new()) },
         };
         Arc::new(Source { kind, feed, gain: AtomicF32::new(gain), peak: AtomicF32::default(), one_shot })
+    }
+
+    /// A music track's source, and the queue's other end for its decoder to fill with
+    /// interleaved stereo at 48 kHz. Not in the mix until added.
+    pub fn track(gain: f32, capacity: usize) -> (Arc<Source>, Producer<f32>) {
+        let (input, output) = RingBuffer::new(capacity);
+        let feed = Feed::Track { output: Mutex::new(output), played: AtomicU64::new(0), ended: AtomicBool::new(false) };
+        let s = Source { kind: SourceKind::Music, feed, gain: AtomicF32::new(gain), peak: AtomicF32::default(), one_shot: false };
+        (Arc::new(s), input)
+    }
+
+    /// Frames of a track the speakers have taken so far; 0 for anything else.
+    pub fn played(&self) -> u64 {
+        match &self.feed {
+            Feed::Track { played, .. } => played.load(Ordering::Relaxed),
+            _ => 0,
+        }
+    }
+
+    /// The track's decoder is done: once its queue runs dry, the source has nothing to play.
+    pub fn end_track(&self) {
+        if let Feed::Track { ended, .. } = &self.feed {
+            ended.store(true, Ordering::Relaxed);
+        }
     }
 
     /// The cues' bus, which stays in the mix.
@@ -178,7 +208,7 @@ impl Source {
                 }
             }
             Feed::Queue { buf } => buf.lock().extend(stereo.flatten()),
-            Feed::Clip(..) | Feed::Bus { .. } => return,
+            Feed::Clip(..) | Feed::Bus { .. } | Feed::Track { .. } => return,
         }
         let frames = (samples.len() / channels).max(1);
         self.peak.max((sum / frames as f32).sqrt());
@@ -198,6 +228,7 @@ impl Source {
             Feed::Queue { buf } => buf.lock().is_empty(),
             Feed::Stream { output, .. } => output.lock().queue.is_empty(),
             Feed::Bus { incoming, playing, .. } => incoming.lock().is_empty() && playing.lock().is_empty(),
+            Feed::Track { output, ended, .. } => ended.load(Ordering::Relaxed) && output.lock().is_empty(),
         }
     }
 
@@ -216,6 +247,19 @@ impl Source {
                 at.store(from + n, Ordering::Relaxed);
             }
             Feed::Stream { output, overflowed, .. } => output.lock().pull(out, gain, overflowed.swap(false, Ordering::Relaxed)),
+            Feed::Track { output, played, .. } => {
+                let mut output = output.lock();
+                // Whole frames only: the decoder writes them whole, so this never splits one.
+                let n = out.len().min(output.slots()) & !1;
+                if let Ok(chunk) = output.read_chunk(n) {
+                    let (a, b) = chunk.as_slices();
+                    for (o, &v) in out.iter_mut().zip(a.iter().chain(b)) {
+                        *o += v * gain;
+                    }
+                    chunk.commit_all();
+                }
+                played.fetch_add((n / 2) as u64, Ordering::Relaxed);
+            }
             Feed::Queue { buf } => {
                 let mut buf = buf.lock();
                 let n = out.len().min(buf.len());
@@ -606,7 +650,7 @@ impl Mixer {
         }
         let mut busy = false;
         for s in sources.iter() {
-            let gain = if deaf && s.kind == SourceKind::Voice { 0. } else { s.gain.get() };
+            let gain = if deaf && matches!(s.kind, SourceKind::Voice | SourceKind::Music) { 0. } else { s.gain.get() };
             busy |= s.mix_into(out, gain, retire);
         }
         if busy {

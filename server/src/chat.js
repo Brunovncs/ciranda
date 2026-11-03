@@ -35,6 +35,8 @@ const ALLOWED_TYPES = new Map([
   ['audio/ogg', 'audio'],
   ['audio/wav', 'audio'],
   ['audio/webm', 'audio'],
+  // AAC in MP4 (.m4a): what Cirandinha keeps a song as (music/ytdlp.js).
+  ['audio/mp4', 'audio'],
   ['application/pdf', 'file'],
   ['text/plain', 'file'],
 ]);

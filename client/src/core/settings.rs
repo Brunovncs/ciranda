@@ -43,6 +43,9 @@ pub struct Settings {
     pub custom_theme: Option<CustomTheme>,
     pub show_members: bool,
     pub soundpad_volume: u32,
+    /// Cirandinha's music, as a percentage up to 350, and whether it is muted: yours alone.
+    pub music_volume: u32,
+    pub music_muted: bool,
     pub recent_emoji: Vec<String>,
     pub ui_scale: u32,
     pub mention_sound: bool,
@@ -205,6 +208,7 @@ impl Settings {
         a.mic_sensitivity = other.mic_sensitivity;
         a.sound_volume = other.sound_volume;
         a.soundpad_volume = other.soundpad_volume;
+        a.music_volume = other.music_volume;
         a.media_cache_mb = other.media_cache_mb;
         a.window = other.window;
         a.voice_volumes.clone_from(&other.voice_volumes);
@@ -623,6 +627,8 @@ impl Default for Settings {
             custom_theme: None,
             show_members: true,
             soundpad_volume: 100,
+            music_volume: 100,
+            music_muted: false,
             recent_emoji: Vec::new(),
             ui_scale: 100,
             mention_sound: true,

@@ -65,6 +65,8 @@ export class Realtime {
   // A mute toggle sends everybody a roster. Generous, since it is somebody
   // clicking (or holding push-to-talk), but a script cannot make it a flood.
   #muteThrottle = new Throttle({ burst: 20, perSecond: 4 });
+  /** Cirandinha's controls, per person: pressing them is cheap to do and not cheap to serve (a track is fetched). */
+  #musicThrottle = new Throttle({ burst: 60, perSecond: 5 });
   /** Rosters owed to a room whose mute toggles came too fast to send each one. */
   #owedRosters = new Set();
   /** Ink sent per person in the current second: { at, count }. */
@@ -95,6 +97,8 @@ export class Realtime {
    * @param {(conversationId: number, userId: number, mid: number, host: string) => object} deps.issueCallTokens
    * @param {import('./dms.js').DirectMessages} deps.dms
    * @param {import('./calls.js').Calls} deps.calls
+   * @param {import('./music/service.js').Music} [deps.music]
+   * @param {() => boolean} [deps.musicEnabled]  the owner's switch, and yt-dlp being there
    * @param {(channelId: number, mid: number) => Promise<void>} deps.kickMember
    */
   constructor(deps) {
@@ -371,6 +375,10 @@ export class Realtime {
       'call:hang-up': this.#callHangUp,
       'call:join': this.#callJoin,
       'soundpad:play': this.#soundpadPlay,
+      'music:add': this.#musicAdd,
+      'music:control': this.#musicControl,
+      'music:sync': this.#musicSync,
+      'music:clock': this.#musicClock,
       ink: this.#ink,
       'admin:force-mute': this.#adminForceMute,
       'admin:move': this.#adminMove,
@@ -418,6 +426,8 @@ export class Realtime {
       mid: joined.mid,
       ...this.#deps.issueTokens(channelId, user.id, joined.mid, this.#clients.get(ws)?.host),
       roster: this.#deps.voice.roster(channelId),
+      // Where the music is, so somebody who joins in the middle of a song is in the middle of it too.
+      music: this.#deps.music?.snapshot(channelId) ?? null,
     };
   }
 
@@ -626,6 +636,62 @@ export class Realtime {
       });
     }
     return { type: 'voice:ok' };
+  }
+
+  // ------------------------------------------------------------- music
+
+  /**
+   * Everything a Cirandinha request has to clear before it is served: the
+   * feature is on, the person is in that voice channel (the music is that
+   * channel's), and they are not pressing faster than it can be served.
+   * Anybody in the channel may add and control: upstream asks for a role's
+   * permission here, and a server of friends has no roles to ask.
+   * @returns {{channelId: number}|{error: object}}
+   */
+  #musicGate(user, msg) {
+    const fail = (error) => ({ error: { type: 'voice:error', error } });
+    if (!this.#deps.music || !this.#deps.musicEnabled?.()) return fail('music_off');
+    const channelId = Number(msg.channelId);
+    if (!this.#deps.voice.find(channelId, user.id)) return fail('not_in_channel');
+    if (!this.#musicThrottle.take(user.id).allowed) return fail('slow_down');
+    return { channelId };
+  }
+
+  #musicAdd(user, msg) {
+    const gate = this.#musicGate(user, msg);
+    if (gate.error) return gate.error;
+    const result = this.#deps.music.add(gate.channelId, user, msg.items, { next: msg.next === true });
+    return result.ok ? { type: 'voice:ok', added: result.added } : { type: 'voice:error', error: result.error };
+  }
+
+  #musicControl(user, msg) {
+    const gate = this.#musicGate(user, msg);
+    if (gate.error) return gate.error;
+    const result = this.#deps.music.control(gate.channelId, String(msg.action), msg);
+    return result.ok ? { type: 'voice:ok' } : { type: 'voice:error', error: result.error };
+  }
+
+  /** What is playing, asked for by anybody in the channel. */
+  #musicSync(user, msg) {
+    const gate = this.#musicGate(user, msg);
+    if (gate.error) return gate.error;
+    return { type: 'music:sync', channelId: gate.channelId, music: this.#deps.music.snapshot(gate.channelId) };
+  }
+
+  /**
+   * The server's clock, and nothing else. A listener asks, times the round
+   * trip, and so knows how long a push takes to arrive: which is what puts it
+   * at the same place in the track as the one who pressed Play.
+   */
+  #musicClock(user, msg) {
+    const gate = this.#musicGate(user, msg);
+    if (gate.error) return gate.error;
+    return { type: 'music:clock', serverNow: this.#deps.music.now() };
+  }
+
+  /** To everyone in a voice channel, and nobody else: what is playing is for the people hearing it. */
+  toChannel(channelId, payload) {
+    for (const member of this.#deps.voice.roster(channelId)) this.toUser(member.userId, payload);
   }
 
   // ------------------------------------------------------------- ink
@@ -853,10 +919,13 @@ export class Realtime {
   }
 
   broadcastRoster(channelId) {
+    const roster = this.#deps.voice.roster(channelId);
+    // The last person leaving ends the music, and lets go of its files.
+    this.#deps.music?.onRoster(channelId, roster);
     this.broadcast({
       type: 'voice:roster',
       channelId,
-      roster: this.#deps.voice.roster(channelId),
+      roster,
     });
   }
 

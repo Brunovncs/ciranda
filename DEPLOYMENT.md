@@ -425,6 +425,7 @@ one step at a time, with the candidate pair that won.
 | `GET` | `/api/media/:hash?k=` | An upload by media key (`GET /api/media-key`), for browser and Android clients that cannot send headers. Outside the password gate: the key, issued behind it, stands in for it. Never a private conversation's file |
 | `GET` | `/api/server/logo` | The server's picture, behind the password gate but not a login; the same one as `/api/server/icon/:hash` |
 | `GET` | `/api/streams` | Who is live, viewer counts, watch URLs, ICE servers |
+| `POST` | `/api/music/resolve` | Cirandinha: the tracks a YouTube or Spotify link, or some words, name, to choose from. Queueing them is `music:add` over the socket |
 | `POST` | `/api/session` | Claim a username; returns a broadcaster token or a watch URL |
 | `POST` | `/api/session/heartbeat` | Hold a claim while setting up |
 | `POST` | `/api/session/release` | Give a username back at once |
@@ -439,8 +440,9 @@ one step at a time, with the candidate pair that won.
 | `/etc/harmony/mediamtx.yml` | Relay config |
 | `/usr/local/bin/mediamtx` | The relay binary |
 | `/usr/local/bin/harmony-ip-watch.sh` | Dynamic-IP watcher |
+| `/usr/local/bin/yt-dlp` | What Cirandinha fetches audio with, root-owned (left out with `HARMONY_YTDLP=0`) |
 | `/var/lib/harmony/advertised-ip` | Last public IP it saw |
-| `/etc/systemd/system/{harmony-server,mediamtx,harmony-ip-watch}.*` | Units |
+| `/etc/systemd/system/{harmony-server,mediamtx,harmony-ip-watch,harmony-ytdlp-update}.*` | Units |
 
 The setup, when you let it run, also writes:
 
@@ -454,10 +456,10 @@ The setup, when you let it run, also writes:
 ### Uninstall
 
 ```bash
-sudo systemctl disable --now harmony-server mediamtx harmony-ip-watch.timer
+sudo systemctl disable --now harmony-server mediamtx harmony-ip-watch.timer harmony-ytdlp-update.timer
 sudo rm -rf /opt/harmony /etc/harmony /var/lib/harmony /usr/local/bin/mediamtx \
-            /usr/local/bin/harmony-ip-watch.sh \
-            /etc/systemd/system/{harmony-server,mediamtx,harmony-ip-watch}.{service,timer}
+            /usr/local/bin/harmony-ip-watch.sh /usr/local/bin/yt-dlp \
+            /etc/systemd/system/{harmony-server,mediamtx,harmony-ip-watch,harmony-ytdlp-update}.{service,timer}
 sudo systemctl daemon-reload
 sudo userdel harmony
 ```
@@ -465,6 +467,59 @@ sudo userdel harmony
 Caddy and certbot, if the setup installed them, are ordinary packages: remove
 them with `apt-get remove caddy certbot`, and the renewal hook and token with
 `sudo rm /etc/letsencrypt/renewal-hooks/deploy/harmony-caddy.sh /etc/letsencrypt/cloudflare.ini`.
+
+## Cirandinha: music in voice channels
+
+Cirandinha puts music on in a voice channel: a YouTube link or playlist, a
+Spotify track, album or playlist, or words to search for. Everybody in the
+channel hears the same song at the same place, each client playing its own
+copy at its own volume, and anybody in the channel can add songs, reorder the
+queue, skip, go back, shuffle and repeat. When the last person leaves the
+channel, its music ends.
+
+**It is on unless the owner turns it off** in the server's settings. All it
+needs is yt-dlp; without one, the settings say Cirandinha is not available.
+
+**What it takes.** The server finds and fetches the audio with
+[yt-dlp](https://github.com/yt-dlp/yt-dlp) and keeps it as an ordinary upload
+(AAC in an `.m4a`, about 1 MB a minute): it counts in the upload storage, and
+a song no queue holds is among the first things swept when the disk needs
+room. Nothing is re-encoded, there is no ffmpeg, and no audio goes through the
+media relay, so a Raspberry Pi manages it. Each client evens out the loudness
+of the songs itself.
+
+> **Your decision.** Downloading audio from YouTube this way is not something
+> YouTube's terms of service allow, and playing copyrighted music to other
+> people can need a licence where you live. Spotify's audio is never used: a
+> Spotify link is only read for its list of songs (from the public page
+> Spotify makes for embedding, which nothing promises will stay as it is), and
+> each song is looked for on YouTube when its turn comes.
+
+- **yt-dlp.** `install.sh` puts the standalone build in `/usr/local/bin/yt-dlp`
+  (root-owned, checked against the release's checksums) and a timer,
+  `harmony-ytdlp-update.timer`, updates it daily, because YouTube breaks old
+  versions often. `HARMONY_YTDLP=0` leaves it out. The Docker image has the
+  zipapp instead (one file for every platform, run by the image's Python); the
+  container copies it into the data volume (`bin/yt-dlp`) and updates that
+  copy a minute after it starts and daily after that.
+  `HARMONY_YTDLP_AUTOUPDATE=0` keeps the image's copy as it is.
+- **Why not the standalone build in Docker.** It is a one-file program that
+  unpacks its own libraries into `/tmp` on every run and loads them from there.
+  A read-only container's `/tmp` is a tmpfs, which Docker mounts `noexec`, so it
+  fails before it starts with `Error loading shared library libz.so.1:
+  Operation not permitted`. The zipapp unpacks nothing, so `/tmp` can stay
+  `noexec` and no memory goes to it.
+- **If YouTube says to sign in** ("confirm you're not a bot", usually from a
+  datacentre address), give yt-dlp a cookies file in Netscape format with
+  `HARMONY_YTDLP_COOKIES=/path/to/cookies.txt`, readable by the server's user.
+  Use a throwaway account's cookies: they are sent to YouTube.
+- **Limits.** A song longer than `HARMONY_MUSIC_MAX_SECONDS` (900, fifteen
+  minutes) or bigger than 24 MB is refused, a channel's queue holds
+  `HARMONY_MUSIC_QUEUE_MAX` songs (200), and a playlist adds its first 100.
+- **When it stops working.** Update yt-dlp first (`sudo yt-dlp -U`, or restart
+  the container). If only Spotify links fail with "could not read that Spotify
+  link", Spotify changed its page; the one file that reads it is
+  `server/src/music/spotify.js`.
 
 ---
 

@@ -17,6 +17,7 @@ describe('migrations', () => {
     assert.equal(version(db), SCHEMA_VERSION);
     assert.ok(columns(db, 'channels').includes('mic_locked'));
     assert.ok(columns(db, 'messages').includes('reply_to'));
+    assert.deepEqual(columns(db, 'music_tracks'), ['source_key', 'file_hash', 'title', 'artist', 'duration_ms', 'thumb_hash', 'fetched_at']);
   });
 
   it("take Harmony 3.5's v11, replies, without losing them or the microphone lock", () => {

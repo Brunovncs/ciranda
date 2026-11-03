@@ -17,6 +17,7 @@ const LEGACY_LOGO_KEY = 'server_logo';
 // The Electron line's key for the same setting, so a database that moves
 // between the two lines keeps it.
 const MAX_FILE_KEY = 'max_file_bytes';
+const MUSIC_KEY = 'music_enabled';
 
 /** What a server with no name of its own is called. */
 export const DEFAULT_NAME = 'Harmony';
@@ -131,6 +132,21 @@ export class ServerSettings {
     else this.#meta.set(MAX_FILE_KEY, String(Math.round(bytes)));
   }
 
+  /**
+   * Whether Cirandinha is on. On unless the owner has turned it off: upstream
+   * ships it off, but this fork's servers are friends' servers whose operator
+   * has decided for them (DEPLOYMENT.md says what it involves). Only the
+   * owner's "off" is stored, as '0'; nothing stored is on.
+   */
+  get musicEnabled() {
+    return this.#meta.get(MUSIC_KEY) !== '0';
+  }
+
+  setMusicEnabled(on) {
+    if (on) this.#meta.delete(MUSIC_KEY);
+    else this.#meta.set(MUSIC_KEY, '0');
+  }
+
   /** The override, or null when the environment is still in charge. */
   #stored() {
     return this.#meta.get(DOOR_KEY);
@@ -228,6 +244,7 @@ export class ServerSettings {
       logo: this.iconHash,
       passwordRequired: this.passwordRequired,
       restartRequired: this.restartRequired,
+      musicEnabled: this.musicEnabled,
     };
   }
 }
