@@ -21,7 +21,7 @@ use gpui::prelude::FluentBuilder;
 use gpui::{
     Animation, AnimationExt, AnyElement, App, AppContext, Context, Entity, EventEmitter, Focusable, InteractiveElement, IntoElement,
     MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render, SharedString, StatefulInteractiveElement, StyleRefinement, Styled,
-    Window, anchored, div,
+    Window, anchored, canvas, div,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -140,7 +140,25 @@ impl ServerView {
         } else {
             self.render_tiles(&tiles, voice.as_ref(), t, window, cx)
         };
-        div().flex().flex_col().size_full().child(header).child(div().flex_1().min_h(px(0.)).child(body)).into_any_element()
+        // Measured as laid out; a change draws the tiles again at the new size.
+        let (seen, view) = (self.stage_size.clone(), cx.entity_id());
+        let measure = canvas(
+            move |b, _, cx| {
+                if seen.replace(b.size) != b.size {
+                    cx.notify(view);
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .inset_0();
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .child(header)
+            .child(div().relative().flex_1().min_h(px(0.)).child(body).child(measure))
+            .into_any_element()
     }
 
     /// Closed streams, as chips that reopen them.
@@ -247,17 +265,25 @@ impl ServerView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        // The space the stage has, roughly: the window less the side panes.
-        let vw = f32::from(window.viewport_size().width) / crate::theme::scale();
-        let vh = f32::from(window.viewport_size().height) / crate::theme::scale();
-        let side = 268. + if prefs(cx).show_members && vw > 900. { 232. } else { 0. } + 40.;
-        let (w, h) = ((vw - side).max(320.) - 32., (vh - 48. - 52. - 40.).max(240.));
+        // The stage as it was laid out, less its padding; before the first layout, the window
+        // less the side panes, roughly.
+        let scale = crate::theme::scale();
+        let laid = self.stage_size.get();
+        let (w, h) = if laid.width > gpui::px(0.) {
+            (f32::from(laid.width) / scale - 32., f32::from(laid.height) / scale - 32.)
+        } else {
+            let vw = f32::from(window.viewport_size().width) / scale;
+            let vh = f32::from(window.viewport_size().height) / scale;
+            (vw - 640., vh - 140.)
+        };
+        let (w, h) = (w.max(320.), h.max(200.));
         self.ink_layers.retain(|id, _| tiles.iter().any(|t| t.entity_id() == *id));
         let focused = self.focused_tile.clone().filter(|f| tiles.contains(f));
         if let Some(f) = focused {
             let others: Vec<Entity<Tile>> = tiles.iter().filter(|x| **x != f).cloned().collect();
             let strip_h = if others.is_empty() { 0. } else { 130. };
-            let big = self.tile_el(&f, voice, w, h - strip_h, true, t, window, cx);
+            // The strip and the gap above it.
+            let big = self.tile_el(&f, voice, w, h - if others.is_empty() { 0. } else { strip_h + 10. }, true, t, window, cx);
             // As many as there are: centred while they fit, scrolled sideways (the wheel too) once not.
             let mut row = div().flex().flex_none().gap(px(10.)).mx_auto();
             for o in &others {
@@ -278,12 +304,17 @@ impl ServerView {
                 cols = c;
             }
         }
-        let tw = best.max(160.);
+        // A pixel short, so rounding never pushes a row past the stage.
+        let tw = (best - 1.).floor().max(160.);
         let th = tw * 9. / 16.;
-        let _ = cols;
-        let mut grid = div().flex().flex_wrap().justify_center().content_center().gap(px(gap)).p(px(16.)).size_full();
-        for tile in tiles {
-            grid = grid.child(self.tile_el(tile, voice, tw, th, false, t, window, cx));
+        // Rows laid out by hand: wrapping would break a row wherever rounding says it no longer fits.
+        let mut grid = div().flex().flex_col().justify_center().items_center().gap(px(gap)).p(px(16.)).size_full();
+        for row in tiles.chunks(cols) {
+            let mut line = div().flex().flex_none().gap(px(gap));
+            for tile in row {
+                line = line.child(self.tile_el(tile, voice, tw, th, false, t, window, cx));
+            }
+            grid = grid.child(line);
         }
         grid.into_any_element()
     }

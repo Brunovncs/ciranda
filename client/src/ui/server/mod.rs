@@ -106,6 +106,8 @@ pub struct ServerView {
     /// The "is calling you" dialog, while it rings.
     ringing: Option<Entity<private::Incoming>>,
     pub focused_tile: Option<Entity<crate::media::video::Tile>>,
+    /// The stage's size as last laid out, which the tiles are sized to fit.
+    stage_size: std::rc::Rc<std::cell::Cell<gpui::Size<Pixels>>>,
     /// The stream watched over the whole window, with the call's controls along the bottom.
     pub theater: Option<Entity<crate::media::video::Tile>>,
     /// When the pointer last moved over it: its controls hide once it rests.
@@ -232,6 +234,7 @@ impl ServerView {
             call: None,
             call_subs: Vec::new(),
             focused_tile: None,
+            stage_size: Default::default(),
             theater: None,
             theater_moved: std::time::Instant::now(),
             theater_bar_hover: false,
