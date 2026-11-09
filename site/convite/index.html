@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Convite para o Ciranda</title>
+<meta name="description" content="Você foi convidado para um servidor do Ciranda: voz e chat para o seu grupo de amigos.">
+<meta property="og:title" content="Convite para o Ciranda">
+<meta property="og:description" content="Voz e chat para o seu grupo de amigos. Toque para entrar.">
+<meta property="og:image" content="https://brunovncs.github.io/ciranda/icon.png">
+<link rel="icon" href="../icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700&display=swap" rel="stylesheet">
+<!--
+  An invitation to a Ciranda server (client/src/core/invite.rs makes the link). Everything it
+  carries is after the #, which the browser never sends: not to GitHub, not to any analytics.
+  This page reads it, offers the app, and hands the same fields to the app as ciranda://join.
+-->
+<style>
+  :root {
+    --bg: #0f1116; --surface: #171a21; --raised: #1f232c; --border: #2a2f3a;
+    --text: #e6e8ee; --muted: #8b93a7; --accent: #6682ff; --danger: #e05561; --ok: #3fd07f;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --bg: #f2f3f5; --surface: #ffffff; --raised: #ebedef; --border: #d4d7dc;
+      --text: #22262b; --muted: #5c6670; --accent: #0b2ecb; --danger: #c4303a; --ok: #1a9550;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 16px/1.5 Figtree, system-ui, -apple-system, "Segoe UI", sans-serif;
+    min-height: 100vh; display: flex; justify-content: center; padding: 40px 16px;
+  }
+  main { width: 100%; max-width: 440px; }
+  .head { text-align: center; margin-bottom: 28px; }
+  .head img { width: 84px; height: 84px; border-radius: 20px; }
+  .kicker { color: var(--muted); margin: 18px 0 2px; font-size: 15px; }
+  h1 { font-size: 30px; line-height: 1.15; margin: 0; font-weight: 700; overflow-wrap: anywhere; }
+  .host { color: var(--muted); font-size: 14px; margin-top: 6px; overflow-wrap: anywhere; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 20px; margin-bottom: 14px; }
+  .card h2 { font-size: 16px; margin: 0 0 6px; font-weight: 600; }
+  .card p { margin: 0 0 14px; color: var(--muted); font-size: 15px; }
+  .card p:last-child { margin-bottom: 0; }
+  .btn {
+    display: flex; align-items: center; justify-content: center; gap: 8px; width: 100%;
+    min-height: 50px; padding: 12px 16px; border-radius: 12px; border: 0; cursor: pointer;
+    font: 600 16px Figtree, system-ui, sans-serif; text-decoration: none; text-align: center;
+    background: var(--accent); color: #fff;
+  }
+  .btn.secondary { background: var(--raised); color: var(--text); }
+  .btn + .btn { margin-top: 10px; }
+  .btn:focus-visible { outline: 3px solid color-mix(in srgb, var(--accent) 50%, transparent); outline-offset: 2px; }
+  ol { margin: 0; padding-left: 20px; color: var(--muted); font-size: 15px; }
+  ol li { margin: 4px 0; }
+  ol b { color: var(--text); font-weight: 600; }
+  .field { display: flex; align-items: center; gap: 8px; background: var(--raised); border-radius: 10px; padding: 8px 8px 8px 12px; margin-top: 8px; }
+  .field span { flex: 1; min-width: 0; font: 14px ui-monospace, "Cascadia Mono", Consolas, monospace; overflow-wrap: anywhere; }
+  .field small { display: block; font: 12px Figtree, system-ui, sans-serif; color: var(--muted); }
+  .chip { flex: none; border: 0; border-radius: 8px; padding: 6px 10px; background: var(--surface); color: var(--text); font: 500 13px Figtree, system-ui, sans-serif; cursor: pointer; }
+  .note { color: var(--muted); font-size: 13px; text-align: center; margin-top: 20px; }
+  .note a { color: var(--muted); }
+  .error h1 { font-size: 24px; }
+  [hidden] { display: none !important; }
+  details summary { cursor: pointer; color: var(--muted); font-size: 14px; }
+  details[open] summary { margin-bottom: 4px; }
+</style>
+</head>
+<body>
+<main>
+  <div class="head">
+    <img src="../icon.png" alt="">
+    <p class="kicker" data-t="invited">Você foi convidado para</p>
+    <h1 id="name">um servidor do Ciranda</h1>
+    <div class="host" id="host"></div>
+  </div>
+
+  <!-- Android: the app opens with everything filled in; without it, the APK. -->
+  <section id="android" hidden>
+    <div class="card">
+      <a class="btn" id="open-android" href="#" data-t="open">Abrir no Ciranda</a>
+      <p style="margin-top:12px" data-t="android-hint">Se o Ciranda ainda não estiver instalado, o botão baixa o app. Depois de instalar, volte aqui e toque de novo.</p>
+      <a class="btn secondary" id="apk" href="https://github.com/Brunovncs/ciranda-android/releases/latest" data-t="get-android">Baixar Ciranda para Android</a>
+    </div>
+    <div class="card">
+      <h2 data-t="first-time">Primeira vez instalando?</h2>
+      <ol>
+        <li data-t="a1">Abra o arquivo baixado.</li>
+        <li data-t="a2">Permita que o navegador instale apps, se o Android pedir.</li>
+        <li data-t="a3">Volte aqui e toque em <b>Abrir no Ciranda</b>: só falta escolher seu nome e uma senha.</li>
+      </ol>
+    </div>
+  </section>
+
+  <!-- A computer: the app's download, and the invite to paste into it. -->
+  <section id="desktop" hidden>
+    <div class="card">
+      <h2 data-t="desk-title">No computador</h2>
+      <ol>
+        <li data-t="d1">Baixe e abra o Ciranda.</li>
+        <li data-t="d2">Copie o convite e cole no campo <b>Endereço do servidor</b>: o resto se preenche.</li>
+        <li data-t="d3">Escolha seu nome e uma senha.</li>
+      </ol>
+      <p></p>
+      <a class="btn" id="desk-download" href="https://github.com/Brunovncs/ciranda/releases/latest" data-t="get-desktop">Baixar Ciranda</a>
+      <button class="btn secondary" id="copy-link" type="button" data-t="copy-invite">Copiar convite</button>
+    </div>
+  </section>
+
+  <section id="ios" hidden>
+    <div class="card">
+      <h2 data-t="ios-title">Ainda não tem Ciranda para iPhone</h2>
+      <p data-t="ios-text">Por enquanto o Ciranda roda no Android, no Windows, no macOS e no Linux. Abra este convite num deles.</p>
+    </div>
+  </section>
+
+  <!-- What the link carries, for typing it in by hand. -->
+  <section id="manual" hidden>
+    <div class="card">
+      <details>
+        <summary data-t="by-hand">Prefere digitar? Endereço e senha</summary>
+        <div class="field"><span><small data-t="address">Endereço do servidor</small><span id="f-server"></span></span><button class="chip" type="button" data-copy="server" data-t="copy">Copiar</button></div>
+        <div class="field" id="pw-row"><span><small data-t="password">Senha do servidor</small><span id="f-password">••••••••</span></span><button class="chip" type="button" id="reveal" data-t="show">Mostrar</button><button class="chip" type="button" data-copy="password" data-t="copy">Copiar</button></div>
+      </details>
+    </div>
+  </section>
+
+  <section id="broken" class="error" hidden>
+    <div class="card">
+      <h2 data-t="broken-title">Este convite está incompleto</h2>
+      <p data-t="broken-text">Peça um convite novo a quem te chamou: no Ciranda, clique com o botão direito no servidor e escolha Copiar convite.</p>
+    </div>
+  </section>
+
+  <p class="note"><span data-t="footer">Ciranda: voz e chat para o seu grupo de amigos.</span> <a href="https://github.com/Brunovncs/ciranda">GitHub</a></p>
+</main>
+
+<script>
+(() => {
+  const en = !/^pt\b/i.test(navigator.language || 'pt');
+  const EN = {
+    invited: 'You were invited to', open: 'Open in Ciranda',
+    'android-hint': "If Ciranda isn't installed yet, the button downloads it. Once installed, come back here and tap it again.",
+    'get-android': 'Download Ciranda for Android', 'first-time': 'Installing for the first time?',
+    a1: 'Open the downloaded file.', a2: 'Let the browser install apps, if Android asks.',
+    a3: 'Come back here and tap <b>Open in Ciranda</b>: all that is left is a name and a password.',
+    'desk-title': 'On a computer', d1: 'Download and open Ciranda.',
+    d2: 'Copy the invite and paste it in the <b>Server address</b> box: the rest fills itself in.',
+    d3: 'Choose your name and a password.', 'get-desktop': 'Download Ciranda', 'copy-invite': 'Copy invite',
+    'ios-title': 'No Ciranda for iPhone yet', 'ios-text': 'For now Ciranda runs on Android, Windows, macOS and Linux. Open this invite on one of them.',
+    'by-hand': 'Rather type it? Address and password', address: 'Server address', password: 'Server password',
+    copy: 'Copy', show: 'Show', hide: 'Hide', copied: 'Copied',
+    'broken-title': 'This invite is incomplete',
+    'broken-text': 'Ask whoever invited you for a new one: in Ciranda, right-click the server and choose Copy invite link.',
+    footer: 'Ciranda: voice and chat for your group of friends.', server: 'a Ciranda server',
+  };
+  const PT = { hide: 'Ocultar', copied: 'Copiado', show: 'Mostrar', copy: 'Copiar', server: 'um servidor do Ciranda', 'copy-invite': 'Copiar convite' };
+  const t = (k) => (en ? EN[k] : PT[k]) ?? k;
+  if (en) {
+    document.documentElement.lang = 'en';
+    for (const el of document.querySelectorAll('[data-t]')) {
+      const k = el.dataset.t;
+      if (EN[k]) el.innerHTML = EN[k];
+    }
+    document.title = 'Ciranda invite';
+  }
+
+  const hash = new URLSearchParams(location.hash.slice(1));
+  const server = (hash.get('s') || '').trim();
+  const password = hash.get('p') || '';
+  const name = (hash.get('n') || '').trim();
+  const show = (id) => { document.getElementById(id).hidden = false; };
+
+  if (!server) {
+    document.querySelector('.kicker').hidden = true;
+    document.getElementById('name').hidden = true;
+    show('broken');
+    return;
+  }
+
+  const host = server.replace(/^[a-z]+:\/\//i, '');
+  document.getElementById('name').textContent = name || host;
+  document.getElementById('host').textContent = name ? host : '';
+  if (name) document.title = (en ? 'Invite to ' : 'Convite para ') + name;
+
+  // The app's own link: the same fields, as core::invite::Invite::app_link makes them.
+  const fields = new URLSearchParams();
+  fields.set('s', server);
+  if (password) fields.set('p', password);
+  if (name) fields.set('n', name);
+  const query = fields.toString();
+
+  const ua = navigator.userAgent;
+  const android = /Android/i.test(ua);
+  const ios = /iPhone|iPad|iPod/i.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1);
+
+  async function latest(repo, pick) {
+    try {
+      const r = await fetch(`https://api.github.com/repos/${repo}/releases/latest`, { headers: { Accept: 'application/vnd.github+json' } });
+      if (!r.ok) return null;
+      const release = await r.json();
+      const asset = (release.assets || []).find((a) => pick(a.name));
+      return asset ? asset.browser_download_url : null;
+    } catch { return null; }
+  }
+
+  if (android) {
+    show('android');
+    const page = 'https://github.com/Brunovncs/ciranda-android/releases/latest';
+    const open = document.getElementById('open-android');
+    const intentFor = (fallback) =>
+      `intent://join?${query}#Intent;scheme=ciranda;package=app.ciranda.android;S.browser_fallback_url=${encodeURIComponent(fallback)};end`;
+    // Firefox does not take intent: links; it opens the app's own scheme.
+    const firefox = /Firefox/i.test(ua);
+    open.href = firefox ? `ciranda://join?${query}` : intentFor(page);
+    latest('Brunovncs/ciranda-android', (n) => n.endsWith('-android.apk')).then((apk) => {
+      if (!apk) return;
+      document.getElementById('apk').href = apk;
+      if (!firefox) open.href = intentFor(apk);
+    });
+  } else if (ios) {
+    show('ios');
+  } else {
+    show('desktop');
+    const dl = document.getElementById('desk-download');
+    const plat = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || ua;
+    const pick = /Mac/i.test(plat) ? (n) => n.endsWith('-macos-universal.dmg')
+      : /Linux/i.test(plat) ? (n) => n.endsWith('-linux-x64.AppImage')
+      : /arm/i.test(ua) ? (n) => n.endsWith('-windows-arm64-setup.exe')
+      : (n) => n.endsWith('-windows-x64-setup.exe');
+    latest('Brunovncs/ciranda', pick).then((url) => { if (url) dl.href = url; });
+    const copyLink = document.getElementById('copy-link');
+    copyLink.addEventListener('click', () => copy(location.href, copyLink));
+  }
+
+  show('manual');
+  document.getElementById('f-server').textContent = server;
+  if (!password) {
+    document.getElementById('pw-row').hidden = true;
+  } else {
+    const shown = document.getElementById('f-password');
+    const reveal = document.getElementById('reveal');
+    reveal.addEventListener('click', () => {
+      const on = shown.textContent === password;
+      shown.textContent = on ? '••••••••' : password;
+      reveal.textContent = on ? t('show') : t('hide');
+    });
+  }
+  for (const b of document.querySelectorAll('[data-copy]')) {
+    b.addEventListener('click', () => copy(b.dataset.copy === 'server' ? server : password, b));
+  }
+
+  async function copy(text, button) {
+    const before = button.textContent;
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      const area = document.createElement('textarea');
+      area.value = text;
+      document.body.appendChild(area);
+      area.select();
+      try { document.execCommand('copy'); } catch {}
+      area.remove();
+    }
+    button.textContent = t('copied');
+    setTimeout(() => { button.textContent = before; }, 1600);
+  }
+})();
+</script>
+</body>
+</html>

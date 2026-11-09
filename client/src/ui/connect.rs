@@ -4,6 +4,7 @@
 
 use crate::core::api::{Api, ApiError, sends_in_the_clear};
 use crate::core::cache::Cache;
+use crate::core::invite::Invite;
 use crate::core::settings::{SavedServer, same_server};
 use crate::core::types::{AuthReply, ErrorCode, Health, IceServer, User};
 use crate::core::{self};
@@ -96,6 +97,9 @@ impl ConnectView {
                 TextFieldEvent::Submit => this.connect(cx),
                 TextFieldEvent::Changed => {
                     this.error = None;
+                    if f == this.server && this.take_invite(cx) {
+                        return;
+                    }
                     // Never the server password as it is typed: the server counts every wrong
                     // one it is sent, and a few half-typed ones would lock this computer out.
                     if f == this.server {
@@ -167,6 +171,23 @@ impl ConnectView {
             this.probe(cx);
         }
         this
+    }
+
+    /// An invite link pasted as the address (`core::invite`): the address and the server password
+    /// go in their boxes, the form asks for a new account, and the password is checked at once.
+    fn take_invite(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(invite) = Invite::parse(&self.server.read(cx).text()) else { return false };
+        self.server.update(cx, |f, cx| f.set_text(&invite.server, cx));
+        self.door.update(cx, |f, cx| f.set_text(&invite.password, cx));
+        self.mode = Mode::Register;
+        self.restore_password(cx);
+        if invite.password.is_empty() {
+            self.probe(cx);
+        } else {
+            self.check_door(true, cx);
+        }
+        cx.notify();
+        true
     }
 
     /// Whether the server has accounts and an owner decides which fields the form shows, so it is
@@ -928,6 +949,9 @@ impl AddServer {
                 TextFieldEvent::Submit => this.submit(cx),
                 TextFieldEvent::Changed => {
                     this.error = None;
+                    if *f == this.server && this.take_invite(cx) {
+                        return;
+                    }
                     // The address only: see `ConnectView::new`.
                     if *f == this.server {
                         this.probe(cx);
@@ -1009,6 +1033,20 @@ impl AddServer {
             this.probed = true;
             cx.notify();
         });
+    }
+
+    /// As `ConnectView::take_invite`. The account is a new one there unless this adds a server
+    /// for the account in use, which signs in (or is made) with the password kept for it.
+    fn take_invite(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(invite) = Invite::parse(&self.server.read(cx).text()) else { return false };
+        self.server.update(cx, |f, cx| f.set_text(&invite.server, cx));
+        self.door.update(cx, |f, cx| f.set_text(&invite.password, cx));
+        if self.me.is_none() {
+            self.set_mode(Mode::Register, cx);
+        }
+        self.probe(cx);
+        cx.notify();
+        true
     }
 
     /// As `ConnectView::check_door`: once the server password's box is left.

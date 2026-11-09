@@ -361,6 +361,7 @@ impl Root {
         let name = if s.name.is_empty() { s.host() } else { s.name.clone() };
         let header = (name.clone(), s.host());
         let copy = s.url.clone();
+        let invite = crate::core::invite::Invite::new(&s.url, &s.password, &name).link();
         let leave = s.url.clone();
         let menu = cx.new(|_| Menu {
             items: vec![
@@ -379,6 +380,16 @@ impl Root {
                 MenuEntry::item("paperclip", tr!("Copy address", "Copiar endereço"), false, move |_, cx| {
                     cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));
                     overlay::toast(tr!("Address copied.", "Endereço copiado."), cx);
+                }),
+                MenuEntry::item("users", tr!("Copy invite link", "Copiar convite"), false, move |_, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(invite.clone()));
+                    overlay::toast(
+                        tr!(
+                            "Invite copied. Whoever opens it gets this server's address and password.",
+                            "Convite copiado. Quem abrir recebe o endereço e a senha deste servidor."
+                        ),
+                        cx,
+                    );
                 }),
                 MenuEntry::item("log-out", tr!("Remove server", "Remover servidor"), true, move |window, cx| {
                     let (root, url) = (root.clone(), leave.clone());
