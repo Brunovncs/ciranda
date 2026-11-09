@@ -54,6 +54,15 @@ pub enum Kind {
 
 pub type Line = Vec<Span>;
 
+/// The words that call the whole server, as the server reads them (`EVERYONE_WORDS` in its
+/// `chat.js`): `@everyone` and the shorter ways people write it.
+pub const EVERYONE_WORDS: [&str; 4] = ["everyone", "all", "todos", "here"];
+
+/// Whether a folded mention calls everyone rather than somebody.
+pub fn calls_everyone(name: &str) -> bool {
+    EVERYONE_WORDS.contains(&name)
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Block {
     /// A run of ordinary lines, drawn with a break between each and none after the last. An empty
@@ -1053,6 +1062,16 @@ mod tests {
         assert_eq!(mentions("no one"), Vec::<String>::new());
         assert_eq!(mentions("mail me@bob.com or @@x"), Vec::<String>::new());
         assert_eq!(mentions("@EVERYONE @everyone"), ["everyone"]);
+    }
+
+    #[test]
+    fn the_short_ways_of_calling_everyone() {
+        for word in ["everyone", "all", "todos", "here"] {
+            assert!(calls_everyone(word), "{word}");
+        }
+        // Folded already, as a mention's name is; and a word that only starts like one is a person.
+        assert!(!calls_everyone("allison"));
+        assert!(!calls_everyone("Todos"));
     }
 
     #[test]

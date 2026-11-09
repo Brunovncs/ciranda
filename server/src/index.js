@@ -400,7 +400,8 @@ app.get('/api/health', (req, res) => {
     authenticated: authed,
     // `inbox`: GET /api/inbox and `scope: 'private'` sockets, so a client can
     // keep this server's private messages in the background cheaply.
-    features: ['inbox', 'replies', 'edit-history', 'ink', 'dm-clear'],
+    // `mentions`: a `private` socket also hears the mentions that call you.
+    features: ['inbox', 'replies', 'edit-history', 'ink', 'dm-clear', 'mentions'],
     ...(authed
       ? {
           name: serverSettings.name,
@@ -1350,6 +1351,23 @@ function toChannelReaders(channelId, payload) {
   return realtime?.broadcastWhere(payload, (user) => channels.hasGrant(channelId, user.id));
 }
 
+/**
+ * A mention, to the background sockets of whoever it calls: the channel's
+ * messages are broadcast only to the server on screen, so a phone kept in a
+ * pocket would never hear of one. The channel's name comes along, as such a
+ * socket has no list of channels to look it up in. The same readers as the
+ * message itself: @everyone in a password channel calls only those inside.
+ */
+function toMentioned(channel, message) {
+  if (!message || (!message.mentionsEveryone && message.mentions.length === 0)) return;
+  const reads = (user) => !channel.password_hash || channels.hasGrant(channel.id, user.id);
+  const called = (user) => message.mentionsEveryone || message.mentions.includes(user.id);
+  realtime?.toBackground(
+    { type: 'mention', message, channel: { id: channel.id, name: channel.name } },
+    (user) => user.id !== message.userId && called(user) && reads(user),
+  );
+}
+
 app.get('/api/channels/:id/messages', requireLogin, (req, res) => {
   const id = Number.parseInt(req.params.id, 10);
   const channel = readableChannel(req, id);
@@ -1381,6 +1399,7 @@ app.post('/api/channels/:id/messages', requireLogin, (req, res) => {
 
   const message = oneForClient(result.message);
   toChannelReaders(id, { type: 'message', message });
+  toMentioned(channel, message);
   return res.status(201).json({ message });
 });
 

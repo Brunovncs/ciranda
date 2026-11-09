@@ -268,8 +268,8 @@ fn pieces(line: &Line, t: &Theme, look: &mut Lookup, cx: &mut Context<Session>) 
             }
             Kind::Mention { name, raw } => {
                 let me = look.session.users.get(&look.me).map(|u| u.nickname.clone()).unwrap_or_default();
-                let (shown, mine) = if name == "everyone" {
-                    (Some("@everyone".to_string()), true)
+                let (shown, mine) = if crate::markdown::calls_everyone(name) {
+                    (Some(raw.to_lowercase()), true)
                 } else {
                     (look.session.user_by_nick(name).map(|u| format!("@{}", u.name())), *name == me)
                 };

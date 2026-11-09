@@ -179,6 +179,12 @@ export const MENTION_RE = /(?<![\w@])@([a-z0-9][a-z0-9_-]{0,23})/gi;
 export const EVERYONE = 'everyone';
 
 /**
+ * The other ways people write it, which mean the same: whoever is called
+ * one of these is called with everybody else.
+ */
+export const EVERYONE_WORDS = new Set([EVERYONE, 'all', 'todos', 'here']);
+
+/**
  * Who a message is addressed to.
  *
  * Computed from the text rather than stored, and that is deliberate. A
@@ -198,7 +204,7 @@ export function mentionsIn(body, idOf) {
   MENTION_RE.lastIndex = 0;
   for (let m = MENTION_RE.exec(text); m; m = MENTION_RE.exec(text)) {
     const name = m[1].toLowerCase();
-    if (name === EVERYONE) {
+    if (EVERYONE_WORDS.has(name)) {
       everyone = true;
       continue;
     }

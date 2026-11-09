@@ -1173,6 +1173,13 @@ describe('reading mentions out of a message', () => {
     assert.equal(result.everyone, true);
     assert.deepEqual(result.userIds, []);
   });
+
+  it('takes @all, @todos and @here for @everyone', () => {
+    for (const word of ['@all', '@Todos', '@here']) {
+      assert.deepEqual(mentionsIn(`${word} dinner is ready`, idOf), { userIds: [], everyone: true }, word);
+    }
+    assert.equal(mentionsIn('@allison hi', idOf).everyone, false, 'a word that only starts like one');
+  });
 });
 
 describe('mentions on a message', () => {

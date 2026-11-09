@@ -918,6 +918,15 @@ export class Realtime {
     this.#fanOut(payload, (client) => Boolean(client.user) && client.scope === 'full' && allow(client.user));
   }
 
+  /**
+   * Send to the background sockets of whoever passes a test: what a phone
+   * kept connected in its pocket wants to hear of the server's broadcasts,
+   * without being online there.
+   */
+  toBackground(payload, allow) {
+    this.#fanOut(payload, (client) => Boolean(client.user) && client.scope === 'private' && allow(client.user));
+  }
+
   broadcastRoster(channelId) {
     const roster = this.#deps.voice.roster(channelId);
     // The last person leaving ends the music, and lets go of its files.

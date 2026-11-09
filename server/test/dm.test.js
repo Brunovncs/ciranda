@@ -885,6 +885,30 @@ describe('in the background', () => {
     await Promise.all([alice.close(), bob.close()]);
   });
 
+  it('hears the mentions that call you, and only those', async () => {
+    assert.ok((await api('/api/health')).body.features.includes('mentions'));
+    const channels = (await api('/api/channels', { token: tokens.alice })).body.channels;
+    const text = channels.find((c) => c.kind === 'text');
+    const post = (who, body) => api(`/api/channels/${text.id}/messages`, { method: 'POST', token: tokens[who], body: { body } });
+    const bob = connect(tokens.bob);
+    await bob.hello({ scope: 'private' });
+    const eve = connect(tokens.eve);
+    await eve.hello({ scope: 'private' });
+
+    assert.equal((await post('alice', 'nothing for anybody')).status, 201);
+    assert.equal((await post('alice', 'hey @bob, look')).status, 201);
+    const got = await bob.next((m) => m.type === 'mention');
+    assert.equal(got.message.body, 'hey @bob, look');
+    assert.deepEqual(got.channel, { id: text.id, name: text.name });
+    await silent(eve, (m) => m.type === 'mention' || m.type === 'message');
+
+    assert.equal((await post('bob', '@todos bora jogar')).status, 201);
+    const all = await eve.next((m) => m.type === 'mention');
+    assert.equal(all.message.mentionsEveryone, true);
+    await silent(bob, (m) => m.type === 'mention' && m.message.body.startsWith('@todos'));
+    await Promise.all([bob.close(), eve.close()]);
+  });
+
   it('answers an inbox poll with the newest message, and keeps the poller reachable for a call', async () => {
     const convo = await open('alice', 'bob');
     const before = await api('/api/inbox', { token: tokens.bob });
