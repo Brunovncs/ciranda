@@ -3,7 +3,8 @@
 
 use super::emoji_picker::EmojiPicker;
 use super::picker::Picker;
-use super::rich::{self, Lookup};
+use super::rich::{self, Lookup, Select};
+use super::select::Selection;
 use super::sidebar::{Menu, MenuEntry};
 use crate::core::types::*;
 use crate::core::upload::{Progress, Source};
@@ -133,6 +134,10 @@ pub struct ChatView {
     frame_timer: Task<()>,
     /// The language the placeholders were written in, so a switch rewrites them.
     lang: crate::i18n::Lang,
+    /// Message text selected with the mouse.
+    sel: Selection,
+    /// Scrolls the messages while a selection is dragged past the top or bottom of the list.
+    drag_scroll: Option<Task<()>>,
     focus: FocusHandle,
     _subs: Vec<Subscription>,
 }
@@ -157,7 +162,13 @@ impl ChatView {
             cx.observe(&session, |this, _, cx| this.sync(cx)),
             cx.subscribe_in(&composer, window, |this, _, ev: &TextFieldEvent, window, cx| match ev {
                 TextFieldEvent::Submit => this.send(window, cx),
-                TextFieldEvent::Changed => this.update_mention(cx),
+                TextFieldEvent::Changed => {
+                    if !this.sel.is_empty() {
+                        this.sel.clear();
+                        cx.notify();
+                    }
+                    this.update_mention(cx)
+                }
             }),
             cx.subscribe(&search, |this, _, ev: &TextFieldEvent, cx| {
                 let _ = ev;
@@ -184,6 +195,7 @@ impl ChatView {
             }
         });
         session.update(cx, |s, cx| s.open(room, cx));
+        let focus = cx.focus_handle();
         let mut v = ChatView {
             session,
             room,
@@ -212,7 +224,9 @@ impl ChatView {
             frame_due: None,
             frame_timer: Task::ready(()),
             lang: crate::i18n::lang(),
-            focus: cx.focus_handle(),
+            sel: Selection::new(cx.entity_id(), focus.clone()),
+            drag_scroll: None,
+            focus,
             _subs: subs,
         };
         v.sync(cx);
@@ -753,6 +767,72 @@ impl ChatView {
     /// Ctrl+V in the box, caught on its way there: the box's own paste runs before any key
     /// listener and knows only text. A copied picture or file is attached; text, even beside a
     /// picture (a spreadsheet's cells), goes on to the box.
+    /// Ctrl+C in the box copies the messages' text selected, if any, rather than the box's.
+    fn on_copy(&mut self, _: &crate::text_field::Copy, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.sel.is_empty() {
+            self.copy_selection(cx);
+            cx.stop_propagation();
+        }
+    }
+
+    /// While a selection is dragged above or below the messages, scrolls them that way, faster
+    /// the farther the pointer is, and moves the selection's end along.
+    fn start_drag_scroll(&mut self, cx: &mut Context<Self>) {
+        if self.drag_scroll.is_some() || self.sel.dragging_at().is_none() {
+            return;
+        }
+        self.drag_scroll = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_millis(16)).await;
+                let going = this.update(cx, |this, cx| this.drag_scroll_step(cx)).unwrap_or(false);
+                if !going {
+                    break;
+                }
+            }
+        }));
+    }
+
+    fn drag_scroll_step(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(p) = self.sel.dragging_at() else {
+            self.drag_scroll = None;
+            return false;
+        };
+        let view = self.list.viewport_bounds();
+        let past = if p.y < view.top() {
+            p.y - view.top()
+        } else if p.y > view.bottom() {
+            p.y - view.bottom()
+        } else {
+            gpui::px(0.)
+        };
+        if past == gpui::px(0.) {
+            return true;
+        }
+        let step = (past.abs() / 2.).clamp(gpui::px(2.), gpui::px(30.));
+        // From where the list really is: `scroll_by` counts from the end while it follows the
+        // newest message, and the next layout undoes it. Reaching the end follows it again.
+        let top = -self.list.scroll_px_offset_for_scrollbar().y;
+        let max = self.list.max_offset_for_scrollbar().y;
+        let to = (top + if past < gpui::px(0.) { -step } else { step }).clamp(gpui::px(0.), max);
+        if to == top {
+            return true;
+        }
+        self.list.set_offset_from_scrollbar(gpui::point(gpui::px(0.), -to));
+        if past < gpui::px(0.) && self.list.logical_scroll_top().item_ix < 3 && self.results.is_none() {
+            let room = self.room;
+            self.session.update(cx, |s, cx| s.load_older(room, cx));
+        }
+        self.sel.follow_pointer();
+        cx.notify();
+        true
+    }
+
+    fn copy_selection(&mut self, cx: &mut Context<Self>) {
+        if let Some(text) = self.sel.text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
     fn on_paste(&mut self, _: &crate::text_field::Paste, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.mode, Some(Mode::Edit(_))) || !self.composer.focus_handle(cx).is_focused(window) {
             return;
@@ -792,6 +872,20 @@ impl ChatView {
     /// picture or file too.
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let k = &ev.keystroke;
+        if !self.sel.is_empty() {
+            let copy = (k.modifiers.secondary() && k.key == "c") || (k.modifiers.control && k.key == "insert");
+            if copy {
+                self.copy_selection(cx);
+                cx.stop_propagation();
+                return;
+            }
+            if k.key == "escape" && !k.modifiers.modified() {
+                self.sel.clear();
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+        }
         if k.modifiers.secondary()
             && k.key == "v"
             && !matches!(self.mode, Some(Mode::Edit(_)))
@@ -914,6 +1008,7 @@ impl ChatView {
             // A search still on its way would bring results back into an empty box.
             self.searching = Task::ready(());
             self.results = None;
+            self.sel.clear();
             self.sync(cx);
             return;
         }
@@ -927,6 +1022,7 @@ impl ChatView {
                 if let Ok(mut r) = got {
                     r.results.reverse();
                     this.results = Some((q, r.results));
+                    this.sel.clear();
                     this.sync(cx);
                 }
             });
@@ -937,6 +1033,7 @@ impl ChatView {
         self.search.update(cx, |f, cx| f.clear(cx));
         self.searching = Task::ready(());
         self.results = None;
+        self.sel.clear();
         self.sync(cx);
     }
 
@@ -1071,6 +1168,12 @@ impl ChatView {
                 false,
                 act(&this, move |v, w, cx| v.pick_reaction(m.clone(), at, w, cx)),
             ));
+        }
+        if let Some(text) = self.sel.text() {
+            items.push(MenuEntry::item("copy", tr!("Copy selection", "Copiar seleção"), false, move |_, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                overlay::toast(tr!("Copied.", "Copiado."), cx);
+            }));
         }
         if !m.body.trim().is_empty() {
             let body = m.body.clone();
@@ -1464,9 +1567,11 @@ impl ChatView {
         } else {
             let parsed = self.parsed(&m, cx);
             let id = m.id;
+            // Search results come in their own order: their place among them, not their id.
+            let select = Select { sel: &self.sel, order: if self.results.is_some() { ix as i64 } else { m.id } };
             Some(self.session.update(cx, |s, cx| {
                 let mut look = Lookup { session: s, me: me.id };
-                rich::body(format!("body-{id}"), &parsed, 14., &t, &mut look, cx)
+                rich::body(format!("body-{id}"), &parsed, 14., &t, &mut look, Some(select), cx)
             }))
         };
         let attachment = self
@@ -2413,6 +2518,8 @@ impl ChatView {
 
 impl Render for ChatView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sel.begin_frame();
+        self.start_drag_scroll(cx);
         let t = current();
         let log = self.session.read(cx).chats.get(&self.room);
         let (loaded, error) = (log.is_some_and(|l| l.loaded), log.and_then(|l| l.error.clone()));
@@ -2498,6 +2605,7 @@ impl Render for ChatView {
             .capture_action(cx.listener(Self::on_up))
             .capture_action(cx.listener(Self::on_down))
             .capture_action(cx.listener(Self::on_paste))
+            .capture_action(cx.listener(Self::on_copy))
             .group("chat-drop")
             .relative()
             .flex()

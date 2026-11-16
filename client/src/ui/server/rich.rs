@@ -2,6 +2,7 @@
 //! clickable links, mentions shown by display name, and emoji from shortcodes, custom ones as
 //! pictures. A link shows where it goes on hover, and asks first when its text names elsewhere.
 
+use super::select::{Selectable, Selection};
 use crate::core::types::UserId;
 use crate::emoji;
 use crate::markdown::{self, Block, Kind, Line, Span};
@@ -25,6 +26,13 @@ enum Piece {
     Emoji(Option<std::sync::Arc<gpui::RenderImage>>, String),
 }
 
+/// Where a body's text goes in the pane's selection: the selection, and the message's place in it.
+#[derive(Clone, Copy)]
+pub struct Select<'a> {
+    pub sel: &'a Selection,
+    pub order: i64,
+}
+
 /// A body parsed once, to draw as often as needed.
 pub struct Parsed {
     blocks: Vec<Block>,
@@ -44,10 +52,12 @@ pub fn body(
     size: f32,
     t: &Theme,
     look: &mut Lookup,
+    select: Option<Select>,
     cx: &mut Context<Session>,
 ) -> AnyElement {
     let id: SharedString = id.into();
     let size = if parsed.big { size * 2.2 } else { size };
+    let at = |block: usize, line: usize| select.map(|s| (s.sel.clone(), (s.order, block as u32, line as u32, 0)));
     let mut out = div().flex().flex_col().gap(px(4.)).text_size(px(size)).line_height(px(size * 1.45));
     for (bi, block) in parsed.blocks.iter().enumerate() {
         let bid = SharedString::from(format!("{id}.{bi}"));
@@ -55,7 +65,7 @@ pub fn body(
             Block::Paragraph(lines) => {
                 let mut d = div().flex().flex_col();
                 for (li, line) in lines.iter().enumerate() {
-                    d = d.child(line_el(format!("{bid}.{li}"), line, size, t, look, cx));
+                    d = d.child(line_el(format!("{bid}.{li}"), line, size, t, look, at(bi, li), cx));
                 }
                 d.into_any_element()
             }
@@ -69,13 +79,13 @@ pub fn body(
                     .text_size(px(s))
                     .line_height(px(s * 1.35))
                     .font_weight(FontWeight::BOLD)
-                    .child(line_el(format!("{bid}.0"), line, s, t, look, cx))
+                    .child(line_el(format!("{bid}.0"), line, s, t, look, at(bi, 0), cx))
                     .into_any_element()
             }
             Block::Quote(lines) => {
                 let mut d = div().flex().flex_col().pl(px(12.)).border_l_2().border_color(t.stroke_strong).text_color(t.text2);
                 for (li, line) in lines.iter().enumerate() {
-                    d = d.child(line_el(format!("{bid}.{li}"), line, size, t, look, cx));
+                    d = d.child(line_el(format!("{bid}.{li}"), line, size, t, look, at(bi, li), cx));
                 }
                 d.into_any_element()
             }
@@ -83,18 +93,19 @@ pub fn body(
                 let mut d = div().flex().flex_col().gap(px(2.));
                 for (li, item) in items.iter().enumerate() {
                     let mark = if *ordered { format!("{}.", li + 1) } else { "•".into() };
+                    let text = line_el(format!("{bid}.{li}"), item, size, t, look, at(bi, li), cx);
                     d = d.child(
                         div()
                             .flex()
                             .gap(px(8.))
                             .child(div().flex_none().min_w(px(16.)).text_color(t.text3).child(mark))
-                            .child(div().flex_1().min_w(px(0.)).child(line_el(format!("{bid}.{li}"), item, size, t, look, cx))),
+                            .child(div().flex_1().min_w(px(0.)).child(text)),
                     );
                 }
                 d.into_any_element()
             }
             Block::Code { text, .. } => div()
-                .id(bid)
+                .id(bid.clone())
                 .w_full()
                 .px(px(12.))
                 .py(px(10.))
@@ -106,14 +117,25 @@ pub fn body(
                 .text_size(px(size * 0.9))
                 .line_height(px(size * 1.4))
                 .overflow_x_scroll()
-                .child(text.clone())
+                .child(match at(bi, 0) {
+                    Some(at) => text_el(format!("{bid}.t"), text.clone(), Vec::new(), Vec::new(), Vec::new(), t, Some(at)),
+                    None => text.clone().into_any_element(),
+                })
                 .into_any_element(),
         });
     }
     out.into_any_element()
 }
 
-fn line_el(id: impl Into<SharedString>, line: &Line, size: f32, t: &Theme, look: &mut Lookup, cx: &mut Context<Session>) -> AnyElement {
+fn line_el(
+    id: impl Into<SharedString>,
+    line: &Line,
+    size: f32,
+    t: &Theme,
+    look: &mut Lookup,
+    at: Option<(Selection, super::select::Key)>,
+    cx: &mut Context<Session>,
+) -> AnyElement {
     let id: SharedString = id.into();
     let pieces = pieces(line, t, look, cx);
     if pieces.is_empty() {
@@ -122,23 +144,8 @@ fn line_el(id: impl Into<SharedString>, line: &Line, size: f32, t: &Theme, look:
     let only_text = matches!(pieces.as_slice(), [Piece::Text { .. }]);
     let mut els = pieces.into_iter().enumerate().map(|(i, p)| match p {
         Piece::Text { text, highlights, mono, links } => {
-            let targets: Vec<(String, String)> = links.iter().map(|(r, url)| (text[r.clone()].to_string(), url.clone())).collect();
-            let ranges: Vec<Range<usize>> = links.iter().map(|l| l.0.clone()).collect();
-            let theme = *t;
-            let styled = StyledText::new(SharedString::from(text))
-                .with_highlights(highlights)
-                .with_font_family_overrides(mono.into_iter().map(|r| (r, SharedString::from(MONO))));
-            InteractiveText::new(ElementId::Name(format!("{id}.{i}").into()), styled)
-                .on_click(ranges, move |ix, window, cx| {
-                    if let Some((label, url)) = targets.get(ix) {
-                        open_link(label, url, window, cx);
-                    }
-                })
-                .tooltip(move |ix, window, cx| {
-                    let (_, url) = links.iter().find(|(r, _)| r.contains(&ix))?;
-                    Some(crate::widgets::tip(url.clone(), &theme)(window, cx))
-                })
-                .into_any_element()
+            let at = at.clone().map(|(sel, (m, b, l, _))| (sel, (m, b, l, i as u32)));
+            text_el(format!("{id}.{i}"), text, highlights, mono, links, t, at)
         }
         Piece::Emoji(Some(image), _) => img(image).h(px(size * 1.3)).max_w(px(size * 4.)).into_any_element(),
         Piece::Emoji(None, raw) => div().child(raw).into_any_element(),
@@ -150,6 +157,41 @@ fn line_el(id: impl Into<SharedString>, line: &Line, size: f32, t: &Theme, look:
         return div().w_full().child(el).into_any_element();
     }
     div().flex().flex_wrap().items_center().children(els.map(|el| div().min_w(px(0.)).child(el))).into_any_element()
+}
+
+/// A run of text with its links, selectable when the pane has a selection to put it in.
+fn text_el(
+    id: String,
+    text: impl Into<SharedString>,
+    highlights: Vec<(Range<usize>, HighlightStyle)>,
+    mono: Vec<Range<usize>>,
+    links: Vec<(Range<usize>, String)>,
+    t: &Theme,
+    at: Option<(Selection, super::select::Key)>,
+) -> AnyElement {
+    let text: SharedString = text.into();
+    let targets: Vec<(String, String)> = links.iter().map(|(r, url)| (text[r.clone()].to_string(), url.clone())).collect();
+    let ranges: Vec<Range<usize>> = links.iter().map(|l| l.0.clone()).collect();
+    let theme = *t;
+    let styled = StyledText::new(text.clone())
+        .with_highlights(highlights)
+        .with_font_family_overrides(mono.into_iter().map(|r| (r, SharedString::from(MONO))));
+    let layout = styled.layout().clone();
+    let id = ElementId::Name(id.into());
+    let interactive = InteractiveText::new(id.clone(), styled)
+        .on_click(ranges, move |ix, window, cx| {
+            if let Some((label, url)) = targets.get(ix) {
+                open_link(label, url, window, cx);
+            }
+        })
+        .tooltip(move |ix, window, cx| {
+            let (_, url) = links.iter().find(|(r, _)| r.contains(&ix))?;
+            Some(crate::widgets::tip(url.clone(), &theme)(window, cx))
+        });
+    match at {
+        Some((sel, key)) => Selectable::new(id, interactive, layout, text, key, sel, t.accent.opacity(0.3)).into_any_element(),
+        None => interactive.into_any_element(),
+    }
 }
 
 /// Opens a link, after asking when its text names somewhere other than where it goes.

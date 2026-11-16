@@ -12,6 +12,7 @@ mod picker;
 pub mod private;
 mod profile_card;
 pub mod rich;
+mod select;
 mod share;
 pub mod sidebar;
 mod stage;
