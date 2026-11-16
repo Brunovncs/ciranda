@@ -824,7 +824,7 @@ impl Render for TextField {
                                 .cursor(CursorStyle::PointingHand)
                                 .opacity(0.7)
                                 .hover(|s| s.opacity(1.))
-                                .tooltip(crate::widgets::tip(hint, &t))
+                                .tooltip(crate::widgets::live_tip(format!("reveal-{}", cx.entity_id()), hint, &t))
                                 .on_mouse_down(MouseButton::Left, cx.listener(Self::toggle_reveal))
                                 .child(crate::widgets::icon(glyph, 16., t.text2)),
                         )

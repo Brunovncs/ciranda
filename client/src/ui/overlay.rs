@@ -26,14 +26,19 @@ pub struct Dismiss;
 enum Layer {
     /// `dismiss` tells the dialog it was closed from outside (Escape, a click on the scrim), as
     /// if it had closed itself, so what it stands for ends too: a call stops ringing.
-    Dialog {
-        view: AnyView,
-        dismiss: Rc<dyn Fn(&mut App)>,
-    },
+    /// `focus` is held by the dialog's frame: Tab goes round the controls inside it, never to the
+    /// window behind the scrim.
+    Dialog { view: AnyView, dismiss: Rc<dyn Fn(&mut App)>, focus: FocusHandle },
     Menu {
         at: Point<Pixels>,
         anchor: gpui::Anchor,
         view: AnyView,
+        /// Held by the menu's frame, not a stop itself: the arrows walk the items inside it.
+        focus: FocusHandle,
+        /// Where focus was when it opened, to go back to when it closes; taken once it has.
+        restore: Option<FocusHandle>,
+        /// Focus has not been moved in yet.
+        fresh: bool,
     },
 }
 
@@ -48,6 +53,8 @@ impl Layer {
 #[derive(Default)]
 pub struct Overlay {
     layers: Vec<Layer>,
+    /// A menu that closed, with where focus goes back to if it was still inside it.
+    closed_menu: Option<(FocusHandle, FocusHandle)>,
 }
 
 impl Overlay {
@@ -60,13 +67,126 @@ impl Overlay {
                 cx.defer(move |cx| dismiss(cx));
                 true
             }
-            Some(Layer::Menu { .. }) => true,
+            Some(menu @ Layer::Menu { .. }) => {
+                self.forget_menu(menu);
+                true
+            }
         }
     }
 
     pub fn has_menu(&self) -> bool {
         self.layers.iter().any(|l| matches!(l, Layer::Menu { .. }))
     }
+
+    /// The frame of the top dialog or menu, which Tab stays inside while it is open.
+    pub fn trap(&self) -> Option<FocusHandle> {
+        self.layers.last().map(|l| match l {
+            Layer::Dialog { focus, .. } | Layer::Menu { focus, .. } => focus.clone(),
+        })
+    }
+
+    /// Takes the menus away, keeping where focus goes back to.
+    fn close_menus(&mut self) {
+        let (menus, rest): (Vec<Layer>, Vec<Layer>) =
+            std::mem::take(&mut self.layers).into_iter().partition(|l| matches!(l, Layer::Menu { .. }));
+        self.layers = rest;
+        menus.into_iter().for_each(|m| self.forget_menu(m));
+    }
+
+    fn remove(&mut self, id: gpui::EntityId) {
+        let (gone, rest): (Vec<Layer>, Vec<Layer>) = std::mem::take(&mut self.layers).into_iter().partition(|l| l.view().entity_id() == id);
+        self.layers = rest;
+        gone.into_iter().for_each(|m| self.forget_menu(m));
+    }
+
+    fn forget_menu(&mut self, layer: Layer) {
+        if let Layer::Menu { focus, restore: Some(back), .. } = layer {
+            self.closed_menu = Some((focus, back));
+        }
+    }
+
+    /// After a menu closed: focus goes back where it was, unless what the menu did moved it
+    /// elsewhere (a dialog it opened, a field it focused).
+    pub fn restore_focus(&mut self, window: &mut Window, cx: &mut App) {
+        let Some((menu, back)) = self.closed_menu.take() else { return };
+        if window.focused(cx).is_none() || menu.contains_focused(window, cx) {
+            back.focus(window, cx);
+        }
+    }
+
+    /// The open menu takes focus the first time it is drawn, unless something inside it (a
+    /// search field) already has.
+    pub fn focus_new_menu(&mut self, window: &mut Window, cx: &mut App) {
+        for layer in &mut self.layers {
+            if let Layer::Menu { focus, restore, fresh, .. } = layer
+                && *fresh
+            {
+                *fresh = false;
+                if restore.is_none() {
+                    *restore = window.focused(cx);
+                }
+                let focus = focus.clone();
+                window.defer(cx, move |window, cx| {
+                    if !focus.contains_focused(window, cx) {
+                        focus.focus(window, cx);
+                    }
+                });
+            }
+        }
+    }
+}
+
+/// Where focus goes inside a dialog or a menu.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    Next,
+    Prev,
+    First,
+    Last,
+}
+
+/// Up and Down walk a menu's items, wrapping around; Home and End go to the first and the last.
+fn walk_menu(menu: &FocusHandle, key: &str, window: &mut Window, cx: &mut App) -> bool {
+    let step = match key {
+        "down" => Step::Next,
+        "up" => Step::Prev,
+        "home" => Step::First,
+        "end" => Step::Last,
+        _ => return false,
+    };
+    walk_within(menu, step, window, cx);
+    true
+}
+
+/// Moves focus among the stops inside `frame`, wrapping around at either end. They are found by
+/// walking forward from the frame through the window's stops, where a layer's own come together.
+pub fn walk_within(frame: &FocusHandle, step: Step, window: &mut Window, cx: &mut App) {
+    let was = window.focused(cx);
+    frame.focus(window, cx);
+    let mut items: Vec<FocusHandle> = Vec::new();
+    for _ in 0..256 {
+        window.focus_next(cx);
+        match window.focused(cx) {
+            Some(h) if frame.contains(&h, window) && h != *frame && !items.contains(&h) => items.push(h),
+            _ => break,
+        }
+    }
+    let n = items.len();
+    if n == 0 {
+        match was {
+            Some(h) => h.focus(window, cx),
+            None => frame.focus(window, cx),
+        }
+        return;
+    }
+    let at = was.and_then(|w| items.iter().position(|h| *h == w));
+    let to = match (step, at) {
+        (Step::Next, Some(i)) => (i + 1) % n,
+        (Step::Prev, Some(i)) => (i + n - 1) % n,
+        (Step::Prev | Step::Last, _) => n - 1,
+        _ => 0,
+    };
+    items[to].focus(window, cx);
 }
 
 pub struct RootHandle(pub WeakEntity<Root>);
@@ -95,7 +215,7 @@ pub fn open_dialog<V: Render + EventEmitter<Dismiss> + Focusable>(view: Entity<V
     });
     with_root(cx, move |root, cx| {
         close_on_dismiss(&view, cx);
-        root.overlay.layers.push(Layer::Dialog { view: any, dismiss });
+        root.overlay.layers.push(Layer::Dialog { view: any, dismiss, focus: cx.focus_handle() });
         cx.notify();
     });
 }
@@ -103,8 +223,7 @@ pub fn open_dialog<V: Render + EventEmitter<Dismiss> + Focusable>(view: Entity<V
 /// Takes `view`'s layer away once it says `Dismiss`.
 fn close_on_dismiss<V: EventEmitter<Dismiss>>(view: &Entity<V>, cx: &mut Context<Root>) {
     cx.subscribe(view, |root: &mut Root, v, _: &Dismiss, cx| {
-        let id = v.entity_id();
-        root.overlay.layers.retain(|l| l.view().entity_id() != id);
+        root.overlay.remove(v.entity_id());
         cx.notify();
     })
     .detach();
@@ -125,8 +244,10 @@ fn show_menu<V: Render + EventEmitter<Dismiss>>(view: Entity<V>, at: Point<Pixel
     let any: AnyView = view.clone().into();
     with_root(cx, move |root, cx| {
         close_on_dismiss(&view, cx);
-        root.overlay.layers.retain(|l| !matches!(l, Layer::Menu { .. }));
-        root.overlay.layers.push(Layer::Menu { at, anchor, view: any });
+        root.overlay.close_menus();
+        // Its predecessor's focus to go back to, not the predecessor.
+        let restore = root.overlay.closed_menu.take().map(|(_, back)| back);
+        root.overlay.layers.push(Layer::Menu { at, anchor, view: any, focus: cx.focus_handle(), restore, fresh: true });
         cx.notify();
     });
 }
@@ -137,7 +258,7 @@ impl Root {
         let top = self.overlay.layers.len();
         for (i, layer) in self.overlay.layers.iter().enumerate() {
             match layer {
-                Layer::Dialog { view, .. } => out.push(
+                Layer::Dialog { view, focus, .. } => out.push(
                     div()
                         .id(("scrim", view.entity_id()))
                         .absolute()
@@ -160,6 +281,7 @@ impl Root {
                         .child(
                             div()
                                 .id(("dialog", view.entity_id()))
+                                .track_focus(focus)
                                 .max_h_full()
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .child(view.clone())
@@ -177,7 +299,7 @@ impl Root {
                         )
                         .into_any_element(),
                 ),
-                Layer::Menu { at, anchor, view } => out.push(
+                Layer::Menu { at, anchor, view, focus, .. } => out.push(
                     deferred(
                         div()
                             .id(("menu-catcher", i))
@@ -187,26 +309,43 @@ impl Root {
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|root, _, _, cx| {
-                                    root.overlay.layers.retain(|l| !matches!(l, Layer::Menu { .. }));
+                                    root.overlay.close_menus();
                                     cx.notify();
                                 }),
                             )
                             .on_mouse_down(
                                 MouseButton::Right,
                                 cx.listener(|root, _, _, cx| {
-                                    root.overlay.layers.retain(|l| !matches!(l, Layer::Menu { .. }));
+                                    root.overlay.close_menus();
                                     cx.notify();
                                 }),
                             )
                             .child(
                                 anchored().anchor(*anchor).position(*at).snap_to_window_with_margin(px(8.)).child(
                                     div()
+                                        .track_focus(focus)
+                                        .on_key_down({
+                                            let focus = focus.clone();
+                                            move |e: &gpui::KeyDownEvent, window, cx| {
+                                                let k = &e.keystroke;
+                                                if !k.modifiers.modified() && walk_menu(&focus, &k.key, window, cx) {
+                                                    cx.stop_propagation();
+                                                }
+                                            }
+                                        })
                                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                         .child(view.clone())
+                                        // It drops into place from the side it opens on, as it fades in.
                                         .with_animation(
                                             ("menu-in", view.entity_id()),
-                                            Animation::new(Duration::from_millis(100)).with_easing(gpui::ease_out_quint()),
-                                            |d, p| d.opacity(p),
+                                            Animation::new(Duration::from_millis(130)).with_easing(gpui::ease_out_quint()),
+                                            {
+                                                let up = matches!(anchor, gpui::Anchor::BottomLeft);
+                                                move |d, p| {
+                                                    let shift = 6. * (1. - p);
+                                                    d.opacity(p).relative().top(px(if up { shift } else { -shift }))
+                                                }
+                                            },
                                         ),
                                 ),
                             ),

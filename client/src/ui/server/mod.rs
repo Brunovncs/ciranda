@@ -1433,7 +1433,8 @@ impl ServerView {
                     t,
                 )
                 .when(!in_call, inert)
-                .tooltip(tip(
+                .tooltip(live_tip(
+                    "mute",
                     if muted {
                         tr!("Unmute (Ctrl+Shift+M)", "Reativar o microfone (Ctrl+Shift+M)")
                     } else {
@@ -1452,7 +1453,8 @@ impl ServerView {
                     t,
                 )
                 .when(!in_call, inert)
-                .tooltip(tip(
+                .tooltip(live_tip(
+                    "deafen",
                     if deafened {
                         tr!("Undeafen (Ctrl+Shift+D)", "Reativar o som (Ctrl+Shift+D)")
                     } else {

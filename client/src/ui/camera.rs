@@ -60,6 +60,25 @@ impl Preview {
         }
     }
 
+    /// The camera's width over its height, once a frame has come; 16:9 until then.
+    pub fn aspect(&self, cx: &App) -> f32 {
+        self.tile
+            .as_ref()
+            .and_then(|t| t.read(cx).frame.as_ref().map(|f| (f.width() as f32, f.height() as f32)))
+            .filter(|(w, h)| *w > 0. && *h > 0.)
+            .map(|(w, h)| w / h)
+            .unwrap_or(16. / 9.)
+    }
+
+    /// The picture as large as fits in `max_w` by `max_h` with the camera's own shape, so it is
+    /// shown whole, edge to edge: no bars beside it, nothing cut off. Centred in a row as wide as
+    /// `max_w`.
+    pub fn fitted(&self, max_w: f32, max_h: f32, t: &Theme, cx: &App) -> Div {
+        let aspect = self.aspect(cx);
+        let (w, h) = if max_w / aspect <= max_h { (max_w, max_w / aspect) } else { (max_h * aspect, max_h) };
+        div().w_full().flex().justify_center().child(self.frame(t, cx).w(px(w.floor())).max_w_full().h(px(h.floor())))
+    }
+
     /// The picture, or why there is none, filling a rounded frame the caller sizes.
     pub fn frame(&self, t: &Theme, cx: &App) -> Div {
         let frame = self.tile.as_ref().and_then(|t| t.read(cx).picture(px(radius::CARD + 1.)));
@@ -307,8 +326,12 @@ impl CameraDialog {
 }
 
 impl Render for CameraDialog {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = current();
+        // The rest of the dialog takes about 350 px (two rows of backgrounds); the picture gets
+        // what the window leaves, so the dialog never runs past it.
+        let room = f32::from(window.viewport_size().height) / crate::theme::scale() - 48.;
+        let preview_h = (room - 350.).clamp(180., 380.);
         let cameras = self.cameras.clone().unwrap_or_default();
         let none = self.cameras.as_ref().is_some_and(|c| c.is_empty());
         let picked_name = cameras
@@ -320,7 +343,7 @@ impl Render for CameraDialog {
         let options: Vec<(String, String)> = cameras.iter().map(|d| (d.id.clone(), d.name.clone())).collect();
         let field =
             |name: &'static str, control: gpui::AnyElement| div().flex().flex_col().gap(px(6.)).child(label(name, &t)).child(control);
-        let width = 560.;
+        let width = 600.;
         dialog_card(&t, width)
             .track_focus(&self.focus)
             .child(
@@ -335,7 +358,7 @@ impl Render for CameraDialog {
                             t.text2,
                         ),
                     ))
-                    .child(self.preview.frame(&t, cx).w_full().h(px((width - 44.) * 9. / 16.)))
+                    .child(self.preview.fitted(width - 44., preview_h, &t, cx))
                     .child(field(
                         tr!("Camera", "Câmera"),
                         crate::ui::settings::select("camera-pick", picked_name, options, &t, cx, |d: &mut Self, id, cx| {

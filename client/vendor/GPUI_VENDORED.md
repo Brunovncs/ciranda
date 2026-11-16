@@ -44,6 +44,9 @@ without rounded corners or video-range buffers.
   own.
 - `Cargo.toml`: `core-foundation` 0.10 on macOS (already in the tree through core-video), for
   `from_cv_pixel_buffer`.
+- `src/tab_stop.rs`: `TabStopMap::prev_inner` walks the stops in order for the one before,
+  instead of seeking the cursor and stepping it back, which landed on the wrong stop: walking up
+  a menu (`focus_prev` from its second item) left the menu instead of reaching the first.
 
 ## gpui-pre-windows
 

@@ -196,10 +196,14 @@ impl Root {
         // Tab for itself gets it first.
         let k = &ev.keystroke;
         if k.key == "tab" && !k.modifiers.control && !k.modifiers.alt && !k.modifiers.platform {
-            if k.modifiers.shift {
-                window.focus_prev(cx);
-            } else {
-                window.focus_next(cx);
+            // With a dialog or a menu open, round the controls in it alone.
+            match self.overlay.trap() {
+                Some(frame) => {
+                    let step = if k.modifiers.shift { overlay::Step::Prev } else { overlay::Step::Next };
+                    overlay::walk_within(&frame, step, window, cx);
+                }
+                None if k.modifiers.shift => window.focus_prev(cx),
+                None => window.focus_next(cx),
             }
             cx.stop_propagation();
         }
@@ -286,6 +290,8 @@ impl Render for Root {
         // So is a stream watched over the whole window.
         let theater = matches!(&self.screen, Screen::Server(v) if v.read(cx).theater.is_some());
         let rail = (!resuming && !theater && !prefs(cx).saved_servers.is_empty()).then(|| self.render_rail(&t, cx));
+        self.overlay.restore_focus(window, cx);
+        self.overlay.focus_new_menu(window, cx);
         div()
             .id("root")
             .key_context("Root")

@@ -146,8 +146,8 @@ impl ServerView {
         let img = self.session.update(cx, |s, cx| s.avatar(u.id, cx));
         let user = u.clone();
         let hover = t.layer_hover;
-        div()
-            .id(("member", u.id as u64))
+        // Tab reaches it, and Enter shows the card a click does.
+        keyboard_row(div().id(("member", u.id as u64)), t)
             .flex()
             .items_center()
             .gap(px(10.))

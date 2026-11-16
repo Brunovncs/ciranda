@@ -22,6 +22,7 @@ use crate::ui::overlay::{self, Dismiss, dialog_card};
 use crate::ui::server::ServerView;
 use crate::ui::server::sidebar::{Menu, MenuEntry};
 use crate::widgets::*;
+use gpui::AnimationExt;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, MouseButton,
@@ -29,6 +30,10 @@ use gpui::{
     div,
 };
 use std::time::Duration;
+
+/// The dialog's width, and what is left of it for a section beside the rail and its margins.
+const DIALOG_W: f32 = 880.;
+const SECTION_W: f32 = DIALOG_W - 210. - 48. - 2. - 8.;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Section {
@@ -519,9 +524,8 @@ impl Settings {
             .flex()
             .flex_col()
             .gap(px(18.))
-            .child(
-                self.preview.frame(t, cx).h(px(220.)),
-            )
+            // As wide as the section, in the camera's own shape: the whole picture, no bars.
+            .child(self.preview.fitted(SECTION_W, 380., t, cx))
             .child(row_field(tr!("Camera", "Câmera"), select("camera", cam_name, cams, t, cx, |s: &mut Settings, id, cx| s.set_camera(id, cx))))
             .child(div().flex().flex_col().gap(px(8.)).child(label(tr!("Background", "Fundo"), t)).child(grid))
             .when_some(blur, |d, strength| {
@@ -1388,8 +1392,8 @@ impl Render for Settings {
             Section::Advanced => tr!("Advanced", "Avançado"),
         };
         // A fixed height, so the rail stays put while sections of different lengths come and go.
-        let max_h = (window.viewport_size().height * 0.86).min(px(640.));
-        dialog_card(&t, 820.)
+        let max_h = (window.viewport_size().height * 0.88).min(px(700.));
+        dialog_card(&t, DIALOG_W)
             .track_focus(&self.focus)
             .h(max_h)
             .flex_row()
@@ -1453,7 +1457,12 @@ impl Render for Settings {
                             .px(px(24.))
                             .pt(px(10.))
                             .pb(px(24.))
-                            .child(body_el),
+                            // A section comes in with a short fade and rise instead of popping.
+                            .child(div().child(body_el).with_animation(
+                                gpui::ElementId::Name(heading.into()),
+                                gpui::Animation::new(Duration::from_millis(160)).with_easing(gpui::ease_out_quint()),
+                                |d, p| d.opacity(p).relative().top(px(6. * (1. - p))),
+                            )),
                     ),
             )
     }

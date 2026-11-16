@@ -60,17 +60,40 @@ pub fn pane(t: &Theme) -> Div {
 pub fn tip(text: impl Into<SharedString>, t: &Theme) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView + 'static {
     let text = text.into();
     let t = *t;
-    move |_, cx| cx.new(|_| Tip { text: text.clone(), theme: t }).into()
+    move |_, cx| cx.new(|_| Tip { text: text.clone(), live: None, theme: t }).into()
+}
+
+thread_local! {
+    /// The latest text of each live hint, by its key.
+    static LIVE_TIPS: std::cell::RefCell<std::collections::HashMap<SharedString, SharedString>> = Default::default();
+}
+
+/// A hint for a control that toggles, keyed by `key`, which says what the control does now.
+/// GPUI makes a hint from the drawing the pointer arrived on and keeps it while the pointer
+/// stays, so a plain one would go on offering to mute after the click that muted.
+pub fn live_tip(
+    key: impl Into<SharedString>,
+    text: impl Into<SharedString>,
+    t: &Theme,
+) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView + 'static {
+    let (key, text) = (key.into(), text.into());
+    LIVE_TIPS.with(|m| m.borrow_mut().insert(key.clone(), text.clone()));
+    let t = *t;
+    move |_, cx| cx.new(|_| Tip { text: text.clone(), live: Some(key.clone()), theme: t }).into()
 }
 
 struct Tip {
     text: SharedString,
+    live: Option<SharedString>,
     theme: Theme,
 }
 
 impl Render for Tip {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         let t = self.theme;
+        if let Some(now) = self.live.as_ref().and_then(|k| LIVE_TIPS.with(|m| m.borrow().get(k).cloned())) {
+            self.text = now;
+        }
         div()
             .font_family(FONT)
             .max_w(px(300.))
@@ -438,15 +461,30 @@ pub fn track(id: impl Into<ElementId>, s: Slider, t: &Theme, on_change: impl Fn(
     };
     let value = s.value.clamp(0., 1.);
     let (b1, b2) = (bounds.clone(), bounds);
-    let (c1, c2) = (on_change.clone(), on_change);
+    let (c1, c2, c3) = (on_change.clone(), on_change.clone(), on_change);
     let mine = id.clone();
-    div()
-        .id(id.clone())
+    let ring = t.accent_soft;
+    keyboardable(div().id(id.clone()), move |s| s.bg(ring))
         .relative()
         .h(px(20.))
+        .rounded(px(10.))
         .flex()
         .items_center()
         .cursor_pointer()
+        // Under the keyboard: the arrows move it a step (Shift, five), Home and End to the ends.
+        .on_key_down(move |e: &gpui::KeyDownEvent, _, cx| {
+            let k = &e.keystroke;
+            let step = if k.modifiers.shift { 0.1 } else { 0.02 };
+            let to = match k.key.as_str() {
+                "left" | "down" => value - step,
+                "right" | "up" => value + step,
+                "home" => 0.,
+                "end" => 1.,
+                _ => return,
+            };
+            c3(to.clamp(0., 1.), cx);
+            cx.stop_propagation();
+        })
         .child(canvas(move |b, _, _| b2.set(b), |_, _, _, _| {}).absolute().inset_0())
         .child(
             div()

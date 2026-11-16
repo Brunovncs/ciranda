@@ -169,17 +169,19 @@ impl TabStopMap {
         }
     }
 
+    // Ciranda: a plain walk for the stop before `node`. Seeking and stepping the cursor back
+    // landed on the wrong stop (Shift+Tab went forward), and a window holds few enough stops.
     fn prev_inner(&self, node: &TabStopNode) -> Option<&TabStopNode> {
-        let mut cursor = self.order.cursor::<TabStopNode>(());
-        cursor.seek(&node, Bias::Left);
-        cursor.prev();
-        while let Some(item) = cursor.item()
-            && !item.tab_stop
-        {
-            cursor.prev();
+        let mut found = None;
+        for item in self.order.iter() {
+            if item >= node {
+                break;
+            }
+            if item.tab_stop {
+                found = Some(item);
+            }
         }
-
-        cursor.item()
+        found
     }
 
     pub fn replay(&mut self, nodes: &[TabStopOperation]) {

@@ -138,7 +138,7 @@ impl ServerView {
         let body = if tiles.is_empty() {
             self.render_people(&roster, place, t, cx)
         } else {
-            self.render_tiles(&tiles, voice.as_ref(), t, window, cx)
+            self.render_tiles(&tiles, &roster, place, voice.as_ref(), t, window, cx)
         };
         // Measured as laid out; a change draws the tiles again at the new size.
         let (seen, view) = (self.stage_size.clone(), cx.entity_id());
@@ -191,6 +191,25 @@ impl ServerView {
         row.into_any_element()
     }
 
+    /// Whether someone can be heard, from what the server says of them; your own from the call,
+    /// which knows before the server does.
+    fn quiet_of(&self, m: &Member, cx: &App) -> Quiet {
+        let me = self.session.read(cx).me.id;
+        let (muted, deafened) = match self.call.as_ref().map(|c| c.read(cx)) {
+            Some(c) if m.user_id == me => (c.muted || m.muted, c.deafened || m.deafened),
+            _ => (m.muted, m.deafened),
+        };
+        if deafened {
+            Quiet::Deafened
+        } else if m.silenced() {
+            Quiet::Silenced
+        } else if muted {
+            Quiet::Muted
+        } else {
+            Quiet::Open
+        }
+    }
+
     fn render_people(&mut self, roster: &[Member], place: Place, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let me = self.session.read(cx).me.id;
         let mut grid = div().flex().flex_wrap().justify_center().content_center().gap(px(14.)).p(px(24.)).size_full();
@@ -199,46 +218,50 @@ impl ServerView {
             let name = self.session.read(cx).display_name(Some(m.user_id), Some(&m.nickname));
             let image = self.session.update(cx, |s, cx| s.avatar(m.user_id, cx));
             let (user, mid) = (m.user_id, m.mid);
-            let card = div()
-                .id(("person", m.mid as u64))
-                .relative()
-                .w(px(200.))
-                .h(px(150.))
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .gap(px(10.))
-                .rounded(px(radius::CARD + 2.))
-                .bg(t.layer)
-                .border_1()
-                .border_color(t.stroke)
-                .child(avatar(&name, image, 64., None))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(6.))
-                        .child(div().text_size(px(14.)).font_weight(gpui::FontWeight::MEDIUM).child(if m.user_id == me {
-                            trf!("{} (you)", "{} (você)", name)
-                        } else {
-                            name
-                        }))
-                        .when(m.muted || m.silenced(), |d| d.child(icon("mic-off", 14., if m.force_muted { t.critical } else { t.text3 })))
-                        .when(m.deafened, |d| d.child(icon("headphones-off", 14., t.text3)))
-                        .when(m.publishes("s"), |d| d.child(live_chip(t, false))),
+            let quiet = self.quiet_of(m, cx);
+            let card = keyboardable(div().id(("person", m.mid as u64)), {
+                let ring = t.accent_text;
+                move |s| s.border_color(ring)
+            })
+            .relative()
+            .w(px(200.))
+            .h(px(150.))
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(10.))
+            .rounded(px(radius::CARD + 2.))
+            .bg(t.layer)
+            .border_1()
+            .border_color(t.stroke)
+            .child(
+                div().relative().child(avatar(&name, image, 64., None)).children(
+                    quiet_badge(quiet, 24., ("person-quiet", m.mid as u64), t)
+                        .map(|b| div().absolute().right(px(-4.)).bottom(px(-4.)).child(b)),
+                ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(div().text_size(px(14.)).font_weight(gpui::FontWeight::MEDIUM).child(if m.user_id == me {
+                        trf!("{} (you)", "{} (você)", name)
+                    } else {
+                        name
+                    }))
+                    .when(m.publishes("s"), |d| d.child(live_chip(t, false))),
+            )
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| this.open_profile(this.session.clone(), user, e.position(), cx)))
+            .when(m.user_id != me, |d| {
+                d.on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, e: &MouseDownEvent, window, cx| this.peer_menu(place, user, mid, e.position, window, cx)),
                 )
-                .cursor_pointer()
-                .on_click(
-                    cx.listener(move |this, e: &gpui::ClickEvent, _, cx| this.open_profile(this.session.clone(), user, e.position(), cx)),
-                )
-                .when(m.user_id != me, |d| {
-                    d.on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, e: &MouseDownEvent, window, cx| this.peer_menu(place, user, mid, e.position, window, cx)),
-                    )
-                });
-            grid = grid.child(speaking(card, is_speaking, radius::CARD + 2., t));
+            });
+            grid = grid.child(arrives(speaking(card, is_speaking, radius::CARD + 2., t), ("person-in", m.mid as u64)));
         }
         if roster.len() <= 1 {
             let waiting = match place {
@@ -257,9 +280,12 @@ impl ServerView {
         grid.into_any_element()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_tiles(
         &mut self,
         tiles: &[Entity<Tile>],
+        roster: &[Member],
+        place: Place,
         voice: Option<&Entity<Voice>>,
         t: &Theme,
         window: &mut Window,
@@ -278,22 +304,27 @@ impl ServerView {
         };
         let (w, h) = (w.max(320.), h.max(200.));
         self.ink_layers.retain(|id, _| tiles.iter().any(|t| t.entity_id() == *id));
+        // Everyone is on the stage: whoever sends no camera as a card with their picture, so the
+        // tiles never hide who is in the call.
+        let mut cells: Vec<Cell> = tiles.iter().cloned().map(Cell::Tile).collect();
+        let filmed = |user: UserId| tiles.iter().any(|x| x.read(cx).user == user && x.read(cx).kind == TileKind::Camera);
+        cells.extend(roster.iter().filter(|m| !filmed(m.user_id)).cloned().map(Cell::Person));
         let focused = self.focused_tile.clone().filter(|f| tiles.contains(f));
         if let Some(f) = focused {
-            let others: Vec<Entity<Tile>> = tiles.iter().filter(|x| **x != f).cloned().collect();
+            let others: Vec<Cell> = cells.into_iter().filter(|c| !matches!(c, Cell::Tile(x) if *x == f)).collect();
             let strip_h = if others.is_empty() { 0. } else { 130. };
             // The strip and the gap above it.
-            let big = self.tile_el(&f, voice, w, h - if others.is_empty() { 0. } else { strip_h + 10. }, true, t, window, cx);
+            let big = self.tile_el(&f, roster, voice, w, h - if others.is_empty() { 0. } else { strip_h + 10. }, true, t, window, cx);
             // As many as there are: centred while they fit, scrolled sideways (the wheel too) once not.
             let mut row = div().flex().flex_none().gap(px(10.)).mx_auto();
             for o in &others {
-                row = row.child(div().flex_none().child(self.tile_el(o, voice, 200., 112., false, t, window, cx)));
+                row = row.child(div().flex_none().child(self.cell_el(o, roster, place, voice, 200., 112., t, window, cx)));
             }
             let strip = div().id("stage-strip").flex().w(px(w)).h(px(strip_h)).overflow_x_scroll().child(row);
             return div().flex().flex_col().gap(px(10.)).p(px(16.)).size_full().items_center().child(big).child(strip).into_any_element();
         }
         // The column count that makes 16:9 tiles largest.
-        let n = tiles.len();
+        let n = cells.len();
         let gap = 12.;
         let (mut best, mut cols) = (0., 1);
         for c in 1..=n {
@@ -309,10 +340,10 @@ impl ServerView {
         let th = tw * 9. / 16.;
         // Rows laid out by hand: wrapping would break a row wherever rounding says it no longer fits.
         let mut grid = div().flex().flex_col().justify_center().items_center().gap(px(gap)).p(px(16.)).size_full();
-        for row in tiles.chunks(cols) {
+        for row in cells.chunks(cols) {
             let mut line = div().flex().flex_none().gap(px(gap));
-            for tile in row {
-                line = line.child(self.tile_el(tile, voice, tw, th, false, t, window, cx));
+            for cell in row {
+                line = line.child(self.cell_el(cell, roster, place, voice, tw, th, t, window, cx));
             }
             grid = grid.child(line);
         }
@@ -320,9 +351,74 @@ impl ServerView {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn cell_el(
+        &mut self,
+        cell: &Cell,
+        roster: &[Member],
+        place: Place,
+        voice: Option<&Entity<Voice>>,
+        w: f32,
+        h: f32,
+        t: &Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match cell {
+            Cell::Tile(tile) => self.tile_el(tile, roster, voice, w, h, false, t, window, cx),
+            Cell::Person(m) => self.person_tile(m, place, w, h, t, cx),
+        }
+    }
+
+    /// Someone sending no camera, among the tiles: their picture on a wash of their colour,
+    /// named as the tiles are.
+    fn person_tile(&mut self, m: &Member, place: Place, w: f32, h: f32, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let me = self.session.read(cx).me.id;
+        let name = self.session.read(cx).display_name(Some(m.user_id), Some(&m.nickname));
+        let image = self.session.update(cx, |s, cx| s.avatar(m.user_id, cx));
+        let lit = self.is_speaking(place, m.user_id, cx);
+        let quiet = self.quiet_of(m, cx);
+        let (user, mid) = (m.user_id, m.mid);
+        let size = (h * 0.42).clamp(36., 112.);
+        let small = h < 140.;
+        let card = keyboardable(div().id(("person-tile", m.mid as u64)), {
+            let ring = t.accent_text;
+            move |s| s.border_color(ring)
+        })
+        .relative()
+        .w(px(w))
+        .h(px(h))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(radius::CARD + 2.))
+        .overflow_hidden()
+        .bg(t.layer)
+        .border_1()
+        .border_color(t.stroke)
+        .child(div().absolute().inset_0().bg(name_color(&name).opacity(0.14)))
+        .child(avatar(&name, image, size, None))
+        .child(name_tag(&name, user == me, None, small, t))
+        .children(
+            quiet_badge(quiet, if small { 22. } else { 28. }, ("tile-quiet", m.mid as u64), t)
+                .map(|b| div().absolute().top(px(8.)).left(px(8.)).child(b)),
+        )
+        .cursor_pointer()
+        .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| this.open_profile(this.session.clone(), user, e.position(), cx)))
+        .when(user != me, |d| {
+            d.on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, e: &MouseDownEvent, window, cx| this.peer_menu(place, user, mid, e.position, window, cx)),
+            )
+        });
+        arrives(speaking(card, lit, radius::CARD + 2., t), ("person-tile-in", m.mid as u64))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn tile_el(
         &mut self,
         tile: &Entity<Tile>,
+        roster: &[Member],
         voice: Option<&Entity<Voice>>,
         w: f32,
         h: f32,
@@ -333,6 +429,13 @@ impl ServerView {
     ) -> AnyElement {
         let tl = tile.read(cx);
         let (user, kind, local) = (tl.user, tl.kind, tl.local);
+        // A camera says whether its person can be heard; a screen's sound is its own.
+        let quiet = if kind == TileKind::Camera {
+            roster.iter().find(|m| m.user_id == user).map(|m| self.quiet_of(m, cx)).unwrap_or(Quiet::Open)
+        } else {
+            Quiet::Open
+        };
+        let tl = tile.read(cx);
         let gain = tl.gain();
         let has_sound = tl.sound.is_some();
         // Frames much bigger than drawn are scaled down before they are uploaded.
@@ -363,29 +466,10 @@ impl ServerView {
             // Its own view: a new frame redraws the picture alone.
             .child(tile.clone().cached(StyleRefinement::default().size_full()))
             .children(ink)
-            .child(
-                div()
-                    .absolute()
-                    .left(px(16.))
-                    .bottom(px(12.))
-                    .flex()
-                    .items_center()
-                    .gap(px(6.))
-                    .px(px(8.))
-                    .py(px(4.))
-                    .rounded(px(7.))
-                    .bg(gpui::black().opacity(0.55))
-                    .when(kind == TileKind::Screen, |d| d.child(live_chip(t, true)))
-                    .child(div().text_size(px(12.5)).text_color(gpui::white()).child(if local {
-                        trf!("{} (you)", "{} (você)", name)
-                    } else {
-                        name.to_string()
-                    }))
-                    .child(div().text_size(px(11.5)).text_color(gpui::white().opacity(0.7)).child(if kind == TileKind::Screen {
-                        tr!("screen", "tela")
-                    } else {
-                        tr!("camera", "câmera")
-                    })),
+            .child(name_tag(&name, local, Some(kind), h < 140., t))
+            .children(
+                quiet_badge(quiet, if h < 140. { 22. } else { 28. }, ("tile-quiet", id), t)
+                    .map(|b| div().absolute().top(px(8.)).left(px(8.)).child(b)),
             )
             .child(
                 div()
@@ -629,7 +713,8 @@ impl ServerView {
             .gap(px(4.))
             .child(
                 button("theater-mute", if muted { "mic-off" } else { "mic" }, muted, if muted { t.critical } else { white })
-                    .tooltip(tip(
+                    .tooltip(live_tip(
+                        "theater-mute",
                         if muted {
                             tr!("Unmute (Ctrl+Shift+M)", "Reativar o microfone (Ctrl+Shift+M)")
                         } else {
@@ -646,7 +731,8 @@ impl ServerView {
                     deafened,
                     if deafened { t.critical } else { white },
                 )
-                .tooltip(tip(
+                .tooltip(live_tip(
+                    "theater-deafen",
                     if deafened {
                         tr!("Undeafen (Ctrl+Shift+D)", "Reativar o som (Ctrl+Shift+D)")
                     } else {
@@ -858,6 +944,87 @@ impl ServerView {
     pub fn ensure_stage(&mut self, cx: &mut Context<Self>) {
         self.show_stage(cx);
     }
+}
+
+/// One place on the stage: a stream, or someone sending none.
+enum Cell {
+    Tile(Entity<Tile>),
+    Person(Member),
+}
+
+/// Whether someone can be heard.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Quiet {
+    Open,
+    /// Their own mute.
+    Muted,
+    /// An admin's mute, or the channel's microphone lock.
+    Silenced,
+    Deafened,
+}
+
+/// The round mark on someone's tile or picture while they can't be heard: it pops in when they
+/// mute, so it is noticed.
+fn quiet_badge(q: Quiet, size: f32, id: impl Into<gpui::ElementId>, t: &Theme) -> Option<AnyElement> {
+    let (glyph, hint) = match q {
+        Quiet::Open => return None,
+        Quiet::Muted => ("mic-off", tr!("Muted", "Mutado")),
+        Quiet::Silenced => ("mic-off", tr!("Muted by an admin or the channel", "Mutado por um admin ou pelo canal")),
+        Quiet::Deafened => ("headphones-off", tr!("Deafened: hears nothing", "Com o som desativado: não ouve nada")),
+    };
+    let bg = t.critical;
+    Some(
+        div()
+            .id(id.into())
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(size))
+            .rounded_full()
+            .bg(bg)
+            .border_2()
+            .border_color(gpui::black().opacity(0.25))
+            .shadow_md()
+            .child(icon(glyph, (size * 0.52).round(), gpui::white()))
+            .tooltip(tip(hint, t))
+            .with_animation("quiet-in", Animation::new(Duration::from_millis(220)).with_easing(gpui::ease_out_quint()), move |d, p| {
+                d.opacity(p.min(1.)).size(px(size * (0.6 + 0.4 * p)))
+            })
+            .into_any_element(),
+    )
+}
+
+/// The name in the bottom corner of a tile, on a dark plate so it reads over any picture.
+fn name_tag(name: &str, you: bool, kind: Option<TileKind>, small: bool, t: &Theme) -> gpui::Div {
+    let screen = kind == Some(TileKind::Screen);
+    div()
+        .absolute()
+        .left(px(if small { 8. } else { 12. }))
+        .bottom(px(if small { 8. } else { 10. }))
+        .max_w(gpui::relative(0.8))
+        .flex()
+        .items_center()
+        .gap(px(6.))
+        .px(px(8.))
+        .py(px(4.))
+        .rounded(px(7.))
+        .bg(gpui::black().opacity(0.55))
+        .when(screen, |d| d.child(live_chip(t, true)))
+        .child(div().truncate().text_size(px(if small { 11.5 } else { 12.5 })).text_color(gpui::white()).child(if you {
+            trf!("{} (you)", "{} (você)", name)
+        } else {
+            name.to_string()
+        }))
+        .when(screen, |d| {
+            d.child(div().flex_none().text_size(px(11.5)).text_color(gpui::white().opacity(0.7)).child(tr!("screen", "tela")))
+        })
+}
+
+/// Someone joining settles onto the stage, fading in as it grows the last bit.
+fn arrives(el: impl IntoElement + Styled + 'static, id: impl Into<gpui::ElementId>) -> AnyElement {
+    el.with_animation(id, Animation::new(Duration::from_millis(260)).with_easing(gpui::ease_out_quint()), |d, p| d.opacity(p))
+        .into_any_element()
 }
 
 impl Render for Tile {

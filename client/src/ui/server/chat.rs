@@ -1611,7 +1611,7 @@ impl ChatView {
             .children(attachment)
             .children(reactions);
 
-        let (m_reply, m_menu) = (m.clone(), m.clone());
+        let (m_reply, m_menu, m_keys) = (m.clone(), m.clone(), m.clone());
         let row = div()
             .flex()
             .gap(px(12.))
@@ -1636,8 +1636,8 @@ impl ChatView {
                 ))
             })
             .child(content);
-        div()
-            .id(("message", m.id as u64))
+        // Reached with Tab too, where Enter opens what its right click does.
+        keyboard_row(div().id(("message", m.id as u64)), &t)
             .group(group_name)
             .relative()
             .w_full()
@@ -1654,7 +1654,9 @@ impl ChatView {
             .child(row)
             .child(tools)
             .on_click(cx.listener(move |this, e: &ClickEvent, window, cx| {
-                if e.click_count() == 2 {
+                if e.is_keyboard() {
+                    this.message_menu(m_keys.clone(), e.position(), cx);
+                } else if e.click_count() == 2 {
                     this.start_reply(&m_reply, window, cx);
                 }
             }))

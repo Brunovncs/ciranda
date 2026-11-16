@@ -233,12 +233,19 @@ impl Drop for Capture {
     }
 }
 
-/// The camera's mode to use: its full frame rate (up to `FPS`) first, then the smallest picture
-/// that still covers the frame sent (or else the largest), then the format cheapest to turn into
-/// it. NV12 and YUY2 crop and convert in one libyuv pass; MJPEG needs a JPEG decode first, so it
-/// wins only when it is the one way to get the size or the rate.
+/// The camera's mode to use: its full frame rate (up to `FPS`) first, then one in the frame's own
+/// shape (up to 720p), since a 4:3 picture loses a quarter of its height, forehead and chin, to the
+/// 16:9 crop; then the smallest picture that still covers the frame sent (or else the largest),
+/// then the format cheapest to turn into it. NV12 and YUY2 crop and convert in one libyuv pass;
+/// MJPEG needs a JPEG decode first, so it wins only when it is the one way to get the shape, the
+/// size or the rate.
 fn best_format(formats: &[CameraFormat]) -> Option<CameraFormat> {
     let covers = |f: &CameraFormat| f.width() >= WIDTH && f.height() >= HEIGHT;
+    // Within 2% of 16:9, and no bigger than 720p, past which the decode costs more than it gives.
+    let wide = |f: &CameraFormat| {
+        let (a, b) = (f.width() * HEIGHT, f.height() * WIDTH);
+        covers(f) && a.abs_diff(b) * 50 <= b && f.width() * f.height() <= 1280 * 720
+    };
     let format = |f: &CameraFormat| match f.format() {
         FrameFormat::NV12 => 0,
         FrameFormat::YUYV => 1,
@@ -249,7 +256,7 @@ fn best_format(formats: &[CameraFormat]) -> Option<CameraFormat> {
         .iter()
         .min_by_key(|f| {
             let area = f.width() * f.height();
-            (Reverse(f.frame_rate().min(FPS)), !covers(f), if covers(f) { area } else { u32::MAX - area }, format(f))
+            (Reverse(f.frame_rate().min(FPS)), !covers(f), !wide(f), if covers(f) { area } else { u32::MAX - area }, format(f))
         })
         .copied()
 }
@@ -863,7 +870,8 @@ mod tests {
 
     #[test]
     fn the_smallest_full_rate_mode_that_covers_the_frame_wins() {
-        // What a cheap USB camera lists: nothing at 640 × 360, 25 and 30 fps everywhere.
+        // What a cheap USB camera lists: nothing at 640 × 360, 25 and 30 fps everywhere. 720p is
+        // the frame's shape, so the whole picture is sent rather than 480p's middle.
         let mut modes = Vec::new();
         for format in [FrameFormat::MJPEG, FrameFormat::NV12] {
             for (w, h) in [(640, 320), (640, 480), (1280, 720), (1920, 1080)] {
@@ -872,6 +880,12 @@ mod tests {
                 }
             }
         }
+        assert_eq!(best_format(&modes), Some(mode(FrameFormat::NV12, 1280, 720, 30)));
+        // The shape is worth a JPEG decode...
+        let modes = [mode(FrameFormat::NV12, 640, 480, 30), mode(FrameFormat::MJPEG, 1280, 720, 30)];
+        assert_eq!(best_format(&modes), Some(mode(FrameFormat::MJPEG, 1280, 720, 30)));
+        // ...but not a 1080p one: then 480p's middle it is.
+        let modes = [mode(FrameFormat::NV12, 640, 480, 30), mode(FrameFormat::MJPEG, 1920, 1080, 30)];
         assert_eq!(best_format(&modes), Some(mode(FrameFormat::NV12, 640, 480, 30)));
         // The frame rate counts before the size: 720p at 30 beats 480p at 15.
         let modes = [mode(FrameFormat::YUYV, 640, 480, 15), mode(FrameFormat::MJPEG, 1280, 720, 30)];
