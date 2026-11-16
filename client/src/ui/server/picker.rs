@@ -681,7 +681,7 @@ impl Render for Picker {
                                 Kind::Primary,
                                 &t,
                             )
-                            .when(self.picked.is_none() && !composite, |b| b.opacity(0.5))
+                            .when(self.picked.is_none() && !composite, inert)
                             .on_click(cx.listener(|this, _, window, cx| this.start(window, cx))),
                         )
                     }),

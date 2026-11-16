@@ -294,7 +294,11 @@ impl MusicPanel {
                         p.error = Some(tr!("Nothing found.", "Nada encontrado.").into());
                     }
                     Ok(r) => p.found = Some(Found { resolved: r, added: HashSet::new() }),
-                    Err(e) => p.error = Some(resolve_error(&e).into()),
+                    // The failure stands alone; results of an earlier search would sit under it.
+                    Err(e) => {
+                        p.found = None;
+                        p.error = Some(resolve_error(&e).into());
+                    }
                 }
                 cx.notify();
             });

@@ -18,10 +18,10 @@ use crate::widgets::*;
 use chrono::{Local, TimeZone};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, App, AppContext, ClickEvent, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    FontWeight, InteractiveElement, IntoElement, KeyDownEvent, ListAlignment, ListState, MouseButton, MouseDownEvent, ParentElement,
-    PathPromptOptions, Render, RenderImage, SharedString, StatefulInteractiveElement, Styled, StyledImage, Subscription, Task, WeakEntity,
-    Window, div, img, list,
+    Animation, AnimationExt, AnyElement, App, AppContext, ClickEvent, ClipboardEntry, ClipboardItem, Context, Entity, EventEmitter,
+    FocusHandle, Focusable, FontWeight, InteractiveElement, IntoElement, KeyDownEvent, ListAlignment, ListState, MouseButton,
+    MouseDownEvent, ParentElement, PathPromptOptions, Render, RenderImage, SharedString, StatefulInteractiveElement, Styled, StyledImage,
+    Subscription, Task, WeakEntity, Window, div, img, list,
 };
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -116,7 +116,7 @@ pub struct ChatView {
     sending: bool,
     /// What is in the box was not sent because their key changed and the new one isn't accepted:
     /// the notice above offers to accept it and send.
-    held: bool,
+    held: Option<String>,
     mode: Option<Mode>,
     /// What was in the box when an edit took it over, put back when the edit is done.
     draft: Option<String>,
@@ -201,7 +201,7 @@ impl ChatView {
             saving: HashMap::new(),
             save_tick: Task::ready(()),
             sending: false,
-            held: false,
+            held: None,
             mode: None,
             draft: None,
             flash: None,
@@ -346,7 +346,7 @@ impl ChatView {
                 let _ = this.update(cx, |this, cx| {
                     // Held for their changed key: it goes back in the box like any failure, and
                     // the notice above says why and sends it once the key is accepted.
-                    this.held = result.as_ref().is_err_and(|e| e.code == ErrorCode::KeyNotConfirmed);
+                    this.held = result.as_ref().is_err_and(|e| e.code == ErrorCode::KeyNotConfirmed).then(|| text.clone());
                     this.sent(result.err().map(|e| (e.message, text)), answering, pending, cx)
                 });
             })
@@ -557,7 +557,7 @@ impl ChatView {
                     // Held for their changed key: the edit goes back in the box, to be saved once
                     // the key is accepted, unless something else took the box meanwhile.
                     if e.code == ErrorCode::KeyNotConfirmed && this.mode.is_none() {
-                        this.held = true;
+                        this.held = Some(body.clone());
                         this.draft = Some(this.composer.read(cx).text());
                         this.mode = Some(Mode::Edit(m));
                         this.composer.update(cx, |f, cx| f.set_text(&body, cx));
@@ -866,13 +866,18 @@ impl ChatView {
         if self.room.conversation().is_some() {
             return;
         }
+        let before = self.mention.clone();
         let text = self.composer.read(cx).text();
         let word = text.rsplit(|c: char| c.is_whitespace()).next().unwrap_or("");
         self.mention = word.strip_prefix('@').filter(|w| !w.contains('@')).map(|w| (w.to_lowercase(), 0));
         if self.mention.is_some() && self.mention_matches(cx).is_empty() {
             self.mention = None;
         }
-        cx.notify();
+        // Every key lands here; the chat only draws again when the list of names changed (the
+        // field itself draws what was typed).
+        if self.mention != before {
+            cx.notify();
+        }
     }
 
     fn mention_matches(&self, cx: &App) -> Vec<(String, String, Option<UserId>)> {
@@ -1866,7 +1871,7 @@ impl ChatView {
                         div()
                             .font_family(MONO)
                             .text_size(px(11.))
-                            .text_color(if mine { t.accent } else { t.text2 })
+                            .text_color(if mine { t.accent_text } else { t.text2 })
                             .child(r.count.to_string()),
                     )
                     .tooltip(tip(reacted(&who, &r.emoji), t))
@@ -1958,7 +1963,7 @@ impl ChatView {
             .child(div().flex_1())
             .child(
                 tool_button("dm-call", "phone", in_call, if in_call { t.success } else if can_call { t.text2 } else { t.text3 }, t)
-                    .when(!can_call, |d| d.opacity(0.5))
+                    .when(!can_call, inert)
                     .tooltip(tip(
                         if in_call {
                             tr!("In a call", "Em chamada").into()
@@ -1993,12 +1998,12 @@ impl ChatView {
         let changed = s.vault.ready() && s.vault.key_changed_for(peer);
         if !changed {
             // Accepted elsewhere (the safety number's "They match"): sending works again.
-            self.held = false;
+            self.held = None;
         }
         if changed {
             // Nothing is sealed to their new key until it is accepted here (`Vault::seal_message`),
             // so this is also what stands between a message and its sending.
-            let held = self.held;
+            let held = self.held.is_some();
             let s2 = self.session.clone();
             let text = if held {
                 trf!(
@@ -2031,7 +2036,11 @@ impl ChatView {
                                 s.vault.accept_key(peer);
                                 cx.notify();
                             });
-                            if std::mem::take(&mut this.held) {
+                            // What was held goes out if it is still what the box says; text typed
+                            // over it since is left for the person to send.
+                            if let Some(text) = this.held.take()
+                                && this.composer.read(cx).text() == text
+                            {
                                 this.send(window, cx);
                             }
                         })),
@@ -2474,6 +2483,8 @@ impl Render for ChatView {
                 &t,
             )
             .into_any_element()
+        } else if !loaded && self.results.is_none() {
+            skeleton(&t).into_any_element()
         } else {
             list(self.list.clone(), cx.processor(|this, ix, window, cx| this.render_message(ix, window, cx))).size_full().into_any_element()
         };
@@ -2530,6 +2541,31 @@ impl Render for ChatView {
                     ),
             )
     }
+}
+
+/// What a room shows while its first messages are on their way: the outline of a few, pulsing
+/// softly. It stays invisible for the first moments, so a quick answer never flashes it.
+fn skeleton(t: &Theme) -> impl IntoElement {
+    // (name width, line widths) of each placeholder message.
+    const ROWS: [(f32, &[f32]); 6] =
+        [(90., &[320.]), (70., &[420., 180.]), (110., &[260.]), (80., &[380.]), (100., &[300., 140.]), (76., &[220.])];
+    let bar = |w: f32, h: f32| div().h(px(h)).w(px(w)).max_w_full().rounded(px(h / 2.)).bg(t.layer_hover);
+    let mut col = div().size_full().flex().flex_col().gap(px(22.)).px(px(16.)).pt(px(20.)).overflow_hidden();
+    for (name, lines) in ROWS {
+        col = col.child(
+            div()
+                .flex()
+                .gap(px(12.))
+                .child(div().flex_none().size(px(36.)).rounded_full().bg(t.layer_hover))
+                .child(div().flex().flex_col().gap(px(8.)).child(bar(name, 10.)).children(lines.iter().map(|w| bar(*w, 12.)))),
+        );
+    }
+    div()
+        .size_full()
+        .child(col.with_animation("skeleton-pulse", Animation::new(Duration::from_millis(1400)).repeat(), |d, p| {
+            d.opacity(0.55 + 0.45 * (p * std::f32::consts::TAU).sin().abs())
+        }))
+        .with_animation("skeleton-in", Animation::new(Duration::from_millis(500)), |d, p| d.opacity(((p - 0.4) / 0.6).clamp(0., 1.)))
 }
 
 pub fn empty_state(glyph: &'static str, heading: &str, text: &str, t: &Theme) -> gpui::Div {

@@ -191,7 +191,18 @@ impl Root {
             cx.notify();
             return;
         }
-        let _ = window;
+        // Tab walks the controls that can take focus, Shift+Tab walks back. It is a key listener
+        // rather than a binding so a view above it (the message box's @mention list) that wants
+        // Tab for itself gets it first.
+        let k = &ev.keystroke;
+        if k.key == "tab" && !k.modifiers.control && !k.modifiers.alt && !k.modifiers.platform {
+            if k.modifiers.shift {
+                window.focus_prev(cx);
+            } else {
+                window.focus_next(cx);
+            }
+            cx.stop_propagation();
+        }
     }
 }
 
@@ -316,6 +327,11 @@ impl Render for Root {
                             .border_color(t.stroke_strong)
                             .shadow_lg()
                             .child(body(toast.text.clone(), t.text))
+                            .with_animation(
+                                ("toast-in", toast.id),
+                                Animation::new(Duration::from_millis(180)).with_easing(gpui::ease_out_quint()),
+                                |d, p| d.opacity(p).mt(px(8. * (1. - p))),
+                            )
                     }),
                 ))
             })

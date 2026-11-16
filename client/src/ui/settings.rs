@@ -1122,7 +1122,7 @@ impl Settings {
                             Kind::Standard,
                             t,
                         )
-                        .when(self.testing, |b| b.opacity(0.5))
+                        .when(self.testing, inert)
                         .on_click(cx.listener(|s, _, _, cx| s.run_test(cx))),
                     ),
             )
@@ -1231,7 +1231,7 @@ fn noise_row(p: &crate::core::settings::Settings, t: &Theme, cx: &mut Context<Se
                     d.bg(gpui::linear_gradient(90., gpui::linear_color_stop(blue, 0.), gpui::linear_color_stop(violet, 1.)))
                         .text_color(gpui::white())
                 })
-                .when(on && !ciranda, |d| d.bg(t.accent_soft).text_color(t.accent))
+                .when(on && !ciranda, |d| d.bg(t.accent_soft).text_color(t.accent_text))
                 .when(!on && ciranda, |d| d.text_color(violet).hover(move |s| s.bg(violet.opacity(0.12))))
                 .when(!on && !ciranda, |d| d.text_color(t.text2).hover(move |s| s.text_color(hover)))
                 .child(name)

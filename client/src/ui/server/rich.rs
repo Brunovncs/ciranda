@@ -245,7 +245,7 @@ fn pieces(line: &Line, t: &Theme, look: &mut Lookup, cx: &mut Context<Session>) 
             }
             Kind::Link { label, url } => {
                 let style = HighlightStyle {
-                    color: Some(t.accent),
+                    color: Some(t.accent_text),
                     underline: Some(UnderlineStyle { thickness: gpui::px(1.), color: Some(t.accent.opacity(0.5)), wavy: false }),
                     ..base
                 };
@@ -275,7 +275,7 @@ fn pieces(line: &Line, t: &Theme, look: &mut Lookup, cx: &mut Context<Session>) 
                 };
                 match shown {
                     Some(s) => {
-                        let color: Hsla = if mine { t.caution } else { t.accent };
+                        let color: Hsla = if mine { t.caution } else { t.accent_text };
                         push(
                             &mut text,
                             &mut highlights,

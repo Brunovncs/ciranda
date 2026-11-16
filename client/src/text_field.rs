@@ -698,13 +698,28 @@ impl TextField {
     }
 }
 
+/// How many steps the caret blinks for after the last key or click before it rests on, solid.
+/// Every step draws the view the field sits in again (a chat's whole message list, for the message
+/// box), so a window left alone for a minute does not keep doing that twice a second.
+const BLINK_STEPS: u32 = 20;
+
 fn blink_task(cx: &mut Context<TextField>) -> Task<()> {
     cx.spawn(async move |this, cx| {
+        let mut steps = 0;
         loop {
             cx.background_executor().timer(BLINK).await;
+            steps += 1;
             let going = this.update(cx, |f, cx| {
                 if !std::mem::take(&mut f.drawn) {
                     f.blinking = false;
+                    return false;
+                }
+                if steps >= BLINK_STEPS {
+                    // Rests on: shown again if it was off, and drawn no more until `wake`.
+                    if !f.caret_on {
+                        f.caret_on = true;
+                        cx.notify();
+                    }
                     return false;
                 }
                 f.caret_on = !f.caret_on;

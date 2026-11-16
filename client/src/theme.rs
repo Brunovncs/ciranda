@@ -250,6 +250,34 @@ fn luminance(c: u32) -> f32 {
     0.2126 * ch(16) + 0.7152 * ch(8) + 0.0722 * ch(0)
 }
 
+/// WCAG relative luminance of an sRGB colour.
+fn relative_luminance(c: u32) -> f32 {
+    let ch = |s: u32| {
+        let v = ((c >> s) & 0xff) as f32 / 255.;
+        if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+    };
+    0.2126 * ch(16) + 0.7152 * ch(8) + 0.0722 * ch(0)
+}
+
+/// WCAG contrast ratio between two colours, 1 to 21.
+fn contrast(a: u32, b: u32) -> f32 {
+    let (la, lb) = (relative_luminance(a), relative_luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
+/// `fg`, moved toward `toward` in small steps until it reads at `min`:1 on every colour in `on`.
+/// Colours that already do are returned as they are, so a palette keeps its own shade.
+fn readable(fg: u32, toward: u32, on: &[u32], min: f32) -> u32 {
+    let mut c = fg;
+    for step in 1..=25 {
+        if on.iter().all(|&bg| contrast(c, bg) >= min) {
+            return c;
+        }
+        c = mix(fg, toward, step as f32 / 25.);
+    }
+    toward
+}
+
 /// The four custom colours turned into a whole palette, the same way the old client derived it.
 fn derive(c: CustomColors) -> Palette {
     let light = luminance(c.bg) > 0.5;
@@ -293,6 +321,9 @@ pub struct Theme {
     pub text3: Hsla,
     pub accent: Hsla,
     pub accent_soft: Hsla,
+    /// The accent as text or a thin line on a pane: nudged toward the text colour until it reads
+    /// (4.5:1), for palettes whose accent is a fill first (the blurple on Dark).
+    pub accent_text: Hsla,
     /// Text on an accent fill.
     pub on_accent: Hsla,
     pub critical: Hsla,
@@ -336,10 +367,15 @@ impl Theme {
             stroke: c(p.border),
             stroke_strong: c(p.border_strong),
             text: c(p.text),
-            text2: c(p.muted),
-            text3: c(mix(p.muted, p.surface, 0.3)),
+            // Secondary text: the palette's own muted, nudged only if a custom palette left it
+            // under 4.5:1 on its panes and controls.
+            text2: c(readable(p.muted, p.text, &[p.surface, p.bg, p.surface2], 4.5)),
+            // Tertiary text (timestamps, placeholders, small labels): fainter than the secondary,
+            // but still 4.5:1 on a pane and on the page, which the plain 30% mix did not reach.
+            text3: c(readable(mix(p.muted, p.surface, 0.3), p.muted, &[p.surface, p.bg], 4.5)),
             accent,
             accent_soft: accent.opacity(if dark { 0.16 } else { 0.12 }),
+            accent_text: c(readable(p.accent, p.text, &[p.surface, p.bg], 4.5)),
             on_accent: if luminance(p.accent) > 0.55 { c(0x0b0c10) } else { gpui::white() },
             critical: c(p.danger),
             success: c(p.live),
@@ -390,7 +426,22 @@ fn windows_accent(_: bool) -> Option<Rgba> {
 
 #[cfg(windows)]
 fn windows_accent(dark: bool) -> Option<Rgba> {
-    let palette = registry_binary(r"Software\Microsoft\Windows\CurrentVersion\Explorer\Accent", "AccentPalette")?;
+    // The window draws the theme on every frame the root redraws; the registry is asked at most
+    // twice a second, which still follows a change of accent in Settings almost at once.
+    thread_local! {
+        static LAST: std::cell::RefCell<Option<(std::time::Instant, Option<Vec<u8>>)>> = const { std::cell::RefCell::new(None) };
+    }
+    let palette = LAST.with(|last| {
+        let mut last = last.borrow_mut();
+        match &*last {
+            Some((at, value)) if at.elapsed() < std::time::Duration::from_millis(500) => value.clone(),
+            _ => {
+                let value = registry_binary(r"Software\Microsoft\Windows\CurrentVersion\Explorer\Accent", "AccentPalette");
+                *last = Some((std::time::Instant::now(), value.clone()));
+                value
+            }
+        }
+    })?;
     // Eight RGBA entries, lightest to darkest; the accent itself is the fourth.
     let i = if dark { 1 } else { 4 };
     let px = palette.get(i * 4..i * 4 + 3)?;
@@ -435,6 +486,33 @@ mod tests {
         let light = derive(CustomColors { bg: 0xffffff, surface: 0xf0f0f0, text: 0x000000, accent: 0x0000ff });
         assert!(light.light);
         assert_eq!(light.danger, 0xc4303a);
+    }
+
+    fn rgb_of(c: Hsla) -> u32 {
+        let c = Rgba::from(c);
+        let to = |v: f32| (v * 255.).round() as u32;
+        to(c.r) << 16 | to(c.g) << 8 | to(c.b)
+    }
+
+    #[test]
+    fn every_palette_keeps_its_text_readable() {
+        for (name, _) in palettes() {
+            let t = Theme::new(name, WindowAppearance::Dark, None);
+            let (pane, base) = (rgb_of(t.pane), rgb_of(t.base));
+            for (what, c) in [("text", t.text), ("text2", t.text2), ("text3", t.text3), ("accent_text", t.accent_text)] {
+                for (on, bg) in [("pane", pane), ("page", base)] {
+                    let ratio = contrast(rgb_of(c), bg);
+                    assert!(ratio >= 4.4, "{name}: {what} on the {on} is {ratio:.2}:1");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_readable_colour_is_left_alone() {
+        assert_eq!(readable(0xffffff, 0xffffff, &[0x000000], 4.5), 0xffffff);
+        let nudged = readable(0x777777, 0x000000, &[0xffffff], 4.5);
+        assert!(contrast(nudged, 0xffffff) >= 4.5);
     }
 
     #[test]

@@ -41,7 +41,9 @@ enum Mode {
 }
 
 /// The shortest time the loading screen shows: a sign-in quicker than this would make it blink.
-const LOADING_AT_LEAST: Duration = Duration::from_millis(700);
+/// It fades in over 150 ms (`loading_screen`), so this keeps it on screen about as long as it took
+/// to appear, and no server switch waits for a splash.
+const LOADING_AT_LEAST: Duration = Duration::from_millis(350);
 
 pub struct ConnectView {
     focus: FocusHandle,
@@ -799,7 +801,7 @@ impl Render for ConnectView {
                         div()
                             .id("mode")
                             .cursor_pointer()
-                            .text_color(t.accent)
+                            .text_color(t.accent_text)
                             .hover(|s| s.opacity(0.8))
                             .child(caption(
                                 if register {
@@ -809,7 +811,7 @@ impl Render for ConnectView {
                                 } else {
                                     tr!("Create one", "Criar uma")
                                 },
-                                t.accent,
+                                t.accent_text,
                             ))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if saved {
@@ -1243,7 +1245,7 @@ impl AddServer {
                     .id("add-other-name")
                     .cursor_pointer()
                     .hover(|s| s.opacity(0.8))
-                    .child(caption(tr!("Use another name", "Usar outro nome"), t.accent))
+                    .child(caption(tr!("Use another name", "Usar outro nome"), t.accent_text))
                     .on_click(cx.listener(|this, _, window, cx| this.other_name(window, cx))),
             )
     }

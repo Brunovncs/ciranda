@@ -8,11 +8,12 @@ use crate::theme::{Theme, current, px, radius};
 use crate::widgets::*;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, AnyView, App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, Global, InteractiveElement, IntoElement,
-    MouseButton, ParentElement, Pixels, Point, Render, SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window, anchored,
-    deferred, div,
+    Animation, AnimationExt, AnyElement, AnyView, App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, Global,
+    InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, Point, Render, SharedString, StatefulInteractiveElement, Styled,
+    WeakEntity, Window, anchored, deferred, div,
 };
 use std::rc::Rc;
+use std::time::Duration;
 
 pub struct Toast {
     pub id: usize,
@@ -138,7 +139,7 @@ impl Root {
             match layer {
                 Layer::Dialog { view, .. } => out.push(
                     div()
-                        .id(("scrim", i))
+                        .id(("scrim", view.entity_id()))
                         .absolute()
                         .inset_0()
                         .flex()
@@ -158,45 +159,61 @@ impl Root {
                         })
                         .child(
                             div()
-                                .id(("dialog", i))
+                                .id(("dialog", view.entity_id()))
                                 .max_h_full()
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .child(view.clone()),
+                                .child(view.clone())
+                                // It settles in rather than appears: a short rise and fade.
+                                .with_animation(
+                                    ("dialog-in", view.entity_id()),
+                                    Animation::new(Duration::from_millis(140)).with_easing(gpui::ease_out_quint()),
+                                    |d, p| d.opacity(p).mt(px(10. * (1. - p))),
+                                ),
+                        )
+                        .with_animation(
+                            ("scrim-in", view.entity_id()),
+                            Animation::new(Duration::from_millis(120)).with_easing(gpui::ease_out_quint()),
+                            |d, p| d.opacity(p),
                         )
                         .into_any_element(),
                 ),
-                Layer::Menu { at, anchor, view } => {
-                    out.push(
-                        deferred(
-                            div()
-                                .id(("menu-catcher", i))
-                                .absolute()
-                                .inset_0()
-                                .occlude()
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|root, _, _, cx| {
-                                        root.overlay.layers.retain(|l| !matches!(l, Layer::Menu { .. }));
-                                        cx.notify();
-                                    }),
-                                )
-                                .on_mouse_down(
-                                    MouseButton::Right,
-                                    cx.listener(|root, _, _, cx| {
-                                        root.overlay.layers.retain(|l| !matches!(l, Layer::Menu { .. }));
-                                        cx.notify();
-                                    }),
-                                )
-                                .child(
-                                    anchored().anchor(*anchor).position(*at).snap_to_window_with_margin(px(8.)).child(
-                                        div().on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()).child(view.clone()),
-                                    ),
+                Layer::Menu { at, anchor, view } => out.push(
+                    deferred(
+                        div()
+                            .id(("menu-catcher", i))
+                            .absolute()
+                            .inset_0()
+                            .occlude()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|root, _, _, cx| {
+                                    root.overlay.layers.retain(|l| !matches!(l, Layer::Menu { .. }));
+                                    cx.notify();
+                                }),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(|root, _, _, cx| {
+                                    root.overlay.layers.retain(|l| !matches!(l, Layer::Menu { .. }));
+                                    cx.notify();
+                                }),
+                            )
+                            .child(
+                                anchored().anchor(*anchor).position(*at).snap_to_window_with_margin(px(8.)).child(
+                                    div()
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                        .child(view.clone())
+                                        .with_animation(
+                                            ("menu-in", view.entity_id()),
+                                            Animation::new(Duration::from_millis(100)).with_easing(gpui::ease_out_quint()),
+                                            |d, p| d.opacity(p),
+                                        ),
                                 ),
-                        )
-                        .with_priority(1)
-                        .into_any_element(),
+                            ),
                     )
-                }
+                    .with_priority(1)
+                    .into_any_element(),
+                ),
             }
         }
         out
@@ -242,6 +259,8 @@ pub fn menu_item(
 ) -> gpui::Stateful<gpui::Div> {
     let color = if danger { t.critical } else { t.text };
     let hover = if danger { t.tint(t.critical) } else { t.layer_hover };
+    // Under the keyboard the row fills as it does under the pointer, and a little more.
+    let focus = if danger { t.critical.opacity(0.22) } else { t.layer_hover };
     div()
         .id(id.into())
         .flex()
@@ -252,6 +271,9 @@ pub fn menu_item(
         .rounded(px(radius::INNER))
         .cursor_pointer()
         .hover(move |s| s.bg(hover))
+        .tab_index(0)
+        .focus_visible(move |s| s.bg(focus))
+        .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
         .when_some(glyph, |d, g| d.child(icon(g, 15., if danger { t.critical } else { t.text2 })))
         .child(body(text, color))
 }

@@ -440,7 +440,7 @@ pub fn button(cx: &App) -> Option<AnyElement> {
             .border_color(t.accent.opacity(0.35))
             .child(div().absolute().left_0().top_0().bottom_0().w(relative(*done)).bg(t.accent.opacity(0.28)))
             .child(icon("download", 14., t.accent))
-            .child(div().font_family(MONO).text_size(px(11.)).text_color(t.accent).child(trf!(
+            .child(div().font_family(MONO).text_size(px(11.)).text_color(t.accent_text).child(trf!(
                 "Updating {}%",
                 "Atualizando {}%",
                 (done * 100.).round() as u32

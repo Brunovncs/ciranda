@@ -166,7 +166,12 @@ impl Call {
             let sub = cx.subscribe(&session, |this: &mut Call, _, ev: &SessionEvent, cx| match ev {
                 SessionEvent::Roster(p) if *p == this.place => this.on_roster(cx),
                 SessionEvent::CallChanged(id) if this.place == Place::Call(*id) => this.on_call_changed(cx),
-                SessionEvent::Reconnected => {
+                // A join asked for before the socket ever came up was told "offline" and is waiting
+                // for this; one that never went out has nothing to repeat.
+                SessionEvent::FirstUp if this.state == CallState::Reconnecting && !this.left && this.tokens.is_none() => {
+                    this.send_join(cx);
+                }
+                SessionEvent::Reconnected if !this.left => {
                     this.state = CallState::Reconnecting;
                     this.cue_roster = None;
                     this.quiet_until = Some(Instant::now() + RESYNC_QUIET);
@@ -314,9 +319,22 @@ impl Call {
                         cx.emit(CallEvent::Ended(Some(tr!("The call has ended.", "A chamada terminou.").into())))
                     }
                     ErrorCode::Offline | ErrorCode::Timeout => {
-                        // The socket is down; `Reconnected` will try again.
+                        // The socket is down: `Reconnected` (or `FirstUp`, if it never was up) tries
+                        // again. A request that merely timed out on a socket that stayed up gets no
+                        // such event, so it is asked again after a pause.
                         this.state = CallState::Reconnecting;
                         cx.notify();
+                        if e.code == ErrorCode::Timeout {
+                            cx.spawn(async move |this, cx| {
+                                cx.background_executor().timer(Duration::from_secs(3)).await;
+                                let _ = this.update(cx, |this, cx| {
+                                    if this.state == CallState::Reconnecting && !this.left && this.tokens.is_none() {
+                                        this.send_join(cx);
+                                    }
+                                });
+                            })
+                            .detach();
+                        }
                     }
                     _ => {
                         let why = crate::core::api::friendly(e.code, &e.reply)

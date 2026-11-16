@@ -54,7 +54,7 @@ fn step(n: &str, text: impl Into<SharedString>, t: &Theme) -> gpui::Div {
                 .justify_center()
                 .text_size(px(12.))
                 .font_weight(FontWeight::BOLD)
-                .text_color(t.accent)
+                .text_color(t.accent_text)
                 .child(n.to_string()),
         )
         .child(div().flex_1().min_w(px(0.)).child(body(text, t.text2)))

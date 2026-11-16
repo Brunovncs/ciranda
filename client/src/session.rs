@@ -32,6 +32,9 @@ const PICTURE_BUDGET: usize = 192 << 20;
 /// Pictures are decoded at most twice the biggest box they are drawn in (an attachment's
 /// 420 × 300), so a huge upload costs a thumbnail's worth of memory.
 const THUMBNAIL: (u32, u32) = (840, 600);
+/// What a face is decoded to: the largest place one is drawn (a profile card) at a sharp screen's
+/// density. At attachment size a server's worth of avatars filled the picture budget.
+const AVATAR: (u32, u32) = (192, 192);
 /// The lightbox gets the picture at its own size, up to this on either side.
 const FULL: (u32, u32) = (4096, 4096);
 
@@ -362,6 +365,9 @@ pub enum SessionEvent {
     Moved(Option<ChannelId>),
     /// The socket is back after a drop: rejoin voice.
     Reconnected,
+    /// The socket came up for the first time (or a kept-behind session was brought on screen):
+    /// whatever asked for something while it was down, and was told to wait, may ask again.
+    FirstUp,
     /// The account was removed or the token refused: back to the sign-in screen.
     SignedOut(SignOutReason),
     Toast(String),
@@ -466,6 +472,8 @@ pub struct Session {
     keep_owner: u64,
     /// A new identity key is on its way to the server.
     creating_key: bool,
+    /// A draw for pictures that landed is already scheduled (`notify_pictures`).
+    pictures_pending: bool,
     _pump: Task<()>,
     _quit: Subscription,
 }
@@ -594,6 +602,7 @@ impl Session {
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             },
             creating_key: false,
+            pictures_pending: false,
             _pump: Task::ready(()),
             // Keys accepted or pinned are written in the background (see `keystore`); quitting
             // waits for them.
@@ -646,7 +655,11 @@ impl Session {
             rt.stop();
         }
         self.cache.drop_keep(self.keep_owner);
-        self.cache.flush_all();
+        // Serialising and writing the index costs as much as the cache is big; leaving a server
+        // should not wait for the disk. The index goes to a temporary file and is renamed, so a
+        // write cut short by the process ending leaves the previous one.
+        let cache = self.cache.clone();
+        std::thread::spawn(move || cache.flush_all());
     }
 
     /// Kept in the background for its private messages, rather than the server on screen.
@@ -824,6 +837,8 @@ impl Session {
                 if was_down {
                     cx.emit(SessionEvent::Reconnected);
                     self.refresh_lists(cx);
+                } else {
+                    cx.emit(SessionEvent::FirstUp);
                 }
                 // Brought on screen: whatever arrived while it was asleep, or between the
                 // inbox's last answer and now, is asked for as after a reconnect.
@@ -1097,6 +1112,23 @@ impl Session {
 
     // Pictures: avatars, emoji and attachments, by hash.
 
+    /// Draws again once a burst of pictures has landed, not once for each: opening a channel
+    /// brings thirty faces and attachments within moments, and each used to be a whole frame of
+    /// the window.
+    fn notify_pictures(&mut self, cx: &mut Context<Self>) {
+        if std::mem::replace(&mut self.pictures_pending, true) {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(40)).await;
+            let _ = this.update(cx, |s, cx| {
+                s.pictures_pending = false;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// The picture behind a hash, small enough for any box it is drawn in, loading it in the
     /// background the first time it is asked for (and again later if that failed).
     pub fn picture(&mut self, hash: &str, cx: &mut Context<Self>) -> Picture {
@@ -1106,7 +1138,13 @@ impl Session {
     /// As `picture`, from wherever the attachment lives: a sealed one is fetched from its
     /// conversation and opened here, off the UI thread. The disk cache keeps it sealed.
     pub fn picture_from(&mut self, hash: &str, how: Fetch, cx: &mut Context<Self>) -> Picture {
-        let tries = match self.pictures.get(hash) {
+        self.picture_fit(hash, hash.to_string(), how, THUMBNAIL, cx)
+    }
+
+    /// `picture_from` decoded to fit `fit`, kept under `key` so the same file drawn at another
+    /// size is another entry.
+    fn picture_fit(&mut self, hash: &str, key: String, how: Fetch, fit: (u32, u32), cx: &mut Context<Self>) -> Picture {
+        let tries = match self.pictures.get(&key) {
             Some(Slot::Loading) => return Picture::Loading,
             Some(Slot::Ready(frames)) => {
                 let (img, next) = frames.at(Instant::now());
@@ -1120,13 +1158,12 @@ impl Session {
             Some(Slot::Failed { .. }) => return Picture::Failed,
             None => 0,
         };
-        self.put_picture(hash.to_string(), Slot::Loading, 0, cx);
+        self.put_picture(key.clone(), Slot::Loading, 0, cx);
         let (api, cache, h) = (self.api.clone(), self.cache.clone(), hash.to_string());
         cx.spawn(async move |this, cx| {
-            let key = h.clone();
             let got = core::run(fetch_attachment(api, cache, h, how, true)).await;
             let (slot, cost) = match got {
-                Ok((bytes, ct)) => match cx.background_executor().spawn(async move { decode_frames(&bytes, &ct, THUMBNAIL) }).await {
+                Ok((bytes, ct)) => match cx.background_executor().spawn(async move { decode_frames(&bytes, &ct, fit) }).await {
                     Ok((frames, cost)) => (Slot::Ready(Arc::new(frames)), cost),
                     Err(e) => {
                         log::info!("picture {key} did not decode: {e}");
@@ -1142,7 +1179,7 @@ impl Session {
             let retry = matches!(slot, Slot::Failed { retry_at: Some(_), .. });
             let stored = this.update(cx, |s, cx| {
                 s.put_picture(key, slot, cost, cx);
-                cx.notify();
+                s.notify_pictures(cx);
             });
             if stored.is_err() || !retry {
                 return;
@@ -1189,7 +1226,7 @@ impl Session {
 
     pub fn avatar(&mut self, user: UserId, cx: &mut Context<Self>) -> Option<Arc<RenderImage>> {
         let hash = self.users.get(&user)?.avatar_hash.clone()?;
-        match self.picture(&hash, cx) {
+        match self.picture_fit(&hash, format!("{hash}#avatar"), Fetch::Public, AVATAR, cx) {
             Picture::Ready(img) => Some(img),
             _ => None,
         }
@@ -1319,6 +1356,8 @@ impl Session {
         let log = self.chats.entry(room).or_default();
         log.fetching = true;
         log.stale = false;
+        // A retry after a failure shows as loading again, not as the failure it is replacing.
+        log.error = None;
         let page = self.page(room, None);
         cx.spawn(async move |this, cx| {
             let got = page.await;

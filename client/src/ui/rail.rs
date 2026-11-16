@@ -568,7 +568,7 @@ fn server_tile(name: &str, picture: Option<Arc<RenderImage>>, size: f32, on: boo
             .font_weight(FontWeight::SEMIBOLD)
             .text_size(px(size * 0.375))
             .when(on, |d| d.bg(t.accent).text_color(t.on_accent))
-            .when(!on, |d| d.bg(t.accent_soft).text_color(t.accent).hover(move |s| s.bg(hover)))
+            .when(!on, |d| d.bg(t.accent_soft).text_color(t.accent_text).hover(move |s| s.bg(hover)))
             .child(initials(name)),
     }
 }

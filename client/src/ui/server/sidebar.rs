@@ -305,8 +305,7 @@ impl ServerView {
             ),
             (None, None) => None,
         };
-        div()
-            .id(row_id)
+        keyboard_row(div().id(row_id), t)
             .relative()
             .flex()
             .items_center()
@@ -379,8 +378,7 @@ impl ServerView {
             t.text2
         };
         let hover = t.layer_hover;
-        let row = div()
-            .id(("channel", c.id as u64))
+        let row = keyboard_row(div().id(("channel", c.id as u64)), t)
             .relative()
             .flex()
             .items_center()

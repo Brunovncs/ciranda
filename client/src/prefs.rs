@@ -57,14 +57,16 @@ pub fn prefs(cx: &App) -> &Settings {
 }
 
 pub fn set_prefs(cx: &mut App, f: impl FnOnce(&mut Settings)) {
+    // Tried on a copy first: a change that changes nothing (opening the channel already open)
+    // must not tell the window the settings moved, which draws all of it again.
+    let mut next = prefs(cx).clone();
+    f(&mut next);
+    next.sync_active();
+    if next == *prefs(cx) {
+        return;
+    }
     cx.update_global::<Prefs, _>(|p, cx| {
-        let before = p.store.values.clone();
-        f(&mut p.store.values);
-        p.store.values.sync_active();
-        if p.store.values == before {
-            p.redraw = false;
-            return;
-        }
+        let before = std::mem::replace(&mut p.store.values, next);
         p.redraw = !p.store.values.same_but_levels(&before);
         follow(&p.store.values);
         // A colour being dragged across the picker redraws everything but is written once it settles.

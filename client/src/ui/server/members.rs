@@ -155,7 +155,7 @@ impl ServerView {
             .px(px(6.))
             .rounded(px(radius::INNER + 1.))
             .hover(move |s| s.bg(hover))
-            .when(!online, |d| d.opacity(0.45))
+            .when(!online, |d| d.opacity(0.62))
             .child(div().relative().child(avatar(u.name(), img, 26., None)).when(online, |d| {
                 d.child(
                     div()

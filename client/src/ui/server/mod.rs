@@ -976,6 +976,9 @@ impl ServerView {
             }
             self.redraw_rail(cx);
         }
+        // The tile of a stream that is gone with the call would otherwise be held until the next
+        // one; the theater view lets go of its own on the next draw, which also leaves fullscreen.
+        self.focused_tile = None;
         if self.center == Center::Stage {
             self.on_session(cx);
         }
@@ -1429,7 +1432,7 @@ impl ServerView {
                     if muted && in_call { t.critical } else { t.text2 },
                     t,
                 )
-                .when(!in_call, |d| d.opacity(0.4))
+                .when(!in_call, inert)
                 .tooltip(tip(
                     if muted {
                         tr!("Unmute (Ctrl+Shift+M)", "Reativar o microfone (Ctrl+Shift+M)")
@@ -1448,7 +1451,7 @@ impl ServerView {
                     if deafened && in_call { t.critical } else { t.text2 },
                     t,
                 )
-                .when(!in_call, |d| d.opacity(0.4))
+                .when(!in_call, inert)
                 .tooltip(tip(
                     if deafened {
                         tr!("Undeafen (Ctrl+Shift+D)", "Reativar o som (Ctrl+Shift+D)")

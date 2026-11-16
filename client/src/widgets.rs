@@ -4,9 +4,9 @@
 use crate::theme::{FONT, MONO, Theme, px, radius, text};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, AppContext, Bounds, Context, Div, DragMoveEvent, ElementId, FontWeight, Hsla, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement, Pixels, Point, Render, SharedString, Stateful, StatefulInteractiveElement, Styled, Window, canvas, div,
-    linear_color_stop, linear_gradient,
+    App, AppContext, Bounds, BoxShadow, Context, Div, DragMoveEvent, ElementId, FontWeight, Hsla, InteractiveElement, IntoElement,
+    MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render, SharedString, Stateful, StatefulInteractiveElement, Styled, Window,
+    canvas, div, linear_color_stop, linear_gradient,
 };
 use std::cell::Cell;
 use std::rc::Rc;
@@ -85,6 +85,33 @@ impl Render for Tip {
     }
 }
 
+/// A 2 px ring just outside an element's edge, as a shadow: showing it moves nothing, but it is
+/// drawn under the element, so only an element with a fill of its own can wear it.
+pub fn focus_ring(color: Hsla) -> Vec<BoxShadow> {
+    vec![BoxShadow { color, offset: gpui::point(px(0.), px(0.)), blur_radius: px(0.), spread_radius: px(2.), inset: false }]
+}
+
+/// Makes a control reachable with Tab and drawn as `focus` says while it has keyboard focus
+/// (Enter and Space then press it). A press with the mouse leaves focus where it was, so
+/// clicking a button never takes the caret from the message box beside it. A control with no fill
+/// of its own wears the ring as its border (give it a transparent one, so nothing moves).
+pub fn keyboardable<E: InteractiveElement>(el: E, focus: impl FnOnce(gpui::StyleRefinement) -> gpui::StyleRefinement) -> E {
+    el.tab_index(0).focus_visible(focus).on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+}
+
+/// A list row (a channel, a conversation) reached with Tab: under the keyboard it fills with the
+/// accent's soft tint, which differs from both the pointer's grey and the open row's.
+pub fn keyboard_row<E: InteractiveElement>(el: E, t: &Theme) -> E {
+    let fill = t.accent_soft;
+    keyboardable(el, move |s| s.bg(fill))
+}
+
+/// A control that cannot be used now: dimmed, and the pointer saying so. Its click handler should
+/// check; this only draws it.
+pub fn inert<E: Styled>(el: E) -> E {
+    el.opacity(0.45).cursor_not_allowed()
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Primary,
@@ -124,25 +151,31 @@ fn button_base(id: impl Into<ElementId>, kind: Kind, t: &Theme) -> Stateful<Div>
         Kind::Subtle => (gpui::transparent_black(), t.control, gpui::transparent_black()),
         Kind::Danger => (t.critical, t.critical.opacity(0.86), t.critical),
     };
-    div()
-        .id(id.into())
-        .flex()
-        .flex_none()
-        .items_center()
-        .justify_center()
-        .gap(px(8.))
-        .h(px(36.))
-        .px(px(14.))
-        .rounded(px(radius::CONTROL))
-        .bg(bg)
-        .border_1()
-        .border_color(border)
-        .text_size(px(text::BODY.0))
-        .font_weight(if matches!(kind, Kind::Primary | Kind::Danger) { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM })
-        .text_color(fg(kind, t))
-        .cursor_pointer()
-        .hover(move |s| s.bg(hover))
-        .active(|s| s.opacity(0.82))
+    let ring = if kind == Kind::Primary { t.text } else { t.accent_text };
+    let (fill, lift) = (kind == Kind::Subtle, t.control);
+    keyboardable(
+        div()
+            .id(id.into())
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .gap(px(8.))
+            .h(px(36.))
+            .px(px(14.))
+            .rounded(px(radius::CONTROL))
+            .bg(bg)
+            .border_1()
+            .border_color(border)
+            .text_size(px(text::BODY.0))
+            .font_weight(if matches!(kind, Kind::Primary | Kind::Danger) { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM })
+            .text_color(fg(kind, t))
+            .cursor_pointer()
+            .hover(move |s| s.bg(hover))
+            .active(|s| s.opacity(0.82)),
+        // A button with a fill carries the ring outside it; a see-through one has the border.
+        move |s| if fill { s.bg(lift).border_color(ring) } else { s.border_color(ring).shadow(focus_ring(ring)) },
+    )
 }
 
 /// A square button holding only an icon.
@@ -153,19 +186,27 @@ pub fn icon_button(id: impl Into<ElementId>, glyph: &'static str, t: &Theme) -> 
 /// An icon button that can be switched on, like mute or the camera.
 pub fn tool_button(id: impl Into<ElementId>, glyph: &'static str, on: bool, color: Hsla, t: &Theme) -> Stateful<Div> {
     let hover = t.control_hover;
-    div()
-        .id(id.into())
-        .flex()
-        .flex_none()
-        .items_center()
-        .justify_center()
-        .size(px(32.))
-        .rounded(px(8.))
-        .cursor_pointer()
-        .when(on, |d| d.bg(t.tint(color)))
-        .when(!on, |d| d.hover(move |s| s.bg(hover)))
-        .active(|s| s.opacity(0.75))
-        .child(icon(glyph, 17., color))
+    keyboardable(
+        div()
+            .id(id.into())
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .size(px(32.))
+            .rounded(px(8.))
+            .border_2()
+            .border_color(gpui::transparent_black())
+            .cursor_pointer()
+            .when(on, |d| d.bg(t.tint(color)))
+            .when(!on, |d| d.hover(move |s| s.bg(hover)))
+            .active(|s| s.opacity(0.75)),
+        {
+            let ring = t.accent_text;
+            move |s| s.border_color(ring)
+        },
+    )
+    .child(icon(glyph, 17., color))
 }
 
 /// A small label in a dashed outline, see-through so it sits lightly on any surface: a role, a
@@ -243,24 +284,32 @@ pub fn segmented<T: Copy + PartialEq + 'static, V: 'static>(
     for (i, (value, label)) in choices.into_iter().enumerate() {
         let on = value == picked;
         let on_pick = on_pick.clone();
-        let hover = t.text;
+        let (hover, layer) = (t.text, t.layer);
         d = d.child(
-            div()
-                .id((id, i))
-                .flex()
-                .flex_1()
-                .items_center()
-                .justify_center()
-                .h(px(28.))
-                .px(px(10.))
-                .rounded(px(radius::INNER))
-                .cursor_pointer()
-                .text_size(px(13.))
-                .font_weight(FontWeight::MEDIUM)
-                .when(on, |d| d.bg(t.accent_soft).text_color(t.accent))
-                .when(!on, |d| d.text_color(t.text2).hover(move |s| s.text_color(hover)))
-                .child(label)
-                .on_click(cx.listener(move |this, _, window, cx| on_pick(this, value, window, cx))),
+            keyboardable(
+                div()
+                    .id((id, i))
+                    .flex()
+                    .flex_1()
+                    .items_center()
+                    .justify_center()
+                    .h(px(28.))
+                    .px(px(10.))
+                    .rounded(px(radius::INNER))
+                    .border_2()
+                    .border_color(gpui::transparent_black())
+                    .cursor_pointer()
+                    .text_size(px(13.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .when(on, |d| d.bg(t.accent_soft).text_color(t.accent_text))
+                    .when(!on, |d| d.text_color(t.text2).hover(move |s| s.text_color(hover).bg(layer))),
+                {
+                    let ring = t.accent_text;
+                    move |s| s.border_color(ring)
+                },
+            )
+            .child(label)
+            .on_click(cx.listener(move |this, _, window, cx| on_pick(this, value, window, cx))),
         );
     }
     d

@@ -365,7 +365,7 @@ impl Render for CameraDialog {
                     )
                     .child(
                         icon_label_button("camera-start", "camera", tr!("Turn on camera", "Ligar a câmera"), Kind::Primary, &t)
-                            .when(none, |b| b.opacity(0.5))
+                            .when(none, inert)
                             .on_click(cx.listener(|d, _, _, cx| d.turn_on(cx))),
                     ),
             )
