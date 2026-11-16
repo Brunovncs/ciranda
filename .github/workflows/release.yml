@@ -13,6 +13,8 @@ name: Release
 # warns on first launch, and macOS asks for the app to be opened from its context menu (the app
 # is signed with Ciranda's own certificate when the MACOS_SIGN_P12 secret holds one, so that
 # macOS keeps its permissions from one release to the next; see the macos job).
+# The release is published once Windows and Linux are built; the .dmg is added when the Mac build
+# is done (see publish and publish-macos).
 # Run by hand (Actions, "Run workflow") it builds and packages everything for the version in
 # client/Cargo.toml without publishing, to try the packaging before a tag.
 on:
@@ -318,8 +320,11 @@ jobs:
           name: package-macos
           path: dist/*
 
+  # Without the Mac: GitHub's macOS arm64 runners are sometimes not to be had for hours, and a
+  # release waiting for one holds back every other system. The disk image joins it in
+  # publish-macos below, from this same run.
   publish:
-    needs: [version, windows, linux, macos]
+    needs: [version, windows, linux]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
@@ -340,3 +345,24 @@ jobs:
             --title "Ciranda ${{ needs.version.outputs.version }}" \
             --generate-notes \
             --verify-tag
+
+  # The disk image, added to the release once publish has made it. If the macos job cannot get a
+  # runner, rerun only the failed jobs (gh run rerun <id> --failed): this one is rerun with it,
+  # and the release is not touched again. --clobber so a rerun after a half-finished upload
+  # replaces the file.
+  publish-macos:
+    needs: [version, publish, macos]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: package-macos
+          path: dist
+      - name: Add the disk image to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release upload "$GITHUB_REF_NAME" dist/* --clobber
