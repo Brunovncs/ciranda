@@ -10,6 +10,44 @@ use crate::core::update::is_newer;
 
 pub const NEWS: &[Entry] = &[
     Entry {
+        version: "4.8.0",
+        date: (2026, 11, 19),
+        notes: &[
+            new(
+                "Playing now: the game you have open shows beside your name, as \"Playing VALORANT\". Only its name leaves your computer, and it can be turned off in Settings, under In game.",
+                "Jogando agora: o jogo que você está jogando aparece ao lado do seu nome, como \"Jogando VALORANT\". Só o nome dele sai do seu computador, e dá para desligar em Configurações, em Durante o jogo.",
+            ),
+            new(
+                "Animated names: rainbow, aurora, fire, ocean, gold or candy, picked in your profile, moving in the member list, in voice and on your card.",
+                "Nomes animados: arco-íris, aurora, fogo, oceano, ouro ou doce, escolhidos no seu perfil, em movimento na lista de membros, na voz e no seu cartão.",
+            ),
+            new(
+                "The year in review: in December, a few slides of what your server did together, from the chat to the hours in voice, the games and the songs, and yours too.",
+                "A Retrospectiva: em dezembro, alguns slides do que o seu servidor fez junto, do chat às horas na voz, os jogos e as músicas, e a sua também.",
+            ),
+            new(
+                "See who is typing, in channels and private conversations.",
+                "Veja quem está digitando, nos canais e nas conversas privadas.",
+            ),
+            better(
+                "Smoother everywhere: opening and closing things, switching channels and servers, watching a stream full screen and muting all move softly, and corners are rounder.",
+                "Mais suave em tudo: abrir e fechar, trocar de canal e de servidor, assistir uma live em tela cheia e mutar agora têm animação, e os cantos ficaram mais arredondados.",
+            ),
+            better(
+                "The muted badge is a quiet glass instead of a red disc, and new messages rise into place.",
+                "O selo de mutado virou um vidro discreto em vez do disco vermelho, e as mensagens novas entram com animação.",
+            ),
+            better(
+                "Ctrl and +, - or 0 change the size of the interface, and a paste too long for a message is sent as a text file.",
+                "Ctrl com +, - ou 0 muda o tamanho da interface, e um texto colado longo demais para uma mensagem vai como arquivo de texto.",
+            ),
+            better(
+                "Playing now, animated names, typing and the year in review need the server updated to 4.8.0.",
+                "Jogando agora, nomes animados, digitando e a Retrospectiva precisam do servidor atualizado para a 4.8.0.",
+            ),
+        ],
+    },
+    Entry {
         version: "4.7.6",
         date: (2026, 11, 19),
         notes: &[
