@@ -20,6 +20,9 @@ pub fn shapes(name: &str) -> &'static str {
         // Nothing, to keep a menu's labels in line where an item has no icon.
         "blank" => "",
         "hash" => r#"<path d="M4 9h16M4 15h16M10 3 8 21M16 3l-2 18"/>"#,
+        "gamepad" => {
+            r#"<path d="M6 11h4M8 9v4M15 12h.01M18 10h.01"/><path d="M17.3 5H6.7a4 4 0 0 0-4 3.6C2.6 9.4 2 14.5 2 16a3 3 0 0 0 3 3c1 0 1.5-.5 2-1l1.4-1.4a2 2 0 0 1 1.4-.6h4.4a2 2 0 0 1 1.4.6L17 18c.5.5 1 1 2 1a3 3 0 0 0 3-3c0-1.5-.6-6.6-.7-7.3a4 4 0 0 0-4-3.7Z"/>"#
+        }
         "volume" => {
             r#"<path d="M11 4.7a.7.7 0 0 0-1.2-.5L6.4 7.6a1.4 1.4 0 0 1-1 .4H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.4a1.4 1.4 0 0 1 1 .4l3.4 3.4a.7.7 0 0 0 1.2-.5ZM16 9a5 5 0 0 1 0 6M19.4 18.4a9 9 0 0 0 0-12.8"/>"#
         }
@@ -130,6 +133,7 @@ pub fn shapes(name: &str) -> &'static str {
             r#"<path d="M12.8 2.2a2 2 0 0 0-1.6 0L2.6 6.1a1 1 0 0 0 0 1.8l8.6 3.9a2 2 0 0 0 1.6 0l8.6-3.9a1 1 0 0 0 0-1.8ZM2 12a1 1 0 0 0 .6.9l8.6 3.9a2 2 0 0 0 1.6 0l8.6-3.9A1 1 0 0 0 22 12M2 17a1 1 0 0 0 .6.9l8.6 3.9a2 2 0 0 0 1.6 0l8.6-3.9A1 1 0 0 0 22 17"/>"#
         }
         "chevron-right" => r#"<path d="m9 18 6-6-6-6"/>"#,
+        "chevron-left" => r#"<path d="m15 18-6-6 6-6"/>"#,
         "chevron-down" => r#"<path d="m6 9 6 6 6-6"/>"#,
         "arrow-left" => r#"<path d="m12 19-7-7 7-7M19 12H5"/>"#,
         "arrow-right" => r#"<path d="M5 12h14M12 5l7 7-7 7"/>"#,

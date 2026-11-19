@@ -199,8 +199,22 @@ pub struct User {
     pub role: Role,
     #[serde(default)]
     pub avatar_hash: Option<String>,
+    /// An effect on their name ("rainbow", "fire"…), drawn by `crate::name_fx`; an unknown one
+    /// is drawn plain.
+    #[serde(default)]
+    pub name_fx: Option<String>,
     #[serde(default)]
     pub created_at: i64,
+}
+
+/// What someone online is playing, as the server last said, and since when (ms).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Activity {
+    pub user_id: UserId,
+    pub name: String,
+    #[serde(default)]
+    pub since: i64,
 }
 
 impl User {
@@ -1076,6 +1090,9 @@ pub struct Snapshot {
     /// Private calls ringing for you or under way, with their rosters.
     #[serde(default, deserialize_with = "lenient")]
     pub calls: Vec<CallInfo>,
+    /// What the people online are playing.
+    #[serde(default, deserialize_with = "lenient")]
+    pub activities: Vec<Activity>,
 }
 
 /// Base 36, the way the server names channel paths (`vc-<cid36>-<mid36>-<kind>`).

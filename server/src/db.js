@@ -529,6 +529,48 @@ export const MIGRATIONS = [
       );
     `);
   },
+
+  /*
+   * v19 -- the journal, for the year in review (journal.js, retro.js).
+   *
+   * Sessions in voice and in a game, and what Cirandinha played. Never read
+   * by the live server. No foreign keys to users on purpose: a removed
+   * account's hours still count in the server's own totals, and their rows
+   * are dropped with the account (accounts.js) only where they would name them.
+   *
+   * And the name effect a person picks for their name (animated names).
+   */
+  (db) => {
+    db.exec(`
+      CREATE TABLE voice_sessions (
+        id         INTEGER PRIMARY KEY,
+        user_id    INTEGER NOT NULL,
+        channel_id INTEGER NOT NULL,
+        started_at INTEGER NOT NULL,
+        ended_at   INTEGER NOT NULL
+      );
+      CREATE INDEX voice_sessions_started ON voice_sessions(started_at);
+      CREATE TABLE activity_sessions (
+        id         INTEGER PRIMARY KEY,
+        user_id    INTEGER NOT NULL,
+        name       TEXT NOT NULL,
+        started_at INTEGER NOT NULL,
+        ended_at   INTEGER NOT NULL
+      );
+      CREATE INDEX activity_sessions_started ON activity_sessions(started_at);
+      CREATE TABLE music_plays (
+        id         INTEGER PRIMARY KEY,
+        channel_id INTEGER NOT NULL,
+        source_key TEXT NOT NULL,
+        title      TEXT NOT NULL DEFAULT '',
+        artist     TEXT NOT NULL DEFAULT '',
+        added_by   TEXT,
+        played_at  INTEGER NOT NULL
+      );
+      CREATE INDEX music_plays_at ON music_plays(played_at);
+      ALTER TABLE users ADD COLUMN name_fx TEXT;
+    `);
+  },
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS.length;

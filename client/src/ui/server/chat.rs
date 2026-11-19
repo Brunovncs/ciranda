@@ -30,6 +30,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const GROUP_WINDOW_MS: i64 = 5 * 60 * 1000;
+/// The longest message the box takes; a longer paste is sent as a text file.
+const MAX_MESSAGE: usize = 4000;
 /// How long after it came in a message still rises into place when drawn: past its own animation,
 /// so a first draw a little late still plays it whole.
 const ARRIVE_FOR: Duration = Duration::from_secs(1);
@@ -145,6 +147,8 @@ pub struct ChatView {
     sel: Selection,
     /// Scrolls the messages while a selection is dragged past the top or bottom of the list.
     drag_scroll: Option<Task<()>>,
+    /// Who else is writing here, under the box.
+    typing_line: Entity<TypingLine>,
     focus: FocusHandle,
     _subs: Vec<Subscription>,
 }
@@ -160,7 +164,7 @@ impl EventEmitter<ChatEvent> for ChatView {}
 impl ChatView {
     pub fn new(session: Entity<Session>, room: Room, window: &mut Window, cx: &mut Context<Self>) -> ChatView {
         let composer = cx.new(|cx| {
-            TextField::new(cx, true, 4000).lines(1, 10).enter_submits().bare().placeholder(composer_hint(room, session.read(cx)))
+            TextField::new(cx, true, MAX_MESSAGE).lines(1, 10).enter_submits().bare().placeholder(composer_hint(room, session.read(cx)))
         });
         let search = cx.new(|cx| TextField::new(cx, false, 200).bare().placeholder(tr!("Search this channel", "Buscar neste canal")));
         let list = ListState::new(0, ListAlignment::Bottom, gpui::px(600.));
@@ -173,6 +177,11 @@ impl ChatView {
                     if !this.sel.is_empty() {
                         this.sel.clear();
                         cx.notify();
+                    }
+                    // Writing says so to the others here; emptying the box does not.
+                    if !this.composer.read(cx).is_blank() && this.mode.as_ref().is_none_or(|m| !matches!(m, Mode::Edit(_))) {
+                        let room = this.room;
+                        this.session.update(cx, |s, cx| s.typing_in(room, cx));
                     }
                     this.update_mention(cx)
                 }
@@ -202,6 +211,7 @@ impl ChatView {
             }
         });
         session.update(cx, |s, cx| s.open(room, cx));
+        let typing_line = cx.new(|cx| TypingLine::new(session.clone(), room, cx));
         let focus = cx.focus_handle();
         let mut v = ChatView {
             session,
@@ -234,6 +244,7 @@ impl ChatView {
             lang: crate::i18n::lang(),
             sel: Selection::new(cx.entity_id(), focus.clone()),
             drag_scroll: None,
+            typing_line,
             focus,
             _subs: subs,
         };
@@ -346,6 +357,8 @@ impl ChatView {
             return;
         }
         self.sending = true;
+        let room = self.room;
+        self.session.update(cx, |s, _| s.typing_done(room));
         let pending = self.pending.take();
         let answering = match self.mode.take() {
             Some(Mode::Reply(m)) => Some(m),
@@ -855,10 +868,17 @@ impl ChatView {
         if matches!(self.mode, Some(Mode::Edit(_))) || !self.composer.focus_handle(cx).is_focused(window) {
             return;
         }
-        if let Some(item) = cx.read_from_clipboard()
-            && !has_text(&item)
-            && self.attach_copied(&item, cx)
+        let Some(item) = cx.read_from_clipboard() else { return };
+        // Text longer than a message can hold goes as a file instead of being cut short.
+        if let Some(text) = item.text().filter(|t| t.chars().count() > MAX_MESSAGE)
+            && self.pending.is_none()
         {
+            let name = tr!("message.txt", "mensagem.txt").to_string();
+            self.set_pending(text.into_bytes(), "text/plain; charset=utf-8".into(), name, cx);
+            cx.stop_propagation();
+            return;
+        }
+        if !has_text(&item) && self.attach_copied(&item, cx) {
             cx.stop_propagation();
         }
     }
@@ -1563,6 +1583,7 @@ impl ChatView {
         let for_me = (m.mentions.contains(&me.id) || m.mentions_everyone) && !mine;
         let flashing = self.flash.is_some_and(|(id, _)| id == m.id);
         let name = self.session.read(cx).display_name(m.user_id, m.nickname.as_deref());
+        let name_fx = m.user_id.and_then(|u| self.session.read(cx).users.get(&u)).and_then(|u| u.name_fx.clone());
         // Rank means nothing between two people.
         let role = m.user_id.and_then(|u| self.session.read(cx).users.get(&u)).map(|u| u.role).filter(|_| !private);
         let avatar_img = m.user_id.and_then(|u| self.session.update(cx, |s, cx| s.avatar(u, cx)));
@@ -1722,7 +1743,9 @@ impl ChatView {
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(t.text)
                                     .hover(|s| s.underline())
-                                    .child(name.clone()),
+                                    // Their name's effect, held still here: moving, it would draw
+                                    // the whole chat again every frame.
+                                    .child(crate::name_fx::name(("author-fx", m.id as u64), &name, name_fx.as_deref(), false, t.text, &t)),
                                 m.user_id,
                                 cx,
                             ),
@@ -2415,6 +2438,8 @@ impl ChatView {
             .px(px(16.))
             .pb(px(14.))
             .pt(px(4.))
+            // In the room under the box, so it never moves the box.
+            .child(div().absolute().left(px(22.)).bottom(px(0.)).h(px(14.)).flex().items_center().child(self.typing_line.clone()))
             .when(self.mention.is_some() && !mention_list.is_empty(), |d| {
                 let mut menu = div()
                     .absolute()
@@ -3135,6 +3160,60 @@ impl Render for Lightbox {
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(Dismiss))),
                     ),
             )
+    }
+}
+
+/// "Ana is typing…" under the message box: a view of its own, so the dots moving draw it alone and
+/// not the chat. It draws again whenever the session changes, and when a writer lapses.
+pub struct TypingLine {
+    session: Entity<Session>,
+    room: Room,
+    _sub: Subscription,
+}
+
+impl TypingLine {
+    fn new(session: Entity<Session>, room: Room, cx: &mut Context<Self>) -> TypingLine {
+        let sub = cx.observe(&session, |_, _, cx| cx.notify());
+        TypingLine { session, room, _sub: sub }
+    }
+}
+
+impl Render for TypingLine {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = current();
+        let s = self.session.read(cx);
+        let names: Vec<String> = s.writers(self.room).into_iter().map(|u| s.display_name(Some(u), None)).collect();
+        let text = match names.as_slice() {
+            [] => return div().into_any_element(),
+            [a] => trf!("{} is typing…", "{} está digitando…", a),
+            [a, b] => trf!("{} and {} are typing…", "{} e {} estão digitando…", a, b),
+            [a, b, c] => trf!("{}, {} and {} are typing…", "{}, {} e {} estão digitando…", a, b, c),
+            _ => tr!("Several people are typing…", "Várias pessoas estão digitando…").to_string(),
+        };
+        let dot = t.text2;
+        div()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .child(
+                // Three dots rising one after another.
+                div().flex().items_center().gap(px(2.5)).h(px(10.)).with_animation(
+                    "typing-dots",
+                    Animation::new(Duration::from_millis(1100)).repeat().with_max_fps(30.),
+                    move |d, p| {
+                        d.children((0..3).map(|i| {
+                            let x = (p - i as f32 * 0.16).rem_euclid(1.);
+                            let lift = if x < 0.4 { (std::f32::consts::PI * x / 0.4).sin() } else { 0. };
+                            div().size(px(4.)).rounded_full().bg(dot.opacity(0.45 + 0.55 * lift)).relative().top(px(-2.5 * lift))
+                        }))
+                    },
+                ),
+            )
+            .child(div().text_size(px(11.5)).text_color(t.text2).child(text))
+            .with_animation("typing-in", Animation::new(Duration::from_millis(160)).with_easing(gpui::ease_out_quint()), |d, p| {
+                d.opacity(p)
+            })
+            .into_any_element()
     }
 }
 

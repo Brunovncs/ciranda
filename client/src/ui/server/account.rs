@@ -57,6 +57,11 @@ impl ServerView {
         self.session.update(cx, |s, cx| s.call(cx, move |api| Box::pin(async move { api.set_display_name(&name).await }), set_me));
     }
 
+    /// Your name's effect, or `None` for a plain name.
+    pub fn set_name_fx(&mut self, fx: Option<&'static str>, cx: &mut Context<Self>) {
+        self.session.update(cx, |s, cx| s.call(cx, move |api| Box::pin(async move { api.set_name_fx(fx).await }), set_me));
+    }
+
     /// Resolves to what went wrong, or `None` once the password is changed. The server ends every
     /// sign-in of the account, so this one carries on with the new token it hands back.
     pub fn change_password(&mut self, current: String, password: String, cx: &mut Context<Self>) -> Task<Option<String>> {

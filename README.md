@@ -52,6 +52,15 @@ recovery key brings your history to another computer.
   and one settings page to run the server.
 - **Global hotkeys** for mute, deafen and soundboard sounds, working while a game
   has focus.
+- **Playing now**: the game you have open shows beside your name ("Playing
+  VALORANT"), found among the programs running (known games, and anything in a
+  Steam, Epic, Riot, Xbox or GOG library). Only its name leaves your computer,
+  and it can be turned off.
+- **Animated names**: rainbow, aurora, fire, ocean, gold or candy, moving in the
+  member list, in voice and on your card.
+- **Year in review**: in December, a few slides of what your server did together
+  that year (the chat, the hours in voice, the games, the songs, and your own).
+- **Typing indicators**, and a paste too long for a message sent as a text file.
 - **Several servers** on a rail on the left, one click apart.
 - **Automatic updates**, checked against the published SHA-256 and applied after
   your call ends.

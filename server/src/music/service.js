@@ -32,6 +32,8 @@ const clean = (value, max) => String(value ?? '').replace(/[\p{Cc}\p{Cf}]/gu, ' 
 export class Music {
   #library;
   #push;
+  /** Told of every track that starts playing, for the journal. */
+  #onPlay;
   #notifyError;
   #spotify;
   #now;
@@ -49,10 +51,11 @@ export class Music {
    */
   constructor({
     library, push, spotify = null, now = Date.now, setTimer = setTimeout, clearTimer = clearTimeout,
-    maxQueue = 200, random = Math.random,
+    maxQueue = 200, random = Math.random, onPlay = () => {},
   }) {
     this.#library = library;
     this.#push = push;
+    this.#onPlay = onPlay;
     this.#spotify = spotify;
     this.#now = now;
     this.#setTimer = setTimer;
@@ -282,7 +285,14 @@ export class Music {
       if (got.title && !track.title) track.title = clean(got.title, 200);
       if (got.artist && !track.artist) track.artist = clean(got.artist, 120);
       if (got.thumbHash && !track.thumbHash) track.thumbHash = got.thumbHash;
-      if (wasLoading) this.#arm(channelId);
+      if (wasLoading) {
+        this.#arm(channelId);
+        try {
+          this.#onPlay(channelId, track);
+        } catch (err) {
+          console.warn(`[music] journal: ${err.message}`);
+        }
+      }
       this.#send(channelId);
     } catch (err) {
       const live = this.#rooms.get(channelId);

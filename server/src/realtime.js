@@ -45,6 +45,8 @@ export const POLL_REACH_MS = 40_000;
 const PRIVATE_TYPES = new Set([
   'call:start', 'call:answer', 'call:hang-up', 'call:join',
   'voice:leave', 'voice:mute', 'voice:publishing', 'voice:refresh', 'ink',
+  // Typing in a private conversation kept in the background; a channel is refused below.
+  'typing',
 ]);
 
 /** The most ink messages one person may send in a second: a stroke goes out in ~25 a second. */
@@ -52,6 +54,23 @@ export const INK_PER_SECOND = 60;
 /** Coordinates are in ten-thousandths of the shared picture, so a stroke fits in small integers. */
 const INK_SCALE = 10_000;
 const INK_MAX_POINTS = 512;
+
+/** The longest game name kept: long enough for "Baldur's Gate 3: Definitive Edition". */
+const MAX_ACTIVITY = 64;
+
+/**
+ * A game's name as a client said it: trimmed, or null for nothing, or
+ * undefined when it can't be one (not text, too long, or with control
+ * characters that could hide or reorder what everybody else reads).
+ */
+export function cleanActivity(raw) {
+  if (raw == null) return null;
+  if (typeof raw !== 'string') return undefined;
+  const name = raw.trim();
+  if (name === '') return null;
+  if ([...name].length > MAX_ACTIVITY || /\p{C}/u.test(name)) return undefined;
+  return name;
+}
 
 export class Realtime {
   #wss;
@@ -71,6 +90,18 @@ export class Realtime {
   #owedRosters = new Set();
   /** Ink sent per person in the current second: { at, count }. */
   #inkRate = new Map();
+  /** A game opening and closing is a few changes a minute at most; this keeps a script from more. */
+  #activityThrottle = new Throttle({ burst: 6, perSecond: 1 / 10 });
+  /** A client says it is typing every few seconds while it is; more than this is not typing. */
+  #typingThrottle = new Throttle({ burst: 10, perSecond: 1 });
+  /**
+   * What each person online is playing, by user id: {name, since}. Said by their client, which
+   * looks at the games running on the computer (and can be told not to). Live state like
+   * presence: it goes when their last socket does, and a restart forgets it until they say it
+   * again.
+   * @type {Map<number, {name: string, since: number}>}
+   */
+  #activities = new Map();
   /**
    * `scope` is `full` for the server on screen, or `private` for one a client
    * keeps in the background: that one hears only what is sent to its user
@@ -196,6 +227,7 @@ export class Realtime {
       for (const { channelId } of this.#deps.voice.leaveAll(id)) {
         this.broadcastRoster(channelId);
       }
+      this.#setActivity(id, null);
       // After leaveAll, so a client redrawing on this gets a roster that has
       // already lost them rather than one that still has them in a channel.
       this.broadcastPresence();
@@ -338,6 +370,7 @@ export class Realtime {
         // join or leave one.
         rosters: this.#deps.voice.allRosters(),
         online: this.onlineUserIds(),
+        activities: this.#activityList(),
         voiceCap: VOICE_HARD_CAP,
         calls,
       });
@@ -380,9 +413,64 @@ export class Realtime {
       'music:sync': this.#musicSync,
       'music:clock': this.#musicClock,
       ink: this.#ink,
+      'presence:activity': this.#presenceActivity,
+      typing: this.#typing,
       'admin:force-mute': this.#adminForceMute,
       'admin:move': this.#adminMove,
     };
+  }
+
+  // ------------------------------------------------------------- what people play
+
+  /** `{name}`: what they are playing now, or null (or no name) when nothing. */
+  async #presenceActivity(user, msg) {
+    if (!this.#activityThrottle.take(String(user.id)).allowed) return { type: 'activity:error', error: 'slow_down' };
+    const name = cleanActivity(msg.name);
+    if (name === undefined) return { type: 'activity:error', error: 'bad_name' };
+    this.#setActivity(user.id, name);
+    return { type: 'activity:ok' };
+  }
+
+  #setActivity(userId, name) {
+    const was = this.#activities.get(userId);
+    if ((was?.name ?? null) === name) return;
+    if (name) this.#activities.set(userId, { name, since: Date.now() });
+    else this.#activities.delete(userId);
+    this.#deps.journal?.activity(userId, name);
+    const now = this.#activities.get(userId);
+    this.broadcast({ type: 'activity', userId, name, since: now?.since ?? null });
+  }
+
+  #activityList() {
+    return [...this.#activities].map(([userId, a]) => ({ userId, name: a.name, since: a.since }));
+  }
+
+  // ------------------------------------------------------------- typing
+
+  /**
+   * `{channelId}` or `{conversationId}`: they are writing there. Passed on to whoever may read
+   * it, and nothing kept: the client shows it for a few seconds after the last one, so a
+   * client that goes away just stops being shown. No reply, and nothing said on a refusal.
+   */
+  async #typing(user, msg, ws) {
+    if (!this.#typingThrottle.take(String(user.id)).allowed) return null;
+    if (msg.channelId != null) {
+      if (this.#clients.get(ws)?.scope === 'private') return null;
+      const channel = this.#deps.channels.get(Number(msg.channelId));
+      if (!channel || channel.kind !== 'text') return null;
+      const reads = (id) => !channel.password_hash || this.#deps.channels.hasGrant(channel.id, id);
+      if (!reads(user.id)) return null;
+      this.broadcastWhere({ type: 'typing', channelId: channel.id, userId: user.id }, (u) => u.id !== user.id && reads(u.id));
+    } else if (msg.conversationId != null) {
+      const conversation = this.#deps.dms.get(Number(msg.conversationId));
+      if (!conversation) return null;
+      const members = DirectMessages.members(conversation);
+      if (!members.includes(user.id)) return null;
+      for (const id of members) {
+        if (id !== user.id) this.toUser(id, { type: 'typing', conversationId: conversation.id, userId: user.id });
+      }
+    }
+    return null;
   }
 
   // ------------------------------------------------------------- voice

@@ -136,14 +136,15 @@ export class Accounts {
       setRole: db.prepare('UPDATE users SET role = ? WHERE id = ?'),
       setDisplayName: db.prepare('UPDATE users SET display_name = ? WHERE id = ?'),
       setAvatar: db.prepare('UPDATE users SET avatar_hash = ? WHERE id = ?'),
+      setNameFx: db.prepare('UPDATE users SET name_fx = ? WHERE id = ?'),
       // Not the banned: to everybody else on the server they are gone, as if
       // removed, though their row stays to keep the name taken.
       list: db.prepare(
-        'SELECT id, nickname, display_name, role, avatar_hash, created_at '
+        'SELECT id, nickname, display_name, role, avatar_hash, name_fx, created_at '
         + 'FROM users WHERE banned_at IS NULL ORDER BY nickname',
       ),
       listAll: db.prepare(
-        'SELECT id, nickname, display_name, role, avatar_hash, created_at, banned_at '
+        'SELECT id, nickname, display_name, role, avatar_hash, name_fx, created_at, banned_at '
         + 'FROM users ORDER BY nickname',
       ),
       countBanned: db.prepare('SELECT COUNT(*) AS n FROM users WHERE banned_at IS NOT NULL'),
@@ -160,7 +161,7 @@ export class Accounts {
       // client.user for the whole life of a socket, and the password hash has
       // no business sitting in either. Whatever needs it asks byId().
       findSession: db.prepare(
-        'SELECT u.id, u.nickname, u.display_name, u.role, u.avatar_hash, u.created_at, u.banned_at, '
+        'SELECT u.id, u.nickname, u.display_name, u.role, u.avatar_hash, u.name_fx, u.created_at, u.banned_at, '
         + 's.token_hash, s.last_seen AS session_seen FROM sessions s JOIN users u ON u.id = s.user_id '
         + 'WHERE s.token_hash = ? AND u.banned_at IS NULL',
       ),
@@ -208,6 +209,9 @@ export class Accounts {
       // people are using; only the credit for them goes.
       disownClips: db.prepare('UPDATE soundpad_clips SET uploaded_by = NULL WHERE uploaded_by = ?'),
       disownEmojis: db.prepare('UPDATE emojis SET uploaded_by = NULL WHERE uploaded_by = ?'),
+      // The journal names them; the server's totals lose their share with them.
+      dropVoiceSessions: db.prepare('DELETE FROM voice_sessions WHERE user_id = ?'),
+      dropActivitySessions: db.prepare('DELETE FROM activity_sessions WHERE user_id = ?'),
       dropUser: db.prepare('DELETE FROM users WHERE id = ?'),
     };
   }
@@ -488,6 +492,8 @@ export class Accounts {
       if (user.avatar_hash) this.#q.releaseAvatar.run(user.avatar_hash);
       this.#q.disownClips.run(userId);
       this.#q.disownEmojis.run(userId);
+      this.#q.dropVoiceSessions.run(userId);
+      this.#q.dropActivitySessions.run(userId);
       this.#q.dropUser.run(userId);
       this.#db.exec('COMMIT');
     } catch (err) {
@@ -497,6 +503,15 @@ export class Accounts {
     return { ok: true, user, messages };
   }
 
+  /** Set, or clear with null, the effect on somebody's name. Only the ones in NAME_FX. */
+  setNameFx(userId, fx) {
+    const user = this.#q.byId.get(Number(userId));
+    if (!user) return { ok: false, error: 'no_such_user' };
+    if (fx != null && !NAME_FX.includes(fx)) return { ok: false, error: 'bad_name_fx' };
+    this.#q.setNameFx.run(fx ?? null, user.id);
+    return { ok: true, user: this.#q.byId.get(user.id) };
+  }
+
   setAvatar(userId, hash) {
     const user = this.#q.byId.get(userId);
     if (!user) return { ok: false, error: 'no_such_user' };
@@ -504,6 +519,13 @@ export class Accounts {
     return { ok: true, previous: user.avatar_hash ?? null, user: this.#q.byId.get(userId) };
   }
 }
+
+/**
+ * The effects a name can wear. The client draws them; the server only keeps
+ * the choice and refuses one it has never heard of, so an old client shows a
+ * new one as a plain name.
+ */
+export const NAME_FX = ['rainbow', 'aurora', 'fire', 'ocean', 'gold', 'candy'];
 
 /** Shape a user row for the wire. Never leaks password_hash. */
 export const publicUser = (u) => (u ? {
@@ -515,6 +537,8 @@ export const publicUser = (u) => (u ? {
   customName: Boolean(u.display_name),
   role: u.role,
   avatarHash: u.avatar_hash ?? null,
+  // An effect on their name, one of NAME_FX, or null for a plain one.
+  nameFx: u.name_fx ?? null,
   createdAt: u.created_at,
 } : null);
 

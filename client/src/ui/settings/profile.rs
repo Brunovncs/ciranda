@@ -533,10 +533,66 @@ impl Settings {
             .flex_col()
             .gap(px(18.))
             .child(header)
+            .when(self.session.read(cx).supports("name-fx"), |d| {
+                d.child(group(tr!("Your name's effect", "Efeito do seu nome"), self.name_fx_picker(&me, t, cx), t))
+            })
             .child(tiles)
             .child(group(tr!("This computer", "Este computador"), devices, t))
             .child(group(tr!("What you can do here", "O que você pode fazer aqui"), can, t))
             .child(group(tr!("Account", "Conta"), div().flex().flex_col().gap(px(10.)).child(password).child(sign_out), t))
+            .into_any_element()
+    }
+
+    /// Plain and every effect, each as your own name wearing it; a click picks it for everyone.
+    fn name_fx_picker(&mut self, me: &crate::core::types::User, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let picked = me.name_fx.clone();
+        let choices = std::iter::once((None, tr!("Plain", "Simples"))).chain(crate::name_fx::all().into_iter().map(|(k, l)| (Some(k), l)));
+        let mut grid = div().flex().flex_wrap().gap(px(8.));
+        for (i, (fx, title)) in choices.enumerate() {
+            let on = picked.as_deref() == fx;
+            let (ring, hover) = (t.accent_text, t.layer_hover);
+            grid = grid.child(
+                keyboardable(div().id(("name-fx", i)), move |s| s.border_color(ring))
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .w(px(146.))
+                    .px(px(12.))
+                    .py(px(10.))
+                    .rounded(px(radius::CONTROL))
+                    .border_1()
+                    .border_color(if on { t.accent } else { t.stroke })
+                    .bg(if on { t.accent_soft } else { t.layer })
+                    .cursor_pointer()
+                    .when(!on, |d| d.hover(move |s| s.bg(hover)))
+                    .child(div().truncate().text_size(px(15.)).font_weight(FontWeight::SEMIBOLD).child(crate::name_fx::name(
+                        ("name-fx-preview", i),
+                        me.name(),
+                        fx,
+                        true,
+                        t.text,
+                        t,
+                    )))
+                    .child(div().text_size(px(11.5)).text_color(if on { t.accent_text } else { t.text3 }).child(title))
+                    .on_click(cx.listener(move |s, _, _, cx| {
+                        if let Some(server) = s.server.upgrade() {
+                            server.update(cx, |v, cx| v.set_name_fx(fx, cx));
+                        }
+                    })),
+            );
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .child(grid)
+            .child(caption(
+                tr!(
+                    "Everyone on this server sees it, moving in the member list, in voice and on your card.",
+                    "Todos neste servidor veem, em movimento na lista de membros, na voz e no seu cartão."
+                ),
+                t.text3,
+            ))
             .into_any_element()
     }
 

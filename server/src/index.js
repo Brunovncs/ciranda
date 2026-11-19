@@ -15,6 +15,8 @@ import { Throttle } from './throttle.js';
 import { MediaMtxMonitor } from './mediamtx-api.js';
 import { Rooms, normalizeUsername, normalizePath } from './rooms.js';
 import { ensureDataDir, openDatabase, meta } from './db.js';
+import { Journal } from './journal.js';
+import { yearInReview } from './retro.js';
 import { ServerSettings } from './server-settings.js';
 import {
   Accounts, claimOwner, ensureOwnerToken, normalizeNickname, publicUser, sessionHash,
@@ -85,6 +87,8 @@ const accounts = new Accounts(db);
 ensureOwnerToken(accounts, metaStore);
 
 const channels = new Channels(db);
+// Hours in voice, games played and songs, for the year in review.
+const journal = new Journal(db);
 /*
  * A locked channel silences everyone but the owner. Admins included: the
  * lock is the owner's stage, and an admin who needs to speak can ask for it
@@ -94,6 +98,8 @@ const channels = new Channels(db);
 const voice = new VoiceRooms({
   micLocked: (channelId, userId) => Boolean(channels.get(channelId)?.mic_locked)
     && accounts.byId(userId)?.role !== 'owner',
+  onJoin: (channelId, userId) => journal.voiceJoined(channelId, userId),
+  onLeave: (channelId, userId) => journal.voiceLeft(channelId, userId),
 });
 const mediaSecret = channelSecret(metaStore);
 const chat = new Chat(db, {
@@ -155,9 +161,12 @@ const music = new Music({
   library: musicLibrary,
   spotify,
   push: (channelId, payload) => realtime?.toChannel(channelId, payload),
+  onPlay: (channelId, track) => journal.played(channelId, track),
   maxQueue: config.musicQueueMax,
 });
 const musicResolveThrottle = new Throttle({ burst: 12, perSecond: 0.5 });
+// The year in review reads every message of the year: cheap on a friends' server, not for free.
+const retroThrottle = new Throttle({ burst: 6, perSecond: 1 / 10 });
 ytdlp.version().then((version) => {
   if (version) console.log(`[harmony] yt-dlp ${version}: Cirandinha ${serverSettings.musicEnabled ? 'is on' : 'is available (off)'}`);
   else console.log(`[harmony] Cirandinha is not available: yt-dlp could not be run (${ytdlp.why || 'no answer'})`);
@@ -401,7 +410,9 @@ app.get('/api/health', (req, res) => {
     // `inbox`: GET /api/inbox and `scope: 'private'` sockets, so a client can
     // keep this server's private messages in the background cheaply.
     // `mentions`: a `private` socket also hears the mentions that call you.
-    features: ['inbox', 'replies', 'edit-history', 'ink', 'dm-clear', 'mentions'],
+    // `activity`: `presence:activity` and the `activity` broadcast (what people play).
+    // `name-fx`: POST /api/accounts/name-fx. `retro`: GET /api/retro/:year.
+    features: ['inbox', 'replies', 'edit-history', 'ink', 'dm-clear', 'mentions', 'activity', 'name-fx', 'retro', 'typing'],
     ...(authed
       ? {
           name: serverSettings.name,
@@ -724,6 +735,28 @@ app.post('/api/accounts/display-name', requireLogin, (req, res) => {
     };
     return res.status(400).json({ error: result.error, message: messages[result.error] });
   }
+  const user = publicUser(result.user);
+  realtime?.broadcast({ type: 'user:updated', user });
+  return res.json({ user });
+});
+
+/**
+ * The year in review (retro.js): the server's year and the asker's own. `tz` is the asker's
+ * offset from UTC in minutes (what their clock is ahead), so days and hours are theirs.
+ */
+app.get('/api/retro/:year', requireLogin, (req, res) => {
+  const year = Number(req.params.year);
+  const tzMinutes = Number(req.query.tz ?? 0);
+  if (!Number.isInteger(year) || year < 2000 || year > 3000) return res.status(400).json({ error: 'bad_year' });
+  if (!Number.isFinite(tzMinutes) || Math.abs(tzMinutes) > 14 * 60) return res.status(400).json({ error: 'bad_tz' });
+  if (!retroThrottle.take(String(req.user.id)).allowed) return res.status(429).json({ error: 'slow_down' });
+  return res.json(yearInReview(db, { year, tzMinutes: Math.round(tzMinutes), userId: req.user.id }));
+});
+
+/** Your own name's effect: one of NAME_FX, or null for a plain name. */
+app.post('/api/accounts/name-fx', requireLogin, (req, res) => {
+  const result = accounts.setNameFx(req.user.id, req.body?.nameFx ?? null);
+  if (!result.ok) return res.status(400).json({ error: result.error, message: 'No such name effect.' });
   const user = publicUser(result.user);
   realtime?.broadcast({ type: 'user:updated', user });
   return res.json({ user });
@@ -2321,6 +2354,7 @@ realtime = new Realtime({
   calls,
   issueTokens,
   issueCallTokens,
+  journal,
   kickMember: (channelId, mid) => monitor.kickPath(channelPath(channelId, mid, 'voice')),
 });
 
@@ -2374,6 +2408,11 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
     calls.close();
     music.stopAll();
     realtime?.close();
+    try {
+      journal.closeAll();
+    } catch (err) {
+      console.warn(`[harmony] closing the journal: ${err.message}`);
+    }
     clearInterval(sessionSweeper);
     // server.close() only stops new connections and waits for the open ones,
     // and a client keeps one alive between polls for as long as it likes, so

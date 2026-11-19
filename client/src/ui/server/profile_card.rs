@@ -53,6 +53,9 @@ struct Facts {
     online: bool,
     voice: Option<String>,
     blocked: bool,
+    name_fx: Option<String>,
+    /// The game they are playing, and since when (ms).
+    playing: Option<(String, i64)>,
 }
 
 impl ProfileCard {
@@ -81,6 +84,8 @@ impl ProfileCard {
             online: me || s.online.contains(&self.user),
             voice,
             blocked: s.blocked.contains(&self.user),
+            name_fx: user.and_then(|u| u.name_fx.clone()),
+            playing: s.activity(self.user).map(|(g, since)| (g.to_string(), since)),
         }
     }
 
@@ -186,7 +191,14 @@ impl gpui::Render for ProfileCard {
                     .flex()
                     .items_center()
                     .gap(px(6.))
-                    .child(div().truncate().text_size(px(18.)).font_weight(FontWeight::SEMIBOLD).text_color(t.text).child(f.name.clone()))
+                    .child(div().truncate().text_size(px(18.)).font_weight(FontWeight::SEMIBOLD).child(crate::name_fx::name(
+                        "profile-name",
+                        &f.name,
+                        f.name_fx.as_deref(),
+                        true,
+                        t.text,
+                        &t,
+                    )))
                     .when_some(rank, |d, (glyph, text, color)| {
                         d.child(div().id("profile-rank").child(icon(glyph, 15., color)).tooltip(tip(text, &t)))
                     }),
@@ -202,6 +214,9 @@ impl gpui::Render for ProfileCard {
             .rounded(px(radius::CONTROL + 2.))
             .bg(t.layer)
             .child(Self::fact(if f.voice.is_some() { "headphones" } else { "radio" }, tr!("Now", "Agora"), presence, None, &t))
+            .when_some(f.playing.clone(), |d, (game, since)| {
+                d.child(Self::fact("gamepad", tr!("Playing", "Jogando"), game, played_for(since), &t))
+            })
             .when_some(f.joined.clone(), |d, (date, ago)| {
                 d.child(Self::fact("clock", tr!("Member since", "Membro desde"), date, Some(ago), &t))
             })
@@ -280,6 +295,18 @@ impl gpui::Render for ProfileCard {
             .child(facts)
             .child(div().p(px(12.)).child(actions))
     }
+}
+
+/// How long a game has been going, from when it started (ms since the epoch, the server's clock).
+fn played_for(since: i64) -> Option<String> {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as i64;
+    let minutes = (now - since).max(0) / 60_000;
+    Some(match minutes {
+        _ if since <= 0 => return None,
+        0 => tr!("Just started", "Começou agora").to_string(),
+        m if m < 60 => trf!("For {} min", "Há {} min", m),
+        m => trf!("For {} h {} min", "Há {} h {} min", m / 60, m % 60),
+    })
 }
 
 /// A person's picture as large as it was uploaded, which is larger than anywhere else it shows.

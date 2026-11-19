@@ -144,6 +144,7 @@ impl ServerView {
     fn member_row(&mut self, u: &User, online: bool, in_voice: bool, t: &Theme, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let me = self.session.read(cx).me.clone();
         let img = self.session.update(cx, |s, cx| s.avatar(u.id, cx));
+        let playing = self.session.read(cx).activity(u.id).map(|(name, _)| name.to_string());
         let user = u.clone();
         let hover = t.layer_hover;
         // Tab reaches it, and Enter shows the card a click does.
@@ -175,9 +176,25 @@ impl ServerView {
                     .flex_col()
                     .flex_1()
                     .min_w(px(0.))
-                    .child(div().truncate().text_size(px(13.5)).text_color(t.text).child(u.name().to_string()))
-                    .when(u.custom_name, |d| {
-                        d.child(div().truncate().text_size(px(11.)).text_color(t.text3).child(format!("@{}", u.nickname)))
+                    .child(div().truncate().text_size(px(13.5)).child(crate::name_fx::name(
+                        ("member-name", u.id as u64),
+                        u.name(),
+                        u.name_fx.as_deref(),
+                        online,
+                        t.text,
+                        t,
+                    )))
+                    // What they play says more than their username, which their card has anyway.
+                    .map(|d| match playing {
+                        Some(game) => {
+                            d.child(div().flex().items_center().gap(px(4.)).min_w(px(0.)).child(icon("gamepad", 11., t.success)).child(
+                                div().truncate().text_size(px(11.)).text_color(t.text2).child(trf!("Playing {}", "Jogando {}", game)),
+                            ))
+                        }
+                        None if u.custom_name => {
+                            d.child(div().truncate().text_size(px(11.)).text_color(t.text3).child(format!("@{}", u.nickname)))
+                        }
+                        None => d,
                     }),
             )
             .when(u.role == Role::Owner, |d| d.child(icon("crown", 13., t.caution)))

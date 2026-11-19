@@ -449,6 +449,8 @@ impl ServerView {
         let me = self.session.read(cx).me.id == m.user_id;
         let admin = self.session.read(cx).me.role.is_admin();
         let name = self.session.read(cx).display_name(Some(m.user_id), Some(&m.nickname));
+        let name_fx = self.session.read(cx).users.get(&m.user_id).and_then(|u| u.name_fx.clone());
+        let playing = self.session.read(cx).activity(m.user_id).map(|(g, _)| g.to_string());
         let avatar_img = self.session.update(cx, |s, cx| s.avatar(m.user_id, cx));
         let hover = t.layer_hover;
         let user = m.user_id;
@@ -464,9 +466,22 @@ impl ServerView {
             .rounded(px(radius::INNER))
             .hover(move |s| s.bg(hover))
             .child(avatar(&name, avatar_img, 20., speaking.then_some(t.success)))
-            .child(
-                div().flex_1().min_w(px(0.)).truncate().text_size(px(13.)).text_color(if speaking { t.text } else { t.text2 }).child(name),
-            )
+            .child(div().flex_1().min_w(px(0.)).truncate().text_size(px(13.)).child(crate::name_fx::name(
+                ("voice-name", (channel as u64) << 20 | m.user_id as u64),
+                &name,
+                name_fx.as_deref(),
+                true,
+                if speaking { t.text } else { t.text2 },
+                t,
+            )))
+            .when_some(playing, |d, game| {
+                d.child(
+                    div()
+                        .id(("voice-playing", m.user_id as u64))
+                        .child(icon("gamepad", 13., t.success))
+                        .tooltip(tip(trf!("Playing {}", "Jogando {}", game), t)),
+                )
+            })
             .when(m.publishes("s"), |d| d.child(live_chip(t, false)))
             .when(m.publishes("c"), |d| d.child(icon("camera", 13., t.text3)))
             .when(m.muted || m.silenced(), |d| d.child(icon("mic-off", 13., if m.force_muted { t.critical } else { t.text3 })))

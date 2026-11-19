@@ -531,8 +531,18 @@ export class VoiceRooms {
    * either onto the slot at join would leave a member speaking in a room that
    * was locked after they walked in.
    */
-  constructor({ micLocked = () => false } = {}) {
+  #onJoin;
+  #onLeave;
+
+  /**
+   * `onJoin(channelId, userId)` and `onLeave(channelId, userId)` hear every
+   * arrival and departure, whatever caused it (a socket closing, a move, a
+   * channel deleted): the journal's hours come from them.
+   */
+  constructor({ micLocked = () => false, onJoin = () => {}, onLeave = () => {} } = {}) {
     this.#micLocked = micLocked;
+    this.#onJoin = onJoin;
+    this.#onLeave = onLeave;
   }
 
   #room(channelId) {
@@ -582,6 +592,7 @@ export class VoiceRooms {
       publishing: new Set(),
     };
     room.set(mid, member);
+    this.#onJoin(channelId, user.id);
     return { ok: true, mid, member, rejoined: false };
   }
 
@@ -592,6 +603,7 @@ export class VoiceRooms {
       if (member.userId === userId) {
         room.delete(mid);
         if (room.size === 0) this.#rooms.delete(channelId);
+        this.#onLeave(channelId, userId);
         return mid;
       }
     }
@@ -604,7 +616,9 @@ export class VoiceRooms {
     this.#rooms.delete(channelId);
     // A new channel can be given the same id, and must not inherit its mutes.
     this.#forceMuted.delete(channelId);
-    return room ? [...room.entries()].map(([mid, m]) => ({ mid, userId: m.userId })) : [];
+    const gone = room ? [...room.entries()].map(([mid, m]) => ({ mid, userId: m.userId })) : [];
+    for (const { userId } of gone) this.#onLeave(channelId, userId);
+    return gone;
   }
 
   /** Drop a user from every channel. Called when their socket closes. */

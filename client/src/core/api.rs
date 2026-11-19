@@ -297,6 +297,16 @@ impl Api {
         Ok(self.post::<UserReply>("/api/accounts/display-name", json!({ "displayName": name })).await?.user)
     }
 
+    /// Your name's effect (`crate::name_fx`), or `None` for a plain name.
+    pub async fn set_name_fx(&self, fx: Option<&str>) -> Result<User> {
+        Ok(self.post::<UserReply>("/api/accounts/name-fx", json!({ "nameFx": fx })).await?.user)
+    }
+
+    /// The year in review (`GET /api/retro/:year`), counted in this computer's time zone.
+    pub async fn retro(&self, year: i32, tz_minutes: i32) -> Result<serde_json::Value> {
+        self.get(&format!("/api/retro/{year}?tz={tz_minutes}")).await
+    }
+
     /// Every session of the account ends, this one included; the reply is this one's new token.
     pub async fn change_password(&self, current: &str, password: &str) -> Result<String> {
         #[derive(serde::Deserialize)]

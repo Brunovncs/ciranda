@@ -8,6 +8,7 @@
 
 #[macro_use]
 mod i18n;
+mod activity;
 mod core;
 mod dm;
 mod elsewhere;
@@ -21,6 +22,7 @@ mod icons;
 mod markdown;
 mod media;
 mod motion;
+mod name_fx;
 mod news;
 mod prefs;
 mod session;
@@ -212,6 +214,7 @@ fn main() {
         prefs::init(cx);
         ui::updates::init(cx);
         ui::hotkeys::init(cx);
+        activity::start(cx);
 
         let options = WindowOptions {
             window_bounds: Some(first_bounds(cx)),

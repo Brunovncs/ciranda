@@ -65,6 +65,10 @@ pub enum Link {
 const KEEP_LOGS: usize = 6;
 /// The most messages a room keeps, and what it goes back down to (see `ChatLog::trim`): forty
 /// pages, then twenty. Far more than a screen, so only a room left open a long while gets there.
+/// How long someone shows as writing after they last said so.
+pub const TYPING_FOR: Duration = Duration::from_secs(6);
+/// How often you say you are writing while you are: well inside `TYPING_FOR`.
+const TYPING_EVERY: Duration = Duration::from_secs(3);
 const LOG_MOST: usize = 2000;
 const LOG_KEEP: usize = 1000;
 
@@ -403,7 +407,15 @@ pub struct Session {
     /// with the lists, and again when the server settings open.
     pub server_info: Option<ServerInfo>,
     pub users: HashMap<UserId, User>,
+    /// What this server can do beyond the basics (`/api/health`'s `features`), once asked.
+    pub features: HashSet<String>,
     pub online: HashSet<UserId>,
+    /// What the people online are playing, and since when (ms), as the server says.
+    pub activities: HashMap<UserId, (String, i64)>,
+    /// Who is writing where, and when they last said so: shown for `TYPING_FOR` after that.
+    pub typing: HashMap<Room, HashMap<UserId, Instant>>,
+    /// When you last told the server you were writing, by room (`TYPING_EVERY`).
+    typing_said: HashMap<Room, Instant>,
     pub channels: Vec<Channel>,
     pub groups: Vec<Group>,
     pub rosters: HashMap<ChannelId, Vec<Member>>,
@@ -570,6 +582,10 @@ impl Session {
             server_icon,
             server_info: None,
             online: HashSet::new(),
+            features: HashSet::new(),
+            activities: HashMap::new(),
+            typing: HashMap::new(),
+            typing_said: HashMap::new(),
             channels: Vec::new(),
             groups: Vec::new(),
             rosters: HashMap::new(),
@@ -752,9 +768,15 @@ impl Session {
         cx.spawn(async move |this, cx| {
             // The server's settings too: the largest file anybody may send is in them, and the
             // box checks a file against it before sending.
-            let (users, emojis, clips, channels, server) =
-                core::run(async move { tokio::join!(api.users(), api.emojis(), api.soundpad(), api.channels(), api.server()) }).await;
+            let (users, emojis, clips, channels, server, health) =
+                core::run(
+                    async move { tokio::join!(api.users(), api.emojis(), api.soundpad(), api.channels(), api.server(), api.health()) },
+                )
+                .await;
             let _ = this.update(cx, |s, cx| {
+                if let Ok(h) = health {
+                    s.features = h.features.into_iter().collect();
+                }
                 if let Ok(info) = server {
                     s.set_server_info(info, cx);
                 }
@@ -787,6 +809,7 @@ impl Session {
         self.channels = snap.channels;
         self.groups = snap.groups;
         self.online = snap.online.into_iter().collect();
+        self.activities = snap.activities.into_iter().map(|a| (a.user_id, (a.name, a.since))).collect();
         self.rosters = snap.rosters.into_iter().filter_map(|(k, v)| Some((k.parse().ok()?, v))).collect();
         self.call_rosters = snap.calls.iter().map(|c| (c.conversation_id, c.roster.clone())).collect();
         self.calls = snap.calls.into_iter().map(|c| (c.conversation_id, c)).collect();
@@ -833,6 +856,8 @@ impl Session {
                 }
                 self.link = Link::Up;
                 self.ever_up = true;
+                // The server forgets what you play when your socket goes: said again on each.
+                self.say_activity(cx);
                 self.calls_reconciled(calls_before, cx);
                 if was_down {
                     cx.emit(SessionEvent::Reconnected);
@@ -872,6 +897,40 @@ impl Session {
                     self.online = online.into_iter().collect();
                 }
             }
+            "activity" => {
+                let Some(user) = v.get("userId").and_then(Value::as_i64) else { return false };
+                match v.get("name").and_then(Value::as_str) {
+                    Some(name) => {
+                        let since = v.get("since").and_then(Value::as_i64).unwrap_or_default();
+                        self.activities.insert(user, (name.to_string(), since));
+                    }
+                    None => {
+                        self.activities.remove(&user);
+                    }
+                }
+            }
+            "typing" => {
+                let Some(user) = v.get("userId").and_then(Value::as_i64) else { return false };
+                let room = match (v.get("channelId").and_then(Value::as_i64), v.get("conversationId").and_then(Value::as_i64)) {
+                    (Some(id), _) => Room::Channel(id),
+                    (None, Some(id)) => Room::Dm(id),
+                    _ => return false,
+                };
+                if user == self.me.id {
+                    return false;
+                }
+                self.typing.entry(room).or_default().insert(user, Instant::now());
+                // Drawn again once it lapses, if nothing said it again meanwhile.
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(TYPING_FOR + Duration::from_millis(50)).await;
+                    let _ = this.update(cx, |s: &mut Session, cx| {
+                        if s.prune_typing() {
+                            cx.notify();
+                        }
+                    });
+                })
+                .detach();
+            }
             "channels" => {
                 if let Some(c) = list_of(parse("channels")) {
                     self.channels = c;
@@ -902,6 +961,10 @@ impl Session {
                     }
                     if let Some(log) = self.chats.get_mut(&room) {
                         log.push(LogOp::Added(m.clone()));
+                    }
+                    // Their message is what they were typing.
+                    if let (Some(by), Some(writers)) = (m.user_id, self.typing.get_mut(&room)) {
+                        writers.remove(&by);
                     }
                     cx.emit(SessionEvent::Message(room, Box::new(m)));
                 }
@@ -1416,6 +1479,88 @@ impl Session {
             });
         })
         .detach();
+    }
+
+    /// Sends something on the socket and forgets it: a hint that is worth nothing late or
+    /// refused (typing, what you play).
+    pub fn say(&self, kind: &'static str, payload: Value, cx: &mut Context<Self>) {
+        let reply = Session::request(self.realtime.clone(), kind, payload);
+        cx.background_executor()
+            .spawn(async move {
+                if let Err(e) = reply.await {
+                    log::debug!("{kind}: {e}");
+                }
+            })
+            .detach();
+    }
+
+    /// Whether this is a server you are on in full (the one on screen, or the one holding your
+    /// call), which is where people see what you do.
+    pub fn in_full(&self) -> bool {
+        !self.background && self.realtime.is_some()
+    }
+
+    /// Tells the server you are writing in `room`, at most every few seconds while you are.
+    pub fn typing_in(&mut self, room: Room, cx: &mut Context<Self>) {
+        if self.typing_said.get(&room).is_some_and(|at| at.elapsed() < TYPING_EVERY) {
+            return;
+        }
+        self.typing_said.insert(room, Instant::now());
+        let payload = match room {
+            Room::Channel(id) => serde_json::json!({ "channelId": id }),
+            Room::Dm(id) => serde_json::json!({ "conversationId": id }),
+        };
+        self.say("typing", payload, cx);
+    }
+
+    /// You sent what you were writing: the next key says so again at once.
+    pub fn typing_done(&mut self, room: Room) {
+        self.typing_said.remove(&room);
+    }
+
+    /// Who is writing in `room` now, the earliest first.
+    pub fn writers(&self, room: Room) -> Vec<UserId> {
+        let mut who: Vec<(UserId, Instant)> = self
+            .typing
+            .get(&room)
+            .map(|m| m.iter().filter(|(_, at)| at.elapsed() < TYPING_FOR).map(|(u, at)| (*u, *at)).collect())
+            .unwrap_or_default();
+        who.sort_by_key(|(_, at)| *at);
+        who.into_iter().map(|(u, _)| u).collect()
+    }
+
+    /// Lets go of writers not heard from lately; true when someone went.
+    fn prune_typing(&mut self) -> bool {
+        let mut gone = false;
+        for writers in self.typing.values_mut() {
+            let before = writers.len();
+            writers.retain(|_, at| at.elapsed() < TYPING_FOR);
+            gone |= writers.len() != before;
+        }
+        self.typing.retain(|_, w| !w.is_empty());
+        gone
+    }
+
+    /// Whether this server can do `feature` (see `features`).
+    pub fn supports(&self, feature: &str) -> bool {
+        self.features.contains(feature)
+    }
+
+    /// What someone online is playing, and since when (ms).
+    pub fn activity(&self, user: UserId) -> Option<(&str, i64)> {
+        if !self.online.contains(&user) {
+            return None;
+        }
+        self.activities.get(&user).map(|(n, s)| (n.as_str(), *s))
+    }
+
+    /// Says what you are playing now (`crate::activity`), or nothing when it is off.
+    pub fn say_activity(&self, cx: &mut Context<Self>) {
+        if !self.in_full() || self.link != Link::Up {
+            return;
+        }
+        let name = crate::activity::shared(cx);
+        self.say("presence:activity", serde_json::json!({ "name": name }), cx);
     }
 
     /// Sends a request on the socket right away (so requests go out in the order they are made)

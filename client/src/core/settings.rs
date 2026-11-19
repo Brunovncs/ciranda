@@ -121,6 +121,11 @@ pub struct Settings {
     pub replay_seconds: u32,
     /// Others watching your screen can draw on it, and you see their drawings over your screen.
     pub ink_enabled: bool,
+    /// The game you are playing shows beside your name ("Playing VALORANT"), found among the
+    /// programs running on this computer. On until turned off.
+    pub share_activity: bool,
+    /// The years whose review ("Retrospectiva") was already offered on opening, by server address.
+    pub retro_seen: BTreeMap<String, Vec<i32>>,
 }
 
 /// The window's place on the screens, in logical pixels: its size and position when not
@@ -670,6 +675,8 @@ impl Default for Settings {
             replay_enabled: true,
             replay_seconds: 30,
             ink_enabled: true,
+            share_activity: true,
+            retro_seen: BTreeMap::new(),
         }
     }
 }

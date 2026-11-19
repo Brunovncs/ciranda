@@ -902,6 +902,32 @@ impl Settings {
             .flex()
             .flex_col()
             .gap(px(14.))
+            .child(group(tr!("Playing now", "Jogando agora")))
+            .child(toggle_row(
+                "share-activity",
+                tr!("Show what I'm playing", "Mostrar o que estou jogando"),
+                tr!(
+                    "The game you have open shows beside your name, as \"Playing VALORANT\", found among the programs running on this computer. Only its name leaves the computer, and it also counts in your server's year in review.",
+                    "O jogo que você está jogando aparece ao lado do seu nome, como \"Jogando VALORANT\", achado entre os programas abertos neste computador. Só o nome dele sai do computador, e ele também entra na Retrospectiva do servidor."
+                ),
+                p.share_activity,
+                t,
+                cx,
+                |cx| {
+                    set_prefs(cx, |p| p.share_activity = !p.share_activity);
+                    crate::activity::announce(cx);
+                },
+            ))
+            .when_some(crate::activity::current(cx), |d, game| {
+                d.child(caption(
+                    if p.share_activity {
+                        trf!("Now: {}", "Agora: {}", game)
+                    } else {
+                        trf!("Now: {} (not shown)", "Agora: {} (não aparece)", game)
+                    },
+                    t.text3,
+                ))
+            })
             .child(group(tr!("Overlay", "Sobreposição")))
             .child(toggle_row(
                 "overlay",

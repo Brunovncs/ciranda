@@ -11,6 +11,7 @@ mod music;
 mod picker;
 pub mod private;
 mod profile_card;
+mod retro;
 pub mod rich;
 mod select;
 mod share;
@@ -1251,6 +1252,21 @@ impl ServerView {
             cx.notify();
             return;
         }
+        // Ctrl and = (or +), -, 0: the interface's size, as a browser's zoom, by tens.
+        if k.modifiers.secondary() && !k.modifiers.alt {
+            let to = match k.key.as_str() {
+                "=" | "+" => Some(prefs(cx).ui_scale.saturating_add(10).min(180)),
+                "-" => Some(prefs(cx).ui_scale.saturating_sub(10).max(70)),
+                "0" if !k.modifiers.shift => Some(100),
+                _ => None,
+            };
+            if let Some(to) = to {
+                set_prefs(cx, |p| p.ui_scale = to);
+                overlay::toast(trf!("Interface size: {}%", "Tamanho da interface: {}%", to), cx);
+                cx.stop_propagation();
+                return;
+            }
+        }
         if k.modifiers.secondary() && !k.modifiers.shift {
             match k.key.as_str() {
                 "," => self.open_settings(window, cx),
@@ -1293,6 +1309,7 @@ impl ServerView {
         let open = !up || self.link_hover;
         let text2 = t.text2;
         let server_name = s.server_name.clone();
+        let retro_year = retro::season().filter(|_| !self.dms_open && s.supports("retro"));
         let lead = div().flex().items_center().gap(px(10.));
         // The conversations are every server's: their title, not this server's.
         let lead = if self.dms_open {
@@ -1322,6 +1339,28 @@ impl ServerView {
             .child(lead)
             .child(div().flex_1())
             .children(crate::ui::updates::button(cx))
+            .when_some(retro_year, |d, year| {
+                d.child(
+                    div()
+                        .id("retro-open")
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .h(px(28.))
+                        .px(px(10.))
+                        .rounded_full()
+                        .cursor_pointer()
+                        .bg(t.accent_soft)
+                        .hover(|s| s.opacity(0.85))
+                        .child(icon("sparkles", 14., t.accent_text))
+                        .child(div().text_size(px(12.)).font_weight(gpui::FontWeight::SEMIBOLD).text_color(t.accent_text).child(trf!(
+                            "{} in review",
+                            "Retrospectiva {}",
+                            year
+                        )))
+                        .on_click(cx.listener(move |this, _, window, cx| retro::Retro::open(this.session.clone(), year, window, cx))),
+                )
+            })
             .child(
                 // Texel's live pill: a glowing dot, and the word beside it when there is something to say.
                 div()
@@ -1750,6 +1789,20 @@ impl Render for ServerView {
                 let _ = root.update(cx, |_, cx| cx.notify());
             });
         }
+        // The year in review opens by itself once per server, the first time it is offered.
+        if let Some(year) = retro::season()
+            && !self.backstage
+            && self.session.read(cx).supports("retro")
+        {
+            let base = self.session.read(cx).api.base();
+            if !prefs(cx).retro_seen.get(&base).is_some_and(|seen| seen.contains(&year)) {
+                let session = self.session.clone();
+                window.defer(cx, move |window, cx| {
+                    set_prefs(cx, |p| p.retro_seen.entry(base).or_default().push(year));
+                    retro::Retro::open(session, year, window, cx);
+                });
+            }
+        }
         let show_members =
             !self.dms_open && prefs(cx).show_members && f32::from(window.viewport_size().width) > 900. * crate::theme::scale();
         let narrow = f32::from(window.viewport_size().width) < 720. * crate::theme::scale();
@@ -1879,7 +1932,7 @@ impl Focusable for Shortcuts {
 impl Render for Shortcuts {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = current();
-        let rows: [(&[&str], &str); 9] = [
+        let rows: [(&[&str], &str); 10] = [
             (&["Ctrl", "Shift", "M"], tr!("Mute or unmute", "Silenciar ou reativar o microfone")),
             (&["Ctrl", "Shift", "D"], tr!("Deafen or undeafen", "Desativar ou reativar o som")),
             (&["Enter"], tr!("Send the message", "Enviar a mensagem")),
@@ -1887,6 +1940,7 @@ impl Render for Shortcuts {
             (&["Ctrl", "V"], tr!("Paste a picture as an attachment", "Colar uma imagem como anexo")),
             (&["Tab"], tr!("Pick the highlighted @mention", "Escolher a @menção destacada")),
             (&["Ctrl", ","], tr!("Settings", "Configurações")),
+            (&["Ctrl", "+ / − / 0"], tr!("Bigger, smaller or the usual interface", "Interface maior, menor ou do tamanho normal")),
             (&["Ctrl", "/"], tr!("This list", "Esta lista")),
             (&["Esc"], tr!("Close a dialog or menu", "Fechar uma janela ou menu")),
         ];
