@@ -2,7 +2,8 @@
 //! copy of `settings.json` on another account or computer holds no usable password or sign-in.
 //! On macOS and Linux they are sealed with XChaCha20-Poly1305 under a random key of Ciranda's own
 //! that lives in the system's keychain (the login keychain; the Secret Service, as GNOME Keyring
-//! or KWallet provide it), to the same effect. Where there is no keychain to ask (a bare window
+//! or KWallet provide it), to the same effect; on Android, under one the app keeps in the
+//! Keystore and hands in (`provide`). Where there is no keychain to ask (a bare window
 //! manager with no Secret Service, a keychain that said no) they are kept as they are, as before.
 
 use super::crypto::random;
@@ -90,6 +91,13 @@ pub fn init() {
             Err(e) => log::warn!("keychain: no thread to ask it ({e}); secrets are kept unsealed"),
         }
     }
+}
+
+/// The key, handed in by the app where the keychain is reached outside Rust: Android's Keystore,
+/// from Kotlin, before anything is sealed or opened. A second one is ignored.
+#[cfg(target_os = "android")]
+pub fn provide(key: [u8; 32]) {
+    let _ = KEY.set(Some(Key::new(key)));
 }
 
 /// The key secrets are sealed with here, and a short id of it written beside each sealed value, so

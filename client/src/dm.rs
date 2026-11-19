@@ -16,7 +16,7 @@ use crate::core::keystore::KeyFile;
 use crate::core::types::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
+use std::sync::Arc;
 use zeroize::Zeroizing;
 
 /// Whether this computer can take part in private conversations yet.
@@ -141,7 +141,7 @@ pub struct Vault {
     current: HashMap<UserId, KeyId>,
     /// Agreed keys, by (conversation, my key, their key): an X25519 agreement per message would be
     /// wasted work for the same pair every time.
-    pairs: HashMap<(ConversationId, KeyId, KeyId), Rc<PairKey>>,
+    pairs: HashMap<(ConversationId, KeyId, KeyId), Arc<PairKey>>,
     /// By person: ids of keys of theirs that something opened with here, not accepted for them.
     unconfirmed: HashMap<UserId, HashSet<KeyId>>,
     /// The message id each sealed text (by its nonce) and each message's own id was seen at.
@@ -349,7 +349,7 @@ impl Vault {
         crypto::public_key(&self.keys.get(&key)?.public_key)
     }
 
-    fn pair(&mut self, conversation: ConversationId, mine: KeyId, peer: UserId, theirs: KeyId) -> Option<Rc<PairKey>> {
+    fn pair(&mut self, conversation: ConversationId, mine: KeyId, peer: UserId, theirs: KeyId) -> Option<Arc<PairKey>> {
         // Their half has to be a key listed as theirs. Otherwise any key the server published, under
         // any id, would open as the other person's (or, paired with yours, as your own words).
         if peer == self.me || self.owner(theirs) != Some(peer) {
@@ -367,7 +367,7 @@ impl Vault {
                 &archived
             }
         };
-        let key = Rc::new(crypto::pair_key(identity, self.me, &public, peer, conversation)?);
+        let key = Arc::new(crypto::pair_key(identity, self.me, &public, peer, conversation)?);
         self.pairs.insert((conversation, mine, theirs), key.clone());
         Some(key)
     }
