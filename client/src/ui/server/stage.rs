@@ -20,8 +20,8 @@ use crate::widgets::*;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     Animation, AnimationExt, AnyElement, App, AppContext, Context, Entity, EventEmitter, Focusable, InteractiveElement, IntoElement,
-    MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render, SharedString, StatefulInteractiveElement, StyleRefinement, Styled,
-    Window, anchored, canvas, div,
+    MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render, SharedString, SpringAnimation, StatefulInteractiveElement,
+    StyleRefinement, Styled, Window, anchored, canvas, div,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -29,6 +29,36 @@ use std::time::{Duration, Instant};
 
 /// How long the controls stay over a stream watched over the whole window once the pointer rests.
 const THEATER_CONTROLS: Duration = Duration::from_millis(2500);
+/// How long a stream takes to grow over the whole window, and to shrink back off it.
+const THEATER_ENTER: Duration = Duration::from_millis(240);
+const THEATER_LEAVE: Duration = Duration::from_millis(200);
+/// How far in from the window's edge it grows from and shrinks back to.
+const THEATER_INSET: f32 = 28.;
+
+/// A stream opening over the whole window: it grows out from just inside the edge as it fades in.
+pub(super) fn theater_entering(el: AnyElement, tile: &Entity<Tile>) -> AnyElement {
+    div()
+        .size_full()
+        .child(el)
+        .with_animation(("theater-in", tile.entity_id()), Animation::new(THEATER_ENTER).with_easing(gpui::ease_out_quint()), |d, p| {
+            d.opacity(p).p(px(THEATER_INSET * (1. - p)))
+        })
+        .into_any_element()
+}
+
+/// The stream just left, over the whole window: it shrinks back in and fades, uncovering the
+/// window as it comes back. It takes no clicks.
+pub fn theater_ghost(tile: Entity<Tile>) -> AnyElement {
+    let id = tile.entity_id();
+    div()
+        .absolute()
+        .inset_0()
+        .child(div().size_full().bg(gpui::black()).child(tile.cached(StyleRefinement::default().size_full())))
+        .with_animation(("theater-out", id), Animation::new(THEATER_LEAVE).with_easing(gpui::ease_in_out), |d, p| {
+            d.opacity(1. - p).p(px(THEATER_INSET * p))
+        })
+        .into_any_element()
+}
 
 /// Whether you are sending your camera and your screen.
 pub fn sharing(_: &Entity<Session>, voice: Option<&Entity<Voice>>, cx: &App) -> (bool, bool) {
@@ -235,12 +265,9 @@ impl ServerView {
             .bg(t.layer)
             .border_1()
             .border_color(t.stroke)
-            .child(
-                div().relative().child(avatar(&name, image, 64., None)).children(
-                    quiet_badge(quiet, 24., ("person-quiet", m.mid as u64), t)
-                        .map(|b| div().absolute().right(px(-4.)).bottom(px(-4.)).child(b)),
-                ),
-            )
+            .child(div().relative().child(avatar(&name, image, 64., None)).child(
+                div().absolute().right(px(-4.)).bottom(px(-4.)).child(quiet_badge(quiet, 24., false, ("person-quiet", m.mid as u64), t)),
+            ))
             .child(
                 div()
                     .flex()
@@ -399,10 +426,13 @@ impl ServerView {
         .child(div().absolute().inset_0().bg(name_color(&name).opacity(0.14)))
         .child(avatar(&name, image, size, None))
         .child(name_tag(&name, user == me, None, small, t))
-        .children(
-            quiet_badge(quiet, if small { 22. } else { 28. }, ("tile-quiet", m.mid as u64), t)
-                .map(|b| div().absolute().top(px(8.)).left(px(8.)).child(b)),
-        )
+        .child(div().absolute().top(px(8.)).left(px(8.)).child(quiet_badge(
+            quiet,
+            if small { 22. } else { 28. },
+            false,
+            ("tile-quiet", m.mid as u64),
+            t,
+        )))
         .cursor_pointer()
         .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| this.open_profile(this.session.clone(), user, e.position(), cx)))
         .when(user != me, |d| {
@@ -467,10 +497,13 @@ impl ServerView {
             .child(tile.clone().cached(StyleRefinement::default().size_full()))
             .children(ink)
             .child(name_tag(&name, local, Some(kind), h < 140., t))
-            .children(
-                quiet_badge(quiet, if h < 140. { 22. } else { 28. }, ("tile-quiet", id), t)
-                    .map(|b| div().absolute().top(px(8.)).left(px(8.)).child(b)),
-            )
+            .child(div().absolute().top(px(8.)).left(px(8.)).child(quiet_badge(
+                quiet,
+                if h < 140. { 22. } else { 28. },
+                true,
+                ("tile-quiet", id),
+                t,
+            )))
             .child(
                 div()
                     .absolute()
@@ -479,7 +512,7 @@ impl ServerView {
                     .flex()
                     .gap(px(4.))
                     .p(px(3.))
-                    .rounded(px(9.))
+                    .rounded(px(radius::CONTROL))
                     .bg(gpui::black().opacity(0.55))
                     .invisible()
                     .group_hover(group, |s| s.visible())
@@ -558,13 +591,14 @@ impl ServerView {
                     }
                 }
             }));
-        speaking(el, lit, radius::CARD + 2., t).into_any_element()
+        arrives(speaking(el, lit, radius::CARD + 2., t), ("tile-in", id))
     }
 
     /// Watches a stream over the whole window: nothing around it but a bar along the bottom with
     /// the people in the call and its controls, which hides while the pointer rests.
     pub fn enter_theater(&mut self, tile: Entity<Tile>, cx: &mut Context<Self>) {
         self.theater = Some(tile);
+        self.theater_leaving = None;
         self.theater_bar_hover = false;
         self.theater_moved = Instant::now() - THEATER_CONTROLS;
         self.theater_poke(cx);
@@ -574,7 +608,17 @@ impl ServerView {
 
     /// Back to the window as it was, out of the monitor's full screen too.
     pub fn leave_theater(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.theater = None;
+        // It shrinks and fades over the window coming back, then goes.
+        self.theater_leaving = self.theater.take();
+        let root = self.root.clone();
+        self.theater_leave_wake = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(THEATER_LEAVE + Duration::from_millis(30)).await;
+            let _ = this.update(cx, |this, cx| {
+                this.theater_leaving = None;
+                cx.notify();
+            });
+            let _ = root.update(cx, |_, cx| cx.notify());
+        });
         if window.is_fullscreen() {
             window.toggle_fullscreen();
         }
@@ -640,7 +684,7 @@ impl ServerView {
             .gap(px(6.))
             .px(px(10.))
             .py(px(6.))
-            .rounded(px(8.))
+            .rounded(px(radius::ICON))
             .bg(gpui::black().opacity(0.55))
             .when(kind == TileKind::Screen, |d| d.child(live_chip(t, true)))
             .child(div().text_size(px(13.)).text_color(white).child(if local {
@@ -667,7 +711,7 @@ impl ServerView {
                 .min_by_key(|x| if x.read(cx).kind == TileKind::Screen { 0 } else { 1 })
                 .cloned();
             let watched = m.user_id == user;
-            let quiet = m.muted || m.silenced() || m.deafened;
+            let quiet = self.quiet_of(m, cx);
             people = people.child(
                 div()
                     .id(("theater-person", m.mid as u64))
@@ -678,21 +722,13 @@ impl ServerView {
                     .gap(px(3.))
                     .child(avatar(&person, image, 32., ring))
                     .child(div().size(px(4.)).rounded_full().when(watched, |d| d.bg(t.accent)))
-                    .when(quiet, |d| {
-                        d.child(
-                            div()
-                                .absolute()
-                                .right(px(-3.))
-                                .top(px(18.))
-                                .size(px(16.))
-                                .rounded_full()
-                                .bg(gpui::black().opacity(0.8))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(icon(if m.deafened { "headphones-off" } else { "mic-off" }, 10., white.opacity(0.9))),
-                        )
-                    })
+                    .child(div().absolute().right(px(-4.)).top(px(17.)).child(quiet_badge(
+                        quiet,
+                        18.,
+                        true,
+                        ("theater-quiet", m.mid as u64),
+                        t,
+                    )))
                     .tooltip(tip(if theirs.is_some() && !watched { trf!("{} · watch", "{} · assistir", person) } else { person }, t))
                     .when_some(theirs.filter(|_| !watched), |d, theirs| {
                         d.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| this.enter_theater(theirs.clone(), cx)))
@@ -705,6 +741,7 @@ impl ServerView {
 
         let button =
             |id: &'static str, glyph: &'static str, on: bool, color: gpui::Hsla| tool_button(id, glyph, on, color, t).size(px(38.));
+        let quiet = t.over_video(t.critical);
         let rule = || div().w(px(1.)).h(px(24.)).mx(px(4.)).bg(white.opacity(0.18));
         let fullscreen = window.is_fullscreen();
         let controls = div()
@@ -712,7 +749,8 @@ impl ServerView {
             .items_center()
             .gap(px(4.))
             .child(
-                button("theater-mute", if muted { "mic-off" } else { "mic" }, muted, if muted { t.critical } else { white })
+                toggle_button("theater-mute", ("mic", "mic-off"), muted, (white, quiet), t)
+                    .size(px(38.))
                     .tooltip(live_tip(
                         "theater-mute",
                         if muted {
@@ -725,22 +763,18 @@ impl ServerView {
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_mute(cx))),
             )
             .child(
-                button(
-                    "theater-deafen",
-                    if deafened { "headphones-off" } else { "headphones" },
-                    deafened,
-                    if deafened { t.critical } else { white },
-                )
-                .tooltip(live_tip(
-                    "theater-deafen",
-                    if deafened {
-                        tr!("Undeafen (Ctrl+Shift+D)", "Reativar o som (Ctrl+Shift+D)")
-                    } else {
-                        tr!("Deafen (Ctrl+Shift+D)", "Desativar o som (Ctrl+Shift+D)")
-                    },
-                    t,
-                ))
-                .on_click(cx.listener(|this, _, _, cx| this.toggle_deafen(cx))),
+                toggle_button("theater-deafen", ("headphones", "headphones-off"), deafened, (white, quiet), t)
+                    .size(px(38.))
+                    .tooltip(live_tip(
+                        "theater-deafen",
+                        if deafened {
+                            tr!("Undeafen (Ctrl+Shift+D)", "Reativar o som (Ctrl+Shift+D)")
+                        } else {
+                            tr!("Deafen (Ctrl+Shift+D)", "Desativar o som (Ctrl+Shift+D)")
+                        },
+                        t,
+                    ))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_deafen(cx))),
             )
             .child(
                 button("theater-camera", if camera_on { "camera-off" } else { "camera" }, false, white)
@@ -781,7 +815,7 @@ impl ServerView {
                     .h(px(38.))
                     .px(px(14.))
                     .ml(px(4.))
-                    .rounded(px(10.))
+                    .rounded(px(radius::CONTROL))
                     .cursor_pointer()
                     .bg(t.critical)
                     .hover(|s| s.opacity(0.85))
@@ -823,7 +857,7 @@ impl ServerView {
             .gap(px(10.))
             .px(px(12.))
             .py(px(8.))
-            .rounded(px(16.))
+            .rounded(px(radius::PANE + 4.))
             .bg(gpui::black().opacity(0.72))
             .border_1()
             .border_color(white.opacity(0.1))
@@ -963,36 +997,57 @@ enum Quiet {
     Deafened,
 }
 
-/// The round mark on someone's tile or picture while they can't be heard: it pops in when they
-/// mute, so it is noticed.
-fn quiet_badge(q: Quiet, size: f32, id: impl Into<gpui::ElementId>, t: &Theme) -> Option<AnyElement> {
+/// The round mark on someone's tile or picture while they can't be heard: a dark glass with the
+/// icon in a soft red, there to be noticed without shouting over the picture. It pops in on a
+/// spring when they mute and shrinks away when they speak again; it holds its place either way,
+/// so nothing around it moves.
+fn quiet_badge(q: Quiet, size: f32, over_video: bool, id: impl Into<gpui::ElementId>, t: &Theme) -> AnyElement {
     let (glyph, hint) = match q {
-        Quiet::Open => return None,
-        Quiet::Muted => ("mic-off", tr!("Muted", "Mutado")),
-        Quiet::Silenced => ("mic-off", tr!("Muted by an admin or the channel", "Mutado por um admin ou pelo canal")),
-        Quiet::Deafened => ("headphones-off", tr!("Deafened: hears nothing", "Com o som desativado: não ouve nada")),
+        Quiet::Open => (None, None),
+        Quiet::Muted => (Some("mic-off"), Some(tr!("Muted", "Mutado"))),
+        Quiet::Silenced => (Some("mic-off"), Some(tr!("Muted by an admin or the channel", "Mutado por um admin ou pelo canal"))),
+        Quiet::Deafened => (Some("headphones-off"), Some(tr!("Deafened: hears nothing", "Com o som desativado: não ouve nada"))),
     };
-    let bg = t.critical;
-    Some(
-        div()
-            .id(id.into())
-            .flex_none()
-            .flex()
-            .items_center()
-            .justify_center()
-            .size(px(size))
-            .rounded_full()
-            .bg(bg)
-            .border_2()
-            .border_color(gpui::black().opacity(0.25))
-            .shadow_md()
-            .child(icon(glyph, (size * 0.52).round(), gpui::white()))
-            .tooltip(tip(hint, t))
-            .with_animation("quiet-in", Animation::new(Duration::from_millis(220)).with_easing(gpui::ease_out_quint()), move |d, p| {
-                d.opacity(p.min(1.)).size(px(size * (0.6 + 0.4 * p)))
-            })
-            .into_any_element(),
-    )
+    // Dark glass over video and on dark palettes; a light one on a light palette's cards.
+    let (glass, edge, red) = if over_video || t.dark {
+        let red = t.over_video(t.critical);
+        (gpui::hsla(red.h, 0.22, 0.09, 0.74), gpui::white().opacity(0.14), red)
+    } else {
+        (gpui::white().opacity(0.9), t.quiet.opacity(0.3), t.quiet)
+    };
+    div()
+        .id(id.into())
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(px(size))
+        .when_some(hint, |d, hint| d.tooltip(tip(hint, t)))
+        .with_spring(
+            "quiet",
+            SpringAnimation::new(crate::motion::SNAP).to(if glyph.is_some() { 1. } else { 0. }).from(0.),
+            move |d, k: f32| {
+                if k < 0.02 {
+                    return d;
+                }
+                d.child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .size(px(size * k))
+                        .rounded_full()
+                        .bg(glass)
+                        .border_1()
+                        .border_color(edge)
+                        .shadow_sm()
+                        .opacity(k.min(1.))
+                        .children(glyph.map(|g| icon(g, (size * 0.54 * k).max(1.), red))),
+                )
+            },
+        )
+        .into_any_element()
 }
 
 /// The name in the bottom corner of a tile, on a dark plate so it reads over any picture.
@@ -1008,7 +1063,7 @@ fn name_tag(name: &str, you: bool, kind: Option<TileKind>, small: bool, t: &Them
         .gap(px(6.))
         .px(px(8.))
         .py(px(4.))
-        .rounded(px(7.))
+        .rounded(px(radius::INNER))
         .bg(gpui::black().opacity(0.55))
         .when(screen, |d| d.child(live_chip(t, true)))
         .child(div().truncate().text_size(px(if small { 11.5 } else { 12.5 })).text_color(gpui::white()).child(if you {
@@ -1021,10 +1076,13 @@ fn name_tag(name: &str, you: bool, kind: Option<TileKind>, small: bool, t: &Them
         })
 }
 
-/// Someone joining settles onto the stage, fading in as it grows the last bit.
+/// Someone joining, or a stream starting, settles onto the stage: it fades in as it rises the
+/// last few pixels into place.
 fn arrives(el: impl IntoElement + Styled + 'static, id: impl Into<gpui::ElementId>) -> AnyElement {
-    el.with_animation(id, Animation::new(Duration::from_millis(260)).with_easing(gpui::ease_out_quint()), |d, p| d.opacity(p))
-        .into_any_element()
+    el.with_animation(id, Animation::new(Duration::from_millis(260)).with_easing(gpui::ease_out_quint()), |d, p| {
+        d.opacity(p).relative().top(px(10. * (1. - p)))
+    })
+    .into_any_element()
 }
 
 impl Render for Tile {

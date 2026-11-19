@@ -288,9 +288,16 @@ impl Render for Root {
         theme::set_scale(prefs(cx).ui_scale as f32 / 100.);
         let t = theme_for(window, cx);
         theme::set_current(t);
+        // A server, or the sign-in, taking another's place fades in as it rises into place.
         let screen: AnyElement = match &self.screen {
-            Screen::Connect { view, .. } => view.clone().into_any_element(),
-            Screen::Server(v) => v.clone().into_any_element(),
+            Screen::Connect { view, .. } => {
+                crate::motion::enter(div().size_full().child(view.clone()), ("screen-in", view.entity_id())).into_any_element()
+            }
+            Screen::Server(v) => crate::motion::enter(div().size_full().child(v.clone()), ("screen-in", v.entity_id())).into_any_element(),
+        };
+        let theater_leaving = match &self.screen {
+            Screen::Server(v) => v.read(cx).theater_leaving.clone().map(server::theater_ghost),
+            Screen::Connect { .. } => None,
         };
         // A kept sign-in going in shows the loading screen alone, without the rail beside it.
         let resuming = self.resuming(cx);
@@ -313,6 +320,7 @@ impl Render for Root {
             .flex()
             .children(rail)
             .child(div().flex_1().min_w(px(0.)).h_full().child(screen))
+            .children(theater_leaving)
             .when(!theater, |d| {
                 d.child(
                     div()

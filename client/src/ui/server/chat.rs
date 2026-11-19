@@ -30,6 +30,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const GROUP_WINDOW_MS: i64 = 5 * 60 * 1000;
+/// How long after it came in a message still rises into place when drawn: past its own animation,
+/// so a first draw a little late still plays it whole.
+const ARRIVE_FOR: Duration = Duration::from_secs(1);
 /// The most a file may be where it goes up in one request: a private conversation's, sealed whole
 /// on this computer, or any file to a server that doesn't take pieces. Also the most read into
 /// memory to send; a bigger file stays on disk and is read a piece at a time.
@@ -122,6 +125,10 @@ pub struct ChatView {
     /// What was in the box when an edit took it over, put back when the edit is done.
     draft: Option<String>,
     flash: Option<(MessageId, Instant)>,
+    /// Messages that came in at the bottom while the pane was open, with when: they rise into
+    /// place as they fade in. Opening the room, a search and older messages loading above add
+    /// none.
+    arrived: HashMap<MessageId, Instant>,
     mention: Option<(String, usize)>,
     /// Parsed bodies by message, until it is edited; dropped when the server's emoji change.
     bodies: HashMap<MessageId, (Option<i64>, Rc<rich::Parsed>)>,
@@ -217,6 +224,7 @@ impl ChatView {
             mode: None,
             draft: None,
             flash: None,
+            arrived: HashMap::new(),
             mention: None,
             bodies: HashMap::new(),
             quotes: HashMap::new(),
@@ -299,6 +307,16 @@ impl ChatView {
             // Last first, so the places of the earlier ones still hold.
             for (old, count) in changes.into_iter().rev() {
                 self.list.splice(old, count);
+            }
+            // What came in after the last message already shown is new; what came in above it
+            // is history loading.
+            let now = Instant::now();
+            self.arrived.retain(|_, at| now.duration_since(*at) < ARRIVE_FOR);
+            if let Some(after) = self.shown.last().and_then(|last| ids.iter().position(|id| id == last)) {
+                let before: HashSet<MessageId> = self.shown.iter().copied().collect();
+                for id in ids[after + 1..].iter().filter(|id| !before.contains(id)) {
+                    self.arrived.insert(*id, now);
+                }
             }
         }
         self.shown = ids;
@@ -1485,6 +1503,20 @@ impl ChatView {
         if let Some(due) = self.session.update(cx, |s, _| s.take_frame_due()) {
             self.wake_at(due, cx);
         }
+        // Just in: it rises the last few pixels into place as it fades in. By its offset, so the
+        // height the list measures is the one it keeps.
+        let id = self.shown.get(ix).copied();
+        let el = match id.filter(|id| self.arrived.get(id).is_some_and(|at| at.elapsed() < ARRIVE_FOR)) {
+            Some(id) => div()
+                .child(el)
+                .with_animation(
+                    ("arrive", id as u64),
+                    Animation::new(Duration::from_millis(280)).with_easing(gpui::ease_out_quint()),
+                    |d, p| d.opacity(p).relative().top(px(10. * (1. - p))),
+                )
+                .into_any_element(),
+            None => el,
+        };
         // Padding, not margin, for the same reason as the call lines: the list measures the box.
         if ix + 1 == self.shown.len() { div().pb(px(18.)).child(el).into_any_element() } else { el }
     }
@@ -2335,7 +2367,7 @@ impl ChatView {
                 .bg(t.layer)
                 .border_1()
                 .border_color(t.stroke)
-                .child(div().size(px(32.)).rounded(px(6.)).bg(t.control).flex().items_center().justify_center().child(icon(
+                .child(div().size(px(32.)).rounded(px(8.)).bg(t.control).flex().items_center().justify_center().child(icon(
                     "paperclip",
                     16.,
                     t.text2,
@@ -2442,10 +2474,10 @@ impl ChatView {
                         .child(match &p.preview {
                             Some(img_) => div()
                                 .size(px(44.))
-                                .rounded(px(6.))
+                                .rounded(px(8.))
                                 .overflow_hidden()
                                 .child(img(img_.clone()).size_full().object_fit(gpui::ObjectFit::Cover)),
-                            None => div().size(px(44.)).rounded(px(6.)).bg(t.control).flex().items_center().justify_center().child(icon(
+                            None => div().size(px(44.)).rounded(px(8.)).bg(t.control).flex().items_center().justify_center().child(icon(
                                 "paperclip",
                                 18.,
                                 t.text2,
@@ -2505,7 +2537,7 @@ impl ChatView {
                             .items_center()
                             .justify_center()
                             .size(px(32.))
-                            .rounded(px(8.))
+                            .rounded(px(radius::ICON))
                             .cursor_pointer()
                             .when(can_send, |d| d.bg(t.accent))
                             .child(icon("send", 16., if can_send { t.on_accent } else { t.text3 }))
@@ -2740,7 +2772,7 @@ fn file_card(card: FileCard, name: &str, hash: &str, how: Fetch, t: &Theme, cx: 
         .bg(t.layer)
         .border_1()
         .border_color(t.stroke)
-        .child(div().size(px(36.)).rounded(px(8.)).bg(t.control).flex().items_center().justify_center().child(icon(
+        .child(div().size(px(36.)).rounded(px(radius::ICON)).bg(t.control).flex().items_center().justify_center().child(icon(
             "paperclip",
             16.,
             t.text2,

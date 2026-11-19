@@ -20,9 +20,9 @@ use crate::theme::{FONT, GUTTER, Theme, current, px, radius};
 use crate::widgets::*;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, AppContext, ClipboardItem, Context, Entity, EventEmitter, FontWeight, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement, Pixels, Point, Render, RenderImage, SharedString, StatefulInteractiveElement, Styled, WeakEntity,
-    Window, div, img,
+    AnimationExt, App, AppContext, ClipboardItem, Context, Entity, EventEmitter, FontWeight, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, ParentElement, Pixels, Point, Render, RenderImage, SharedString, SpringAnimation, StatefulInteractiveElement, Styled,
+    WeakEntity, Window, div, img,
 };
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -533,16 +533,24 @@ fn voice_badge(t: &Theme) -> gpui::Div {
 fn rail_slot(id: impl Into<gpui::ElementId>, on: bool, t: &Theme) -> gpui::Stateful<gpui::Div> {
     let id = id.into();
     let group: SharedString = format!("{id:?}").into();
+    let (accent, faint) = (t.accent, t.text3);
     div().id(id).group(group.clone()).relative().w_full().flex().justify_center().cursor_pointer().child(
-        div()
-            .absolute()
-            .left(px(0.))
-            .top(px((TILE - 20.) / 2.))
-            .w(px(3.))
-            .h(px(20.))
-            .rounded(px(2.))
-            .bg(t.accent)
-            .when(!on, |d| d.top(px((TILE - 8.) / 2.)).h(px(8.)).bg(t.text3).invisible().group_hover(group, |s| s.visible())),
+        // It grows from the hover dot to the full marker on a spring, and shrinks back on the
+        // server left.
+        div().absolute().left(px(0.)).w(px(3.)).rounded(px(2.)).with_spring(
+            "rail-mark",
+            SpringAnimation::new(crate::motion::SNAP).to(on),
+            move |d, phase| {
+                let p = phase.0;
+                let h = 8. + 12. * p.max(0.);
+                let d = d.top(px((TILE - h) / 2.)).h(px(h));
+                if p < 0.04 {
+                    d.bg(faint).invisible().group_hover(group, |s| s.visible())
+                } else {
+                    d.bg(crate::motion::mix(faint, accent, p * 1.6))
+                }
+            },
+        ),
     )
 }
 
@@ -595,7 +603,7 @@ impl Render for ServerTip {
             .gap(px(2.))
             .px(px(10.))
             .py(px(6.))
-            .rounded(px(8.))
+            .rounded(px(radius::ICON))
             .bg(t.popover)
             .border_1()
             .border_color(t.stroke_strong)

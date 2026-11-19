@@ -2,11 +2,12 @@
 //! of choices, sliders, keycaps, avatars and the status dot.
 
 use crate::theme::{FONT, MONO, Theme, px, radius, text};
+use gpui::AnimationExt as _;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Bounds, BoxShadow, Context, Div, DragMoveEvent, ElementId, FontWeight, Hsla, InteractiveElement, IntoElement,
-    MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render, SharedString, Stateful, StatefulInteractiveElement, Styled, Window,
-    canvas, div, linear_color_stop, linear_gradient,
+    MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render, SharedString, SpringAnimation, Stateful, StatefulInteractiveElement,
+    Styled, Window, canvas, div, linear_color_stop, linear_gradient,
 };
 use std::cell::Cell;
 use std::rc::Rc;
@@ -99,7 +100,7 @@ impl Render for Tip {
             .max_w(px(300.))
             .px(px(10.))
             .py(px(6.))
-            .rounded(px(8.))
+            .rounded(px(radius::ICON))
             .bg(t.popover)
             .border_1()
             .border_color(t.stroke_strong)
@@ -217,7 +218,7 @@ pub fn tool_button(id: impl Into<ElementId>, glyph: &'static str, on: bool, colo
             .items_center()
             .justify_center()
             .size(px(32.))
-            .rounded(px(8.))
+            .rounded(px(radius::ICON))
             .border_2()
             .border_color(gpui::transparent_black())
             .cursor_pointer()
@@ -230,6 +231,54 @@ pub fn tool_button(id: impl Into<ElementId>, glyph: &'static str, on: bool, colo
         },
     )
     .child(icon(glyph, 17., color))
+}
+
+/// An icon button for something switched on and off, like mute. On a change the icon shrinks,
+/// turns into the other one and grows back, its colour and the tint behind it following, on a
+/// spring: a click is felt, and a second one halfway turns it round. `glyphs` and `colors` are
+/// (off, on).
+pub fn toggle_button(
+    id: impl Into<ElementId>,
+    glyphs: (&'static str, &'static str),
+    on: bool,
+    colors: (Hsla, Hsla),
+    t: &Theme,
+) -> Stateful<Div> {
+    let hover = t.control_hover;
+    let tint = t.tint(colors.1);
+    keyboardable(
+        div()
+            .id(id.into())
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .size(px(32.))
+            .rounded(px(radius::ICON))
+            .border_2()
+            .border_color(gpui::transparent_black())
+            .cursor_pointer()
+            .when(!on, |d| d.hover(move |s| s.bg(hover)))
+            .active(|s| s.opacity(0.75)),
+        {
+            let ring = t.accent_text;
+            move |s| s.border_color(ring)
+        },
+    )
+    .child(div().size_full().flex().items_center().justify_center().with_spring(
+        "toggle",
+        SpringAnimation::new(crate::motion::SNAP).to(on),
+        move |d, phase| {
+            let p = phase.0;
+            // Smallest halfway, where one icon gives way to the other; a touch past full size as
+            // the spring overshoots.
+            let k = (1. - 0.45 * (1. - (2. * p - 1.).abs())).clamp(0.5, 1.12);
+            d.child(
+                div().absolute().top(px(-2.)).left(px(-2.)).right(px(-2.)).bottom(px(-2.)).rounded(px(radius::ICON)).bg(tint.opacity(p)),
+            )
+            .child(icon(if p >= 0.5 { glyphs.1 } else { glyphs.0 }, 17. * k, crate::motion::mix(colors.0, colors.1, p)))
+        },
+    ))
 }
 
 /// A small label in a dashed outline, see-through so it sits lightly on any surface: a role, a
@@ -267,30 +316,44 @@ pub fn status_dot(color: Hsla, glow: bool) -> Div {
 
 /// A toggle switch.
 pub fn switch(on: bool, t: &Theme) -> Div {
-    div()
-        .flex_none()
-        .flex()
-        .items_center()
-        .w(px(36.))
-        .h(px(20.))
-        .rounded(px(10.))
-        .px(px(3.))
-        .when(on, |d| d.justify_end().bg(t.accent))
-        .when(!on, |d| d.bg(t.well).border_1().border_color(t.stroke_strong))
-        .child(div().size(px(14.)).rounded_full().bg(if on { t.on_accent } else { t.text2 }))
+    use crate::motion::mix;
+    let (well, accent, edge, knob_off, knob_on) = (t.well, t.accent, t.stroke_strong, t.text2, t.on_accent);
+    // The knob slides across and the track fills behind it, on a spring.
+    div().flex_none().w(px(36.)).h(px(20.)).child(div().size_full().with_spring(
+        "switch",
+        SpringAnimation::new(crate::motion::SNAP).to(on),
+        move |d, phase| {
+            let (p, q) = (phase.0, phase.0.clamp(0., 1.));
+            d.relative()
+                .rounded(px(10.))
+                .bg(mix(well, accent, q))
+                .border_1()
+                .border_color(edge.opacity(1. - q))
+                .child(div().absolute().top(px(2.)).left(px(2. + 16. * p)).size(px(14.)).rounded_full().bg(mix(knob_off, knob_on, q)))
+        },
+    ))
 }
 
 /// A tick box.
 pub fn checkbox(on: bool, t: &Theme) -> Div {
-    div()
-        .flex_none()
-        .flex()
-        .items_center()
-        .justify_center()
-        .size(px(18.))
-        .rounded(px(5.))
-        .when(on, |d| d.bg(t.accent).child(icon("check", 13., t.on_accent)))
-        .when(!on, |d| d.bg(t.well).border_1().border_color(t.stroke_strong))
+    use crate::motion::mix;
+    let (well, accent, edge, tick) = (t.well, t.accent, t.stroke_strong, t.on_accent);
+    // The box fills and the tick pops in, on a spring.
+    div().flex_none().size(px(18.)).child(div().size_full().with_spring(
+        "checkbox",
+        SpringAnimation::new(crate::motion::SNAP).to(on),
+        move |d, phase| {
+            let (p, q) = (phase.0, phase.0.clamp(0., 1.));
+            d.flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .bg(mix(well, accent, q))
+                .border_1()
+                .border_color(edge.opacity(1. - q))
+                .when(p > 0.05, |d| d.child(icon("check", 13. * p.min(1.12), tick)))
+        },
+    ))
 }
 
 /// A row of choices, one of them picked: the segmented control from Texel.
@@ -347,7 +410,7 @@ pub fn keycap(s: impl Into<SharedString>, t: &Theme) -> Div {
         .px(px(6.))
         .min_w(px(22.))
         .h(px(22.))
-        .rounded(px(5.))
+        .rounded(px(6.))
         .bg(t.control)
         .border_1()
         .border_b_2()

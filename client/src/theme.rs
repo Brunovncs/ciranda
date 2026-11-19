@@ -66,10 +66,12 @@ pub mod text {
 
 /// Corner radii: the larger the surface, the rounder.
 pub mod radius {
-    pub const PANE: f32 = 14.;
-    pub const CARD: f32 = 12.;
-    pub const CONTROL: f32 = 10.;
-    pub const INNER: f32 = 7.;
+    pub const PANE: f32 = 18.;
+    pub const CARD: f32 = 15.;
+    pub const CONTROL: f32 = 12.;
+    /// A square icon button, a tooltip, a small plate over video.
+    pub const ICON: f32 = 10.;
+    pub const INNER: f32 = 9.;
 }
 
 /// The gap between panes and around the window's edge.
@@ -327,6 +329,9 @@ pub struct Theme {
     /// Text on an accent fill.
     pub on_accent: Hsla,
     pub critical: Hsla,
+    /// Muted or deafened: the critical colour softened toward the text, a state to notice
+    /// rather than an alarm.
+    pub quiet: Hsla,
     /// Speaking, connected, good.
     pub success: Hsla,
     pub caution: Hsla,
@@ -378,6 +383,7 @@ impl Theme {
             accent_text: c(readable(p.accent, p.text, &[p.surface, p.bg], 4.5)),
             on_accent: if luminance(p.accent) > 0.55 { c(0x0b0c10) } else { gpui::white() },
             critical: c(p.danger),
+            quiet: c(if dark { mix(p.danger, p.text, 0.28) } else { mix(p.danger, p.muted, 0.3) }),
             success: c(p.live),
             caution: c(p.warn),
             stage: c(p.video),
@@ -389,6 +395,12 @@ impl Theme {
     /// A status colour as a soft background behind its own text.
     pub fn tint(&self, color: Hsla) -> Hsla {
         color.opacity(if self.dark { 0.14 } else { 0.12 })
+    }
+
+    /// A status colour as it reads over video or a dark glass, whatever the palette: light and
+    /// a little calmer, so it shows without shouting.
+    pub fn over_video(&self, color: Hsla) -> Hsla {
+        gpui::hsla(color.h, color.s.min(0.8), 0.74, 1.)
     }
 }
 

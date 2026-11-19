@@ -17,6 +17,8 @@ mod share;
 pub mod sidebar;
 mod stage;
 
+pub use stage::theater_ghost;
+
 use super::Root;
 use crate::core::settings::HotkeyAction;
 use crate::core::types::*;
@@ -32,7 +34,7 @@ use chat::{ChatEvent, ChatView, Draft};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     AnimationExt, AnyElement, App, AppContext, Context, Entity, EntityId, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render, SpringAnimation, SpringConfig,
+    KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render, SharedString, SpringAnimation, SpringConfig,
     StatefulInteractiveElement, StyleRefinement, Styled, Subscription, WeakEntity, Window, div,
 };
 use sidebar::{Menu, MenuEntry};
@@ -117,6 +119,11 @@ pub struct ServerView {
     theater_bar_hover: bool,
     /// Draws again when the controls are due to hide.
     theater_wake: gpui::Task<()>,
+    /// The stream just left, drawn a moment longer over the window as it shrinks and fades
+    /// (the root draws it, so it covers the rail coming back too).
+    pub theater_leaving: Option<Entity<crate::media::video::Tile>>,
+    /// Lets go of it once it has faded.
+    theater_leave_wake: gpui::Task<()>,
     /// Cirandinha's strip in the call's card, made for the call's player.
     music_strip: Option<Entity<music::MusicStrip>>,
     /// The pointer is on the connection dot, which opens to say what it means.
@@ -240,6 +247,8 @@ impl ServerView {
             theater_moved: std::time::Instant::now(),
             theater_bar_hover: false,
             theater_wake: gpui::Task::ready(()),
+            theater_leaving: None,
+            theater_leave_wake: gpui::Task::ready(()),
             music_strip: None,
             link_hover: false,
             message_cue_at: None,
@@ -1293,7 +1302,7 @@ impl ServerView {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(px(8.))
+                    .rounded(px(radius::ICON))
                     .bg(t.accent_soft)
                     .child(icon("message", 15., t.accent)),
             )
@@ -1426,44 +1435,32 @@ impl ServerView {
                     .on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx))),
             )
             .child(
-                tool_button(
-                    "mute",
-                    if muted { "mic-off" } else { "mic" },
-                    muted && in_call,
-                    if muted && in_call { t.critical } else { t.text2 },
-                    t,
-                )
-                .when(!in_call, inert)
-                .tooltip(live_tip(
-                    "mute",
-                    if muted {
-                        tr!("Unmute (Ctrl+Shift+M)", "Reativar o microfone (Ctrl+Shift+M)")
-                    } else {
-                        tr!("Mute (Ctrl+Shift+M)", "Silenciar (Ctrl+Shift+M)")
-                    },
-                    t,
-                ))
-                .on_click(cx.listener(|this, _, _, cx| this.toggle_mute(cx))),
+                toggle_button("mute", ("mic", "mic-off"), muted && in_call, (t.text2, t.quiet), t)
+                    .when(!in_call, inert)
+                    .tooltip(live_tip(
+                        "mute",
+                        if muted {
+                            tr!("Unmute (Ctrl+Shift+M)", "Reativar o microfone (Ctrl+Shift+M)")
+                        } else {
+                            tr!("Mute (Ctrl+Shift+M)", "Silenciar (Ctrl+Shift+M)")
+                        },
+                        t,
+                    ))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_mute(cx))),
             )
             .child(
-                tool_button(
-                    "deafen",
-                    if deafened { "headphones-off" } else { "headphones" },
-                    deafened && in_call,
-                    if deafened && in_call { t.critical } else { t.text2 },
-                    t,
-                )
-                .when(!in_call, inert)
-                .tooltip(live_tip(
-                    "deafen",
-                    if deafened {
-                        tr!("Undeafen (Ctrl+Shift+D)", "Reativar o som (Ctrl+Shift+D)")
-                    } else {
-                        tr!("Deafen (Ctrl+Shift+D)", "Desativar o som (Ctrl+Shift+D)")
-                    },
-                    t,
-                ))
-                .on_click(cx.listener(|this, _, _, cx| this.toggle_deafen(cx))),
+                toggle_button("deafen", ("headphones", "headphones-off"), deafened && in_call, (t.text2, t.quiet), t)
+                    .when(!in_call, inert)
+                    .tooltip(live_tip(
+                        "deafen",
+                        if deafened {
+                            tr!("Undeafen (Ctrl+Shift+D)", "Reativar o som (Ctrl+Shift+D)")
+                        } else {
+                            tr!("Deafen (Ctrl+Shift+D)", "Desativar o som (Ctrl+Shift+D)")
+                        },
+                        t,
+                    ))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_deafen(cx))),
             )
     }
 
@@ -1680,7 +1677,7 @@ fn panel_button(id: &'static str, glyph: &'static str, on: bool, t: &Theme) -> g
         .items_center()
         .justify_center()
         .h(px(34.))
-        .rounded(px(8.))
+        .rounded(px(radius::ICON))
         .cursor_pointer()
         .bg(if on { t.accent_soft } else { t.control })
         .border_1()
@@ -1741,7 +1738,7 @@ impl Render for ServerView {
                     .track_focus(&self.focus)
                     .on_key_down(cx.listener(Self::on_key))
                     .size_full()
-                    .child(self.render_theater(&tile, &voice, &t, window, cx));
+                    .child(stage::theater_entering(self.render_theater(&tile, &voice, &t, window, cx), &tile));
             }
             // The stream ended, or the call did.
             self.theater = None;
@@ -1807,7 +1804,31 @@ impl Render for ServerView {
                 .into_any_element(),
             _ => self.render_stage(&t, window, cx).into_any_element(),
         };
-        let members = show_members.then(|| self.members.clone().cached(StyleRefinement::default().size_full()));
+        // A channel, a conversation or the stage taking another's place fades in as it rises.
+        let center = crate::motion::enter(div().size_full().child(center), SharedString::from(format!("center-{:?}", self.center)));
+        // The members slide in from the right edge and back out, on a spring; while shut they
+        // are not drawn at all.
+        let members = {
+            let (view, t) = (self.members.clone(), t);
+            const W: f32 = 232.;
+            div().flex_none().h_full().flex().justify_end().overflow_hidden().with_spring(
+                "members-pane",
+                SpringAnimation::new(crate::motion::GLIDE).to(show_members),
+                move |d, phase| {
+                    let p = phase.0.clamp(0., 1.);
+                    d.w(px((W + GUTTER) * p)).opacity(p).when(p > 0.01, |d| {
+                        d.child(
+                            div()
+                                .flex_none()
+                                .w(px(W + GUTTER))
+                                .h_full()
+                                .pl(px(GUTTER))
+                                .child(pane(&t).size_full().child(view.cached(StyleRefinement::default().size_full()))),
+                        )
+                    })
+                },
+            )
+        };
         // The chat pane's own drop comes first and stops there; this is for one anywhere else.
         let chat_open = self.open_chat().is_some();
         div()
@@ -1831,12 +1852,13 @@ impl Render for ServerView {
                     .flex()
                     .flex_1()
                     .min_h(px(0.))
-                    .gap(px(GUTTER))
                     .px(px(GUTTER))
                     .pb(px(GUTTER))
-                    .when(!narrow, |d| d.child(pane(&t).w(px(268.)).flex_none().child(sidebar).children(voice_panel).child(self_strip)))
+                    .when(!narrow, |d| {
+                        d.child(pane(&t).w(px(268.)).mr(px(GUTTER)).flex_none().child(sidebar).children(voice_panel).child(self_strip))
+                    })
                     .child(pane(&t).flex_1().min_w(px(0.)).child(center))
-                    .children(members.map(|m| pane(&t).w(px(232.)).flex_none().child(m))),
+                    .child(members),
             )
     }
 }

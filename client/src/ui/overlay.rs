@@ -48,6 +48,20 @@ impl Layer {
             Layer::Dialog { view, .. } | Layer::Menu { view, .. } => view,
         }
     }
+
+    /// What is left of it to draw while it fades out.
+    fn ghost(&self) -> Ghost {
+        match self {
+            Layer::Dialog { view, .. } => Ghost::Dialog(view.clone()),
+            Layer::Menu { at, anchor, view, .. } => Ghost::Menu { at: *at, anchor: *anchor, view: view.clone() },
+        }
+    }
+}
+
+/// A dialog or a menu that closed, drawn a moment longer as it fades, taking no clicks.
+enum Ghost {
+    Dialog(AnyView),
+    Menu { at: Point<Pixels>, anchor: gpui::Anchor, view: AnyView },
 }
 
 #[derive(Default)]
@@ -55,6 +69,10 @@ pub struct Overlay {
     layers: Vec<Layer>,
     /// A menu that closed, with where focus goes back to if it was still inside it.
     closed_menu: Option<(FocusHandle, FocusHandle)>,
+    /// Layers that closed and are fading out, with when.
+    leaving: Vec<(Ghost, std::time::Instant)>,
+    /// Draws again once they have faded, to let them go.
+    leaving_wake: Option<gpui::Task<()>>,
 }
 
 impl Overlay {
@@ -62,16 +80,23 @@ impl Overlay {
     pub fn close_top(&mut self, cx: &mut App) -> bool {
         match self.layers.pop() {
             None => false,
-            Some(Layer::Dialog { dismiss, .. }) => {
+            Some(dialog @ Layer::Dialog { .. }) => {
+                self.bury(&dialog);
+                let Layer::Dialog { dismiss, .. } = dialog else { unreachable!() };
                 // Later: the dialog's own handlers may update the root, which is being updated now.
                 cx.defer(move |cx| dismiss(cx));
                 true
             }
             Some(menu @ Layer::Menu { .. }) => {
+                self.bury(&menu);
                 self.forget_menu(menu);
                 true
             }
         }
+    }
+
+    fn bury(&mut self, layer: &Layer) {
+        self.leaving.push((layer.ghost(), std::time::Instant::now()));
     }
 
     pub fn has_menu(&self) -> bool {
@@ -90,13 +115,19 @@ impl Overlay {
         let (menus, rest): (Vec<Layer>, Vec<Layer>) =
             std::mem::take(&mut self.layers).into_iter().partition(|l| matches!(l, Layer::Menu { .. }));
         self.layers = rest;
-        menus.into_iter().for_each(|m| self.forget_menu(m));
+        menus.into_iter().for_each(|m| {
+            self.bury(&m);
+            self.forget_menu(m)
+        });
     }
 
     fn remove(&mut self, id: gpui::EntityId) {
         let (gone, rest): (Vec<Layer>, Vec<Layer>) = std::mem::take(&mut self.layers).into_iter().partition(|l| l.view().entity_id() == id);
         self.layers = rest;
-        gone.into_iter().for_each(|m| self.forget_menu(m));
+        gone.into_iter().for_each(|m| {
+            self.bury(&m);
+            self.forget_menu(m)
+        });
     }
 
     fn forget_menu(&mut self, layer: Layer) {
@@ -253,8 +284,8 @@ fn show_menu<V: Render + EventEmitter<Dismiss>>(view: Entity<V>, at: Point<Pixel
 }
 
 impl Root {
-    pub fn render_overlay(&self, t: &Theme, cx: &mut Context<Root>) -> Vec<AnyElement> {
-        let mut out = Vec::new();
+    pub fn render_overlay(&mut self, t: &Theme, cx: &mut Context<Root>) -> Vec<AnyElement> {
+        let mut out = self.render_leaving(t, cx);
         let top = self.overlay.layers.len();
         for (i, layer) in self.overlay.layers.iter().enumerate() {
             match layer {
@@ -356,6 +387,69 @@ impl Root {
             }
         }
         out
+    }
+
+    /// The layers that closed, fading out where they were: a dialog sinks a little, a menu draws
+    /// back toward where it opened from. What is under them takes no clicks until they are gone.
+    fn render_leaving(&mut self, t: &Theme, cx: &mut Context<Root>) -> Vec<AnyElement> {
+        let leave = crate::motion::LEAVE;
+        let overlay = &mut self.overlay;
+        overlay.leaving.retain(|(_, at)| at.elapsed() < leave);
+        if !overlay.leaving.is_empty() && overlay.leaving_wake.is_none() {
+            overlay.leaving_wake = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(leave + Duration::from_millis(20)).await;
+                let _ = this.update(cx, |root, cx| {
+                    root.overlay.leaving_wake = None;
+                    cx.notify();
+                });
+            }));
+        }
+        let fade = || Animation::new(leave).with_easing(gpui::ease_out_quint());
+        let blocker = || div().absolute().inset_0().occlude();
+        overlay
+            .leaving
+            .iter()
+            .map(|(ghost, _)| match ghost {
+                Ghost::Dialog(view) => {
+                    let id = view.entity_id();
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .p(px(24.))
+                        .bg(t.scrim)
+                        .occlude()
+                        .child(
+                            div()
+                                .max_h_full()
+                                .child(view.clone())
+                                .with_animation(("dialog-out", id), fade(), |d, p| d.opacity(1. - p).mt(px(8. * p))),
+                        )
+                        .child(blocker())
+                        .with_animation(("scrim-out", id), fade(), |d, p| d.opacity(1. - p))
+                        .into_any_element()
+                }
+                Ghost::Menu { at, anchor, view } => {
+                    let up = matches!(anchor, gpui::Anchor::BottomLeft);
+                    deferred(div().absolute().inset_0().child(
+                        anchored().anchor(*anchor).position(*at).snap_to_window_with_margin(px(8.)).child(
+                            div().relative().child(view.clone()).child(blocker()).with_animation(
+                                ("menu-out", view.entity_id()),
+                                fade(),
+                                move |d, p| {
+                                    let shift = 4. * p;
+                                    d.opacity(1. - p).top(px(if up { shift } else { -shift }))
+                                },
+                            ),
+                        ),
+                    ))
+                    .with_priority(1)
+                    .into_any_element()
+                }
+            })
+            .collect()
     }
 }
 

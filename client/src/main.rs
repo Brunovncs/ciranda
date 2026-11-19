@@ -20,6 +20,7 @@ mod hotkeys;
 mod icons;
 mod markdown;
 mod media;
+mod motion;
 mod news;
 mod prefs;
 mod session;
