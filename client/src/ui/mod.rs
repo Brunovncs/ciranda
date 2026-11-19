@@ -10,6 +10,7 @@ pub mod game_overlay;
 pub mod hotkeys;
 pub mod ink;
 mod mic_switch;
+pub mod news;
 pub mod overlay;
 mod rail;
 pub mod server;
@@ -147,6 +148,7 @@ impl Root {
         })
         .detach();
         mic_switch::listen(handle, cx);
+        news::greet(handle, cx);
         let mut root = Root {
             focus: cx.focus_handle(),
             screen: Screen::Connect { view: view.clone() },
@@ -183,6 +185,11 @@ impl Root {
         })
         .detach();
         cx.notify();
+    }
+
+    /// A kept sign-in is going in, behind the loading screen.
+    fn resuming(&self, cx: &App) -> bool {
+        matches!(&self.screen, Screen::Connect { view } if view.read(cx).resuming())
     }
 
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -286,7 +293,7 @@ impl Render for Root {
             Screen::Server(v) => v.clone().into_any_element(),
         };
         // A kept sign-in going in shows the loading screen alone, without the rail beside it.
-        let resuming = matches!(&self.screen, Screen::Connect { view } if view.read(cx).resuming());
+        let resuming = self.resuming(cx);
         // So is a stream watched over the whole window.
         let theater = matches!(&self.screen, Screen::Server(v) if v.read(cx).theater.is_some());
         let rail = (!resuming && !theater && !prefs(cx).saved_servers.is_empty()).then(|| self.render_rail(&t, cx));

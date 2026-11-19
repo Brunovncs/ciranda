@@ -84,6 +84,8 @@ pub struct Settings {
     pub close_to_tray: bool,
     /// The notice saying so has been shown, the first time the window closed to it.
     pub tray_notice_seen: bool,
+    /// The newest version whose "What's new" was shown (see `crate::news`); empty before the first.
+    pub news_seen: String,
     /// Clicking a voice channel asks before joining it.
     pub confirm_voice_join: bool,
     /// Going to another server while in a voice channel or a call asks first: it ends them.
@@ -651,6 +653,7 @@ impl Default for Settings {
             language: String::new(),
             close_to_tray: true,
             tray_notice_seen: false,
+            news_seen: String::new(),
             confirm_voice_join: true,
             confirm_server_switch: true,
             join_muted: true,

@@ -94,7 +94,8 @@ impl Updater {
             update::Start::RollBack => update::Start::Trial,
             start => start,
         };
-        if start == update::Start::Updated {
+        // "What's new" says the version itself, with more.
+        if start == update::Start::Updated && !crate::ui::news::will_greet(cx) {
             cx.spawn(async move |_, cx| {
                 cx.update(|cx| {
                     overlay::toast(
@@ -585,10 +586,14 @@ pub fn settings_row(t: &Theme, cx: &mut App) -> AnyElement {
                 .child(div().flex_1().min_w(px(0.)).child(caption(status, color)))
                 .when_some(release, |d, r| {
                     d.child(
-                        crate::widgets::button("update-notes", tr!("What's new", "Novidades"), Kind::Subtle, t)
+                        crate::widgets::button("update-notes", trf!("About {}", "Sobre a {}", r.version), Kind::Subtle, t)
                             .on_click(move |_, _, cx| cx.open_url(&r.page)),
                     )
                 })
+                .child(
+                    crate::widgets::button("update-history", tr!("What's new", "Novidades"), Kind::Subtle, t)
+                        .on_click(|_, window, cx| crate::ui::news::open_history(window, cx)),
+                )
                 .child(
                     crate::widgets::button("update-check", tr!("Check now", "Verificar agora"), Kind::Standard, t)
                         .when(checking, |b| b.opacity(0.5))
