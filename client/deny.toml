@@ -32,6 +32,10 @@ ignore = [
   { id = "RUSTSEC-2026-0370", reason = "zvariant folded into zbus upstream, through GPUI's accesskit_unix" },
   { id = "RUSTSEC-2026-0371", reason = "zbus_names folded into zbus upstream, through GPUI's accesskit_unix" },
   { id = "RUSTSEC-2026-0372", reason = "zvariant_derive folded into zbus upstream, through GPUI's accesskit_unix" },
+  # chrono: Ciranda's dates (message times, news, file names) use it, and so do GPUI, its scheduler
+  # and its logger. Moving Ciranda's own uses to jiff would leave it in the tree through GPUI. An
+  # unmaintained notice, not a vulnerability: one of those would come under another ID and fail.
+  { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; GPUI depends on it too, so it stays until GPUI moves off it" },
 ]
 
 [licenses]
