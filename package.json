@@ -1,6 +1,6 @@
 {
   "name": "ciranda",
-  "version": "4.7.5",
+  "version": "4.7.6",
   "private": true,
   "description": "Low-latency screen sharing: a relay-only WebRTC server for Raspberry Pi and a native desktop client",
   "scripts": {
