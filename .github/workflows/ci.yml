@@ -217,8 +217,12 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 
+  # Advisory: GitHub's Mac runners are scarce and a run may never be given one ("not acquired by
+  # Runner"), which would turn every push red for a reason unrelated to the code. A real failure
+  # still shows on the job; release.yml builds and tests the Mac itself before publishing.
   client-macos:
     runs-on: macos-latest
+    continue-on-error: true
     timeout-minutes: 90
     defaults:
       run:
@@ -268,6 +272,8 @@ jobs:
           - { platform: macos, runner: macos-latest }
     name: release-cache (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
+    # The Mac's cache is a speed-up only, and its runner may never come (see client-macos).
+    continue-on-error: ${{ matrix.platform == 'macos' }}
     timeout-minutes: 120
     defaults:
       run:
