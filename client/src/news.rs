@@ -10,6 +10,36 @@ use crate::core::update::is_newer;
 
 pub const NEWS: &[Entry] = &[
     Entry {
+        version: "4.9.0",
+        date: (2026, 11, 19),
+        notes: &[
+            new(
+                "Colour themes, in Settings under Appearance: Vice City, just as Discord has it, and Middle-earth, Bullworth, Division, Blocks, Night City and Outer Wilds, each with a picture of its own behind the window.",
+                "Temas coloridos, em Configurações, em Aparência: o Vice City, igual ao do Discord, e Terra Média, Bullworth, Divisão, Blocos, Night City e Outer Wilds, cada um com uma cena própria atrás da janela.",
+            ),
+            new(
+                "The themes move: rain and glitches in Night City, snow in Division, embers in Middle-earth, clouds in Blocks, a campfire and a supernova every 22 minutes in Outer Wilds. They stop while the window is in the background, and can be turned off.",
+                "Os temas se mexem: chuva e glitches no Night City, neve na Divisão, brasas na Terra Média, nuvens nos Blocos, fogueira e uma supernova a cada 22 minutos no Outer Wilds. Param quando a janela fica em segundo plano, e dá para desligar.",
+            ),
+            new(
+                "A name style for each theme, picked in your profile, in a typeface of its own: the Night City one glitches, the Blocks one has the game's shadow.",
+                "Um estilo de nome para cada tema, escolhido no seu perfil, com uma fonte própria: o do Night City dá glitch, o dos Blocos tem a sombra do jogo.",
+            ),
+            new(
+                "An app icon for each theme, on the window, the taskbar and the notification area.",
+                "Um ícone do aplicativo para cada tema, na janela, na barra de tarefas e ao lado do relógio.",
+            ),
+            fixed(
+                "Ciranda opens again on the screen it was on, at the same size, also when that screen has another scale.",
+                "O Ciranda volta a abrir na tela em que estava, do mesmo tamanho, mesmo quando essa tela tem outra escala.",
+            ),
+            better(
+                "Name styles need the server updated to 4.9.0.",
+                "Os estilos de nome precisam do servidor atualizado para a 4.9.0.",
+            ),
+        ],
+    },
+    Entry {
         version: "4.8.0",
         date: (2026, 11, 19),
         notes: &[
