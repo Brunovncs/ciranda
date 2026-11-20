@@ -142,6 +142,7 @@ fn processes() -> Vec<(String, String)> {
     out
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 /// Games known by their program, whatever folder they are in. Lowercase program names.
 const KNOWN: &[(&str, &str)] = &[
     ("valorant-win64-shipping.exe", "VALORANT"),
@@ -182,6 +183,7 @@ const KNOWN: &[(&str, &str)] = &[
     ("hollow knight silksong.exe", "Hollow Knight: Silksong"),
 ];
 
+#[cfg_attr(not(windows), allow(dead_code))]
 fn known_exe(exe: &str, path: &str) -> Option<String> {
     let exe = exe.to_lowercase();
     if let Some((_, name)) = KNOWN.iter().find(|(e, _)| *e == exe) {
@@ -194,6 +196,7 @@ fn known_exe(exe: &str, path: &str) -> Option<String> {
     None
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 /// Where the stores put games, as the folder above the game's own (lowercase, `\`-ended), and
 /// folders under them that are not games.
 const STORES: &[&str] = &[
@@ -205,6 +208,7 @@ const STORES: &[&str] = &[
     "\\ea games\\",
     "\\ubisoft game launcher\\games\\",
 ];
+#[cfg_attr(not(windows), allow(dead_code))]
 const NOT_GAMES: &[&str] = &[
     "steamworks shared",
     "steamvr",
@@ -221,11 +225,13 @@ const NOT_GAMES: &[&str] = &[
     "riot client",
     "gamesave",
 ];
+#[cfg_attr(not(windows), allow(dead_code))]
 /// Programs inside a game's folder that run without the game: crash reporters, anti-cheat,
 /// launchers and installers.
 const HELPERS: &[&str] =
     &["crash", "report", "anticheat", "easyanticheat", "be_service", "beservice", "launcher", "setup", "redist", "unins", "updater"];
 
+#[cfg_attr(not(windows), allow(dead_code))]
 fn store_folder(exe: &str, path: &str) -> Option<String> {
     let lower = path.to_lowercase();
     let exe = exe.to_lowercase();
@@ -246,6 +252,7 @@ fn store_folder(exe: &str, path: &str) -> Option<String> {
     None
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 /// A folder name as a game's: underscores to spaces, nothing else touched.
 fn pretty(folder: &str) -> String {
     folder.replace('_', " ").trim().to_string()

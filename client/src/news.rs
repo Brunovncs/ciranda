@@ -33,10 +33,7 @@ pub const NEWS: &[Entry] = &[
                 "Ciranda opens again on the screen it was on, at the same size, also when that screen has another scale.",
                 "O Ciranda volta a abrir na tela em que estava, do mesmo tamanho, mesmo quando essa tela tem outra escala.",
             ),
-            better(
-                "Name styles need the server updated to 4.9.0.",
-                "Os estilos de nome precisam do servidor atualizado para a 4.9.0.",
-            ),
+            better("Name styles need the server updated to 4.9.0.", "Os estilos de nome precisam do servidor atualizado para a 4.9.0."),
         ],
     },
     Entry {
