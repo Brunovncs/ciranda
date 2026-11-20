@@ -9,6 +9,7 @@
 #[macro_use]
 mod i18n;
 mod activity;
+mod app_icon;
 mod core;
 mod dm;
 mod elsewhere;
@@ -41,6 +42,19 @@ use gpui::{AppContext, Bounds, QuitMode, TitlebarOptions, WindowBackgroundAppear
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// Gives the window the size `want` once it has settled on its screen (on the next frame),
+/// measured as its place is saved (`ui::Root`): `resize` takes that same measure.
+fn fit(window: &mut gpui::Window, want: gpui::Size<gpui::Pixels>) {
+    window.on_next_frame(move |window, _| {
+        let now = match window.window_bounds() {
+            WindowBounds::Windowed(b) | WindowBounds::Maximized(b) | WindowBounds::Fullscreen(b) => b.size,
+        };
+        if now != want {
+            window.resize(want);
+        }
+    });
+}
+
 /// 1180×760, or less on a small screen, so the whole window and its title bar start in view
 /// with room around them.
 fn first_size(cx: &gpui::App) -> gpui::Size<gpui::Pixels> {
@@ -50,17 +64,20 @@ fn first_size(cx: &gpui::App) -> gpui::Size<gpui::Pixels> {
     size(want.width.min(room.width * 0.85), want.height.min(room.height * 0.8))
 }
 
-/// Where the window was when Ciranda last ran, while its title bar is still on a screen (one
-/// unplugged since would leave it out of reach); else centred.
-fn first_bounds(cx: &gpui::App) -> WindowBounds {
+/// Where the window was when Ciranda last ran, and on which screen, while its title bar is
+/// still on one (a screen unplugged since would leave it out of reach); else centred on the main
+/// screen. The screen has to be named: GPUI checks a place against the main screen otherwise,
+/// and a window last seen on another one came back centred on the main one.
+fn first_bounds(cx: &gpui::App) -> (WindowBounds, Option<gpui::DisplayId>) {
     if let Some(p) = prefs::prefs(cx).window.filter(|p| p.width >= 640. && p.height >= 480.) {
         let b = Bounds::new(gpui::point(gpui::px(p.x), gpui::px(p.y)), size(gpui::px(p.width), gpui::px(p.height)));
         let title_bar = Bounds::new(b.origin, size(b.size.width.min(gpui::px(240.)), gpui::px(32.)));
-        if cx.displays().iter().any(|d| d.bounds().intersects(&title_bar)) {
-            return if p.maximized { WindowBounds::Maximized(b) } else { WindowBounds::Windowed(b) };
+        if let Some(display) = cx.displays().into_iter().find(|d| d.bounds().intersects(&title_bar)) {
+            let bounds = if p.maximized { WindowBounds::Maximized(b) } else { WindowBounds::Windowed(b) };
+            return (bounds, Some(display.id()));
         }
     }
-    WindowBounds::Windowed(Bounds::centered(None, first_size(cx), cx))
+    (WindowBounds::Windowed(Bounds::centered(None, first_size(cx), cx)), None)
 }
 
 /// `--self-test`: the release workflow runs the exe it is about to publish with this, so one that
@@ -204,6 +221,7 @@ fn main() {
         if let Err(e) = cx.text_system().add_fonts(theme::fonts()) {
             log::warn!("fonts did not load: {e}");
         }
+        name_fx::find_fonts(&cx.text_system().all_font_names());
         text_field::bind_keys(cx);
         #[cfg(target_os = "macos")]
         app_menu(cx);
@@ -216,16 +234,28 @@ fn main() {
         ui::hotkeys::init(cx);
         activity::start(cx);
 
+        let (bounds, display_id) = first_bounds(cx);
         let options = WindowOptions {
-            window_bounds: Some(first_bounds(cx)),
+            window_bounds: Some(bounds),
+            display_id,
             titlebar: Some(TitlebarOptions { title: Some("Ciranda".into()), ..Default::default() }),
             app_id: Some("ciranda".into()),
             window_min_size: Some(size(gpui::px(640.), gpui::px(480.))),
             window_background: WindowBackgroundAppearance::Opaque,
             ..Default::default()
         };
+        // Opened on another screen than the main one, the window first appears on the main one
+        // and Windows shrinks or grows it by the two screens' scales as it moves: given its size
+        // again, it keeps the one it had instead of changing at every start.
+        let restore = match bounds {
+            WindowBounds::Windowed(b) if display_id.is_some() => Some(b.size),
+            _ => None,
+        };
         let window = cx
             .open_window(options, |window, cx| {
+                if let Some(want) = restore {
+                    fit(window, want);
+                }
                 let root = cx.new(|cx| ui::Root::new(window, cx));
                 cx.set_global(ui::overlay::RootHandle(root.downgrade()));
                 root

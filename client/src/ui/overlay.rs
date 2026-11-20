@@ -461,7 +461,7 @@ pub fn dialog_card(t: &Theme, width: f32) -> gpui::Div {
         .flex()
         .flex_col()
         .rounded(px(radius::PANE + 2.))
-        .bg(t.pane)
+        .bg(t.card)
         .border_1()
         .border_color(t.stroke_strong)
         .shadow_lg()

@@ -261,6 +261,26 @@ describe('profile pictures', () => {
   });
 });
 
+describe('name effects', () => {
+  it('takes a name style that goes with a colour theme, and says the server knows them', async () => {
+    const health = (await api('/api/health')).body;
+    assert.ok(health.features.includes('name-styles'));
+    const res = await api('/api/accounts/name-fx', { method: 'POST', body: { nameFx: 'vicecity' }, token: memberToken });
+    assert.equal(res.status, 200);
+    assert.equal(res.body.user.nameFx, 'vicecity');
+  });
+
+  it('refuses one it has never heard of', async () => {
+    const res = await api('/api/accounts/name-fx', { method: 'POST', body: { nameFx: 'glitter' }, token: memberToken });
+    assert.equal(res.status, 400);
+  });
+
+  it('goes back to a plain name', async () => {
+    const res = await api('/api/accounts/name-fx', { method: 'POST', body: { nameFx: null }, token: memberToken });
+    assert.equal(res.body.user.nameFx, null);
+  });
+});
+
 describe('a clip or an emoji with no file named', () => {
   // A missing hash used to reach node:sqlite as `undefined`, which it cannot
   // bind: a 500 for leaving out a field.

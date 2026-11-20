@@ -66,6 +66,8 @@ pub struct Settings {
     custom: [Entity<TextField>; 4],
     /// The custom colour whose picker is open, and where the picker stands on it.
     picking: Option<(usize, [f32; 3])>,
+    /// Each colour theme's picture drawn small for its swatch: None while it is drawn.
+    scene_previews: std::collections::HashMap<&'static str, Option<std::sync::Arc<gpui::RenderImage>>>,
     appearance: WindowAppearance,
     test_steps: Vec<diagnose::Step>,
     test_outcome: Option<diagnose::Outcome>,
@@ -157,6 +159,7 @@ impl Settings {
             profile,
             custom,
             picking: None,
+            scene_previews: Default::default(),
             appearance,
             test_steps: Vec::new(),
             test_outcome: None,
@@ -584,6 +587,62 @@ impl Settings {
                     .on_click(cx.listener(move |s, _, _, cx| s.pick_palette(name, cx))),
             );
         }
+        let mut scenes = div().flex().flex_wrap().gap(px(10.));
+        for (name, title) in theme::scenes() {
+            let on = p.theme == name;
+            let Some(b) = theme::scene_backdrop(name) else { continue };
+            let hover = t.stroke_strong;
+            scenes = scenes.child(
+                div()
+                    .id(gpui::ElementId::Name(format!("scene-{name}").into()))
+                    .w(px(112.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.))
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .h(px(54.))
+                            .p(px(2.))
+                            .rounded(px(radius::CONTROL))
+                            .border_2()
+                            .border_color(if on { t.accent } else { t.stroke })
+                            .when(!on, |d| d.hover(move |s| s.border_color(hover)))
+                            .child(self.scene_swatch(name, b, cx)),
+                    )
+                    .child(div().text_center().text_size(px(12.5)).text_color(if on { t.text } else { t.text2 }).child(title))
+                    .on_click(cx.listener(move |s, _, _, cx| s.pick_palette(name, cx))),
+            );
+        }
+        let mut icons = div().flex().flex_wrap().gap(px(10.));
+        for (i, (key, title)) in crate::app_icon::all().into_iter().enumerate() {
+            let on = p.app_icon == key;
+            let hover = t.stroke_strong;
+            icons = icons.child(
+                div()
+                    .id(("app-icon", i))
+                    .w(px(76.))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(6.))
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .p(px(3.))
+                            .rounded(px(18.))
+                            .border_2()
+                            .border_color(if on { t.accent } else { gpui::transparent_black() })
+                            .when(!on, |d| d.hover(move |s| s.border_color(hover)))
+                            .child(gpui::img(app_icon_image(key)).size(px(52.))),
+                    )
+                    .child(div().text_center().text_size(px(12.)).text_color(if on { t.text } else { t.text2 }).child(title))
+                    .on_click(cx.listener(move |_, _, window, cx| {
+                        set_prefs(cx, |p| p.app_icon = key.to_string());
+                        crate::ui::tray::apply_icon(Some(window.scale_factor()), cx);
+                    })),
+            );
+        }
         let scale = p.ui_scale;
         div()
             .flex()
@@ -591,6 +650,30 @@ impl Settings {
             .gap(px(18.))
             .child(self.language_row(t, cx))
             .child(div().flex().flex_col().gap(px(8.)).child(label(tr!("Colour palette", "Paleta de cores"), t)).child(grid))
+            .child(div().flex().flex_col().gap(px(8.)).child(label(tr!("Colour themes", "Temas coloridos"), t)).child(scenes).child(
+                caption(
+                    tr!(
+                        "A gradient behind the whole window. Each one comes with a name style (Profile) and an app icon.",
+                        "Um gradiente atrás da janela inteira. Cada um vem com um estilo de nome (Perfil) e um ícone do aplicativo."
+                    ),
+                    t.text3,
+                ),
+            ))
+            .when(theme::scene_backdrop(&p.theme).is_some(), |d| {
+                d.child(toggle_row(
+                    "theme-effects",
+                    tr!("Theme effects", "Efeitos do tema"),
+                    tr!(
+                        "Rain, snow, embers and clouds moving behind the panes. They stop while the window is in the background.",
+                        "Chuva, neve, brasas e nuvens se movendo atrás dos painéis. Param quando a janela fica em segundo plano."
+                    ),
+                    p.theme_effects,
+                    t,
+                    cx,
+                    |cx| set_prefs(cx, |p| p.theme_effects = !p.theme_effects),
+                ))
+            })
+            .child(div().flex().flex_col().gap(px(8.)).child(label(tr!("App icon", "Ícone do aplicativo"), t)).child(icons))
             .when(p.theme == "custom", |d| {
                 let names = [tr!("Background", "Fundo"), tr!("Surface", "Superfície"), tr!("Text", "Texto"), tr!("Accent", "Destaque")];
                 let mut row = div().flex().gap(px(10.));
@@ -666,6 +749,44 @@ impl Settings {
                     ),
             )
             .into_any_element()
+    }
+
+    /// A colour theme as its swatch shows it: the gradient, darkened as the page, and its
+    /// picture over or under that, drawn small off the main thread the first time.
+    fn scene_swatch(&mut self, name: &'static str, b: theme::Backdrop, cx: &mut Context<Self>) -> gpui::Div {
+        // Laid out as a window eight times the swatch, so the picture keeps its proportions.
+        const SIZE: (f32, f32) = (896., 432.);
+        if !self.scene_previews.contains_key(name) {
+            self.scene_previews.insert(name, None);
+            let scale = 2;
+            cx.spawn(async move |this, cx| {
+                let image =
+                    cx.background_executor().spawn(async move { crate::ui::scene_fx::draw(name, SIZE, (112 * scale, 54 * scale)) }).await;
+                let _ = this.update(cx, |s, cx| {
+                    s.scene_previews.insert(name, image);
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+        let dark = Theme::new(name, self.appearance, None).base;
+        let picture = self
+            .scene_previews
+            .get(name)
+            .cloned()
+            .flatten()
+            .map(|i| gpui::img(i).absolute().inset_0().size_full().rounded(px(radius::CONTROL - 4.)));
+        let under = crate::ui::scene_fx::under_the_page(name);
+        let (art_under, art_over) = if under { (picture, None) } else { (None, picture) };
+        div()
+            .relative()
+            .size_full()
+            .rounded(px(radius::CONTROL - 4.))
+            .overflow_hidden()
+            .child(crate::ui::backdrop::fill(b, 112., 54., cx).rounded(px(radius::CONTROL - 4.)))
+            .children(art_under)
+            .child(div().absolute().inset_0().rounded(px(radius::CONTROL - 4.)).bg(dark))
+            .children(art_over)
     }
 
     fn language_row(&mut self, t: &Theme, cx: &mut Context<Self>) -> gpui::Div {
@@ -1495,3 +1616,19 @@ impl Render for Settings {
 }
 
 pub fn _slot(_: &FrameSlot) {}
+
+/// An app icon's picture for the picker, made once.
+fn app_icon_image(key: &'static str) -> std::sync::Arc<gpui::Image> {
+    thread_local! {
+        static MADE: std::cell::RefCell<std::collections::HashMap<&'static str, std::sync::Arc<gpui::Image>>> = Default::default();
+    }
+    MADE.with(|m| {
+        m.borrow_mut()
+            .entry(key)
+            .or_insert_with(|| {
+                let svg = crate::app_icon::svg(key).unwrap_or_default();
+                std::sync::Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Svg, svg.into_bytes()))
+            })
+            .clone()
+    })
+}

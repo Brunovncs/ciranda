@@ -525,7 +525,12 @@ export class Accounts {
  * the choice and refuses one it has never heard of, so an old client shows a
  * new one as a plain name.
  */
-export const NAME_FX = ['rainbow', 'aurora', 'fire', 'ocean', 'gold', 'candy'];
+// The second row are name styles that go with the colour themes: a typeface of their own, and
+// colour on some. Advertised as the 'name-styles' feature.
+export const NAME_FX = [
+  'rainbow', 'aurora', 'fire', 'ocean', 'gold', 'candy',
+  'vicecity', 'middleearth', 'bullworth', 'division', 'blocks', 'nightcity', 'outerwilds',
+];
 
 /** Shape a user row for the wire. Never leaks password_hash. */
 export const publicUser = (u) => (u ? {

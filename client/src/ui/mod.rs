@@ -1,6 +1,7 @@
 //! The window's root: the sign-in screen or the server, the theme, and what floats over them
 //! (dialogs, menus, toasts).
 
+pub mod backdrop;
 mod backstage;
 pub mod camera;
 pub mod connect;
@@ -13,6 +14,8 @@ mod mic_switch;
 pub mod news;
 pub mod overlay;
 mod rail;
+mod scene_art;
+pub mod scene_fx;
 pub mod server;
 pub mod settings;
 pub mod tray;
@@ -69,6 +72,8 @@ pub struct Root {
     then: Option<Then>,
     /// What the server kept behind for its call is listened to with (see `backstage`).
     backstage_subs: Vec<Subscription>,
+    /// A colour theme's gradient, picture and moving things, behind everything.
+    scene_fx: Entity<scene_fx::SceneFx>,
 }
 
 impl Focusable for Root {
@@ -164,6 +169,7 @@ impl Root {
             pending: None,
             then: None,
             backstage_subs: Vec::new(),
+            scene_fx: cx.new(|_| scene_fx::SceneFx::new()),
         };
         root.subscribe_connect(&view, window, cx);
         root
@@ -275,7 +281,7 @@ pub fn loading_screen(caption_text: SharedString, t: &Theme) -> impl IntoElement
         .items_center()
         .justify_center()
         .gap(px(20.))
-        .bg(t.base)
+        .bg(t.page())
         .child(mark)
         .child(caption(caption_text, t.text3))
         .with_animation("loading-in", Animation::new(Duration::from_millis(150)).with_easing(gpui::ease_in_out), |d, delta| {
@@ -293,7 +299,12 @@ impl Render for Root {
             Screen::Connect { view, .. } => {
                 crate::motion::enter(div().size_full().child(view.clone()), ("screen-in", view.entity_id())).into_any_element()
             }
-            Screen::Server(v) => crate::motion::enter(div().size_full().child(v.clone()), ("screen-in", v.entity_id())).into_any_element(),
+            // Cached, so the colour theme's moving things redraw their own layer and not the server.
+            Screen::Server(v) => crate::motion::enter(
+                div().size_full().child(v.clone().cached(gpui::StyleRefinement::default().size_full())),
+                ("screen-in", v.entity_id()),
+            )
+            .into_any_element(),
         };
         let theater_leaving = match &self.screen {
             Screen::Server(v) => v.read(cx).theater_leaving.clone().map(server::theater_ghost),
@@ -304,6 +315,8 @@ impl Render for Root {
         // So is a stream watched over the whole window.
         let theater = matches!(&self.screen, Screen::Server(v) if v.read(cx).theater.is_some());
         let rail = (!resuming && !theater && !prefs(cx).saved_servers.is_empty()).then(|| self.render_rail(&t, cx));
+        // A colour theme's gradient and picture under everything, darkened as the page.
+        let backdrop = t.backdrop.map(|_| self.scene_fx.clone());
         self.overlay.restore_focus(window, cx);
         self.overlay.focus_new_menu(window, cx);
         div()
@@ -316,8 +329,9 @@ impl Render for Root {
             .font_family(FONT)
             .text_size(px(14.))
             .text_color(t.text)
-            .bg(t.base)
+            .bg(if backdrop.is_some() { gpui::black() } else { t.base })
             .flex()
+            .children(backdrop)
             .children(rail)
             .child(div().flex_1().min_w(px(0.)).h_full().child(screen))
             .children(theater_leaving)

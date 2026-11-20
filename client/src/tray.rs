@@ -171,8 +171,8 @@ mod pictures {
 }
 
 pub use platform::{
-    Instance, Tray, dark_taskbar, flash_window, forget_thumbs, hide_window, hook_taskbar, is_minimized, quit_running, set_thumbs,
-    show_window,
+    Instance, Tray, dark_taskbar, flash_window, forget_thumbs, hide_window, hook_taskbar, is_minimized, quit_running, set_app_icon,
+    set_thumbs, show_window,
 };
 
 #[cfg(windows)]
@@ -415,8 +415,87 @@ mod platform {
         }
     }
 
-    /// The icon `look` asks for: Ciranda's own outside a call, or when a drawn one would not come.
+    /// The app's icon as the settings have it (`crate::app_icon`), or None for the program's own.
+    static BRAND: Mutex<Option<String>> = Mutex::new(None);
+
+    thread_local! {
+        /// The notification area's drawing of `BRAND`, on the icon's thread: the picture and its
+        /// icon, kept until the picture changes.
+        static BRAND_DRAWN: RefCell<Option<(String, isize)>> = const { RefCell::new(None) };
+        /// What `set_app_icon` last put on the window, let go when it is replaced.
+        static WINDOW_ICONS: Cell<[isize; 2]> = const { Cell::new([0, 0]) };
+    }
+
+    /// The icon outside a call: the app's icon, or the program's own.
+    fn brand_icon(s: &Shared) -> isize {
+        let Some(svg) = BRAND.lock().clone() else { return s.icon };
+        BRAND_DRAWN.with(|d| {
+            let mut d = d.borrow_mut();
+            if let Some((drawn_from, icon)) = &*d
+                && *drawn_from == svg
+            {
+                return *icon;
+            }
+            let size = small_icon();
+            let icon = pictures::paint(&svg, size as u32).map_or(0, |px| make_icon(&px, size));
+            if let Some((_, old)) = d.take() {
+                destroy_icon(old);
+            }
+            *d = Some((svg, icon));
+            if icon != 0 { icon } else { s.icon }
+        })
+    }
+
+    fn destroy_icon(icon: isize) {
+        if icon != 0 {
+            // SAFETY: an icon this module made and no longer hands out.
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::DestroyIcon(HICON(icon as _));
+            }
+        }
+    }
+
+    /// Puts the app's icon on the window `hwnd` (its title bar, taskbar button and Alt+Tab) at
+    /// the window's `scale`, and on the notification area's icon: `svg` drawn, or the program's
+    /// own icon for None. On the main thread.
+    pub fn set_app_icon(hwnd: Option<isize>, scale: f32, tray: Option<&Tray>, svg: Option<String>) {
+        use windows::Win32::UI::WindowsAndMessaging::{ICON_BIG, ICON_SMALL, SendMessageW, WM_SETICON};
+        *BRAND.lock() = svg.clone();
+        if let Some(tray) = tray {
+            tray.refresh();
+        }
+        let Some(hwnd) = hwnd else { return };
+        let sizes = [(32. * scale).round() as i32, (16. * scale).round() as i32];
+        let icons = sizes.map(|size| match &svg {
+            Some(svg) => pictures::paint(svg, size as u32).map_or(0, |px| make_icon(&px, size)),
+            None => program_icon(size),
+        });
+        for (which, icon) in [ICON_BIG, ICON_SMALL].into_iter().zip(icons) {
+            // SAFETY: the window is this thread's own; the icon outlives its use, as the old one
+            // is only let go once replaced.
+            unsafe {
+                SendMessageW(HWND(hwnd as _), WM_SETICON, Some(WPARAM(which as usize)), Some(LPARAM(icon)));
+            }
+        }
+        for old in WINDOW_ICONS.replace(icons) {
+            destroy_icon(old);
+        }
+    }
+
+    /// The program's own icon (resource 1), `size` square.
+    fn program_icon(size: i32) -> isize {
+        // SAFETY: loads from this program's resources; a failure answers 0.
+        unsafe {
+            let Ok(module) = GetModuleHandleW(None) else { return 0 };
+            LoadImageW(Some(module.into()), PCWSTR(1 as _), IMAGE_ICON, size, size, LR_DEFAULTCOLOR).map_or(0, |h| h.0 as isize)
+        }
+    }
+
+    /// The icon `look` asks for: the app's icon outside a call, or when a drawn one would not come.
     fn icon_for(look: Look, s: &Shared) -> HICON {
+        if look == Look::Idle {
+            return HICON(brand_icon(s) as _);
+        }
         let drawn = LOOKS.with(|looks| {
             *looks.borrow_mut().entry(look).or_insert_with(|| {
                 let size = small_icon();
@@ -465,6 +544,11 @@ mod platform {
         /// A notification from the icon, which Windows shows as a toast.
         pub fn notify(&self, title: &str, text: &str) {
             self.post(NOTICE, |p| p.notice = (title.into(), text.into()));
+        }
+
+        /// Draws the icon again, after the app's icon changed.
+        pub fn refresh(&self) {
+            self.post(SET_LOOK, |_| {});
         }
 
         /// Takes the icon away now: one left behind stays until the pointer passes over it.
@@ -636,7 +720,7 @@ mod platform {
                     fill(&mut d.szInfoTitle, &title);
                     fill(&mut d.szInfo, &text);
                     d.dwInfoFlags = NIIF_USER;
-                    d.hBalloonIcon = HICON(s.icon as _);
+                    d.hBalloonIcon = HICON(brand_icon(s) as _);
                     let _ = Shell_NotifyIconW(NIM_MODIFY, &d);
                 }
                 m if m == s.taskbar_created => {
@@ -883,6 +967,8 @@ mod platform {
     use std::path::Path;
 
     pub fn hook_taskbar(_: isize, _: async_channel::Sender<Event>) {}
+
+    pub fn set_app_icon(_: Option<isize>, _: f32, _: Option<&Tray>, _: Option<String>) {}
 
     pub fn set_thumbs(_: isize, _: Option<Thumbs>) -> bool {
         true

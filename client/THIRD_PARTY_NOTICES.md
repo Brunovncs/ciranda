@@ -7,6 +7,8 @@ Everything here ships inside the program: `ciranda.exe` on Windows, the AppImage
 | --- | --- | --- |
 | Figtree, by Erik Kennedy and the Figtree Project Authors (static Regular to Bold instances of the variable font, cut down to Latin, Greek and Cyrillic) | `assets/fonts/Figtree-*.ttf` | SIL Open Font License 1.1, in `assets/fonts/OFL.txt` |
 | Geist Mono, by Vercel | `assets/fonts/GeistMono-*.ttf` | SIL Open Font License 1.1, in `assets/fonts/OFL.txt` |
+| The name styles' typefaces: Luckiest Guy, by Astigmatic, and Permanent Marker, by Font Diner | `assets/fonts/styles/LuckiestGuy-Regular.ttf`, `assets/fonts/styles/PermanentMarker-Regular.ttf` | Apache 2.0, in `assets/fonts/styles/*-LICENSE.txt` |
+| Cinzel Decorative, by Natanael Gama; Chakra Petch, by Cadson Demak; Minecraft-Font, by Idrees Hassan; Jura, by the Jura Project Authors (a static SemiBold instance of the variable font, cut down to Latin); Rajdhani, by Indian Type Foundry (cut down to Latin) | `assets/fonts/styles/*.ttf`, `assets/fonts/styles/Minecraft.otf` | SIL Open Font License 1.1, in `assets/fonts/styles/*-OFL.txt` |
 | MediaPipe selfie segmentation, by Google, as converted to ONNX by onnx-community | `assets/models/selfie_segmentation.onnx` | Apache 2.0 |
 | DeepFilterNet3, by Hendrik Schröter: the published ONNX export, and libDF's STFT, features and streaming loop, ported to this client's tract | `assets/models/deepfilternet3/`, `src/media/deepfilter.rs` | MIT or Apache 2.0; MIT taken, below |
 | Lucide icons, by the Lucide contributors (path data, every icon but `soundboard` and `blur`) | `src/icons.rs` | ISC, below |

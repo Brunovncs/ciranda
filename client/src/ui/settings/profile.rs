@@ -546,7 +546,11 @@ impl Settings {
     /// Plain and every effect, each as your own name wearing it; a click picks it for everyone.
     fn name_fx_picker(&mut self, me: &crate::core::types::User, t: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let picked = me.name_fx.clone();
-        let choices = std::iter::once((None, tr!("Plain", "Simples"))).chain(crate::name_fx::all().into_iter().map(|(k, l)| (Some(k), l)));
+        // The colour themes' styles only where the server takes them.
+        let show_styles = self.session.read(cx).supports("name-styles");
+        let styles = if show_styles { crate::name_fx::styles().to_vec() } else { Vec::new() };
+        let choices = std::iter::once((None, tr!("Plain", "Simples")))
+            .chain(crate::name_fx::all().into_iter().chain(styles).map(|(k, l)| (Some(k), l)));
         let mut grid = div().flex().flex_wrap().gap(px(8.));
         for (i, (fx, title)) in choices.enumerate() {
             let on = picked.as_deref() == fx;
@@ -593,6 +597,25 @@ impl Settings {
                 ),
                 t.text3,
             ))
+            .when(show_styles && !crate::name_fx::has_pricedown(), |d| {
+                d.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .child(div().flex_1().min_w(px(0.)).child(caption(
+                            tr!(
+                                "Vice City is drawn in a free typeface close to GTA's. GTA's own, Pricedown, is free for personal use: installed on this computer, Ciranda uses it.",
+                                "O Vice City usa uma fonte livre parecida com a do GTA. A original, Pricedown, é grátis para uso pessoal: instalada neste computador, o Ciranda passa a usá-la."
+                            ),
+                            t.text3,
+                        )))
+                        .child(
+                            button("pricedown", tr!("Get Pricedown", "Baixar a Pricedown"), Kind::Subtle, t)
+                                .on_click(|_, _, cx| cx.open_url("https://typodermicfonts.com/pricedown/")),
+                        ),
+                )
+            })
             .into_any_element()
     }
 

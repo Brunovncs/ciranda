@@ -41,6 +41,11 @@ pub struct Settings {
     pub voice_sounds: bool,
     pub theme: String,
     pub custom_theme: Option<CustomTheme>,
+    /// The window's and the notification area's icon: empty for Ciranda's own, or one of the
+    /// colour themes' (`crate::app_icon`).
+    pub app_icon: String,
+    /// What moves on a colour theme: rain, snow, embers, clouds.
+    pub theme_effects: bool,
     pub show_members: bool,
     pub soundpad_volume: u32,
     /// Cirandinha's music, as a percentage up to 350, and whether it is muted: yours alone.
@@ -632,6 +637,8 @@ impl Default for Settings {
             voice_sounds: true,
             theme: "midnight".into(),
             custom_theme: None,
+            app_icon: String::new(),
+            theme_effects: true,
             show_members: true,
             soundpad_volume: 100,
             music_volume: 100,

@@ -838,7 +838,7 @@ impl Render for ConnectView {
             .flex()
             .items_center()
             .justify_center()
-            .bg(t.base)
+            .bg(t.page())
             .child(
                 // A trace of the accent behind the form, as Texel's stage does.
                 div().absolute().inset_0().bg(linear_gradient(

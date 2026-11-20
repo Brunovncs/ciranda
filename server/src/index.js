@@ -411,8 +411,9 @@ app.get('/api/health', (req, res) => {
     // keep this server's private messages in the background cheaply.
     // `mentions`: a `private` socket also hears the mentions that call you.
     // `activity`: `presence:activity` and the `activity` broadcast (what people play).
-    // `name-fx`: POST /api/accounts/name-fx. `retro`: GET /api/retro/:year.
-    features: ['inbox', 'replies', 'edit-history', 'ink', 'dm-clear', 'mentions', 'activity', 'name-fx', 'retro', 'typing'],
+    // `name-fx`: POST /api/accounts/name-fx. `name-styles`: it also takes the theme
+    // styles in NAME_FX (vicecity…). `retro`: GET /api/retro/:year.
+    features: ['inbox', 'replies', 'edit-history', 'ink', 'dm-clear', 'mentions', 'activity', 'name-fx', 'name-styles', 'retro', 'typing'],
     ...(authed
       ? {
           name: serverSettings.name,

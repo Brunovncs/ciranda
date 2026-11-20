@@ -58,6 +58,8 @@ pub fn init(window: AnyWindowHandle, instance: &Instance, cx: &mut App) {
         thumbs: None,
         dark: crate::tray::dark_taskbar(),
     });
+    let scale = window.update(cx, |_, window, _| window.scale_factor()).ok();
+    apply_icon(scale, cx);
     let _ = window.update(cx, |_, window, cx| window.on_window_should_close(cx, on_close));
     cx.on_app_quit(|cx| {
         if let Some(tray) = &cx.global::<TrayState>().tray {
@@ -107,6 +109,15 @@ pub(crate) fn hwnd(window: &Window) -> Option<isize> {
         RawWindowHandle::Win32(h) => Some(h.hwnd.get()),
         _ => None,
     }
+}
+
+/// Puts the app's icon the settings ask for (`crate::app_icon`) on the window, its taskbar button
+/// and the notification area, drawn for the window's `scale`.
+pub fn apply_icon(scale: Option<f32>, cx: &mut App) {
+    let Some(state) = cx.try_global::<TrayState>() else { return };
+    let key = prefs(cx).app_icon.clone();
+    let svg = (!key.is_empty()).then(|| crate::app_icon::svg(&key)).flatten();
+    crate::tray::set_app_icon(state.hwnd, scale.unwrap_or(1.), state.tray.as_ref(), svg);
 }
 
 /// The call in progress, or none: the icon, its tooltip and the thumbnail's buttons follow it.
