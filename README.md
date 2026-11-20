@@ -5,7 +5,7 @@ Voice channels with screen and camera sharing, text channels, and private
 conversations and calls, on a server you run. Latency stays under a second
 because the server relays video and never re-encodes it.
 
-[![Download for Windows](https://img.shields.io/github/v/release/Brunovncs/ciranda?label=Windows&logo=windows&style=for-the-badge&color=5b8cff)](https://github.com/Brunovncs/ciranda/releases/latest)
+[![Download for Windows](https://img.shields.io/github/v/release/Brunovncs/ciranda?label=Windows&logo=data%3Aimage%2Fsvg%2Bxml%3Bbase64%2CPHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI%2BPHBhdGggZmlsbD0id2hpdGUiIGQ9Ik0wIDBoMTEuNHYxMS40SDB6TTEyLjYgMEgyNHYxMS40SDEyLjZ6TTAgMTIuNmgxMS40VjI0SDB6TTEyLjYgMTIuNkgyNFYyNEgxMi42eiIvPjwvc3ZnPg%3D%3D&style=for-the-badge&color=5b8cff)](https://github.com/Brunovncs/ciranda/releases/latest)
 [![Download for macOS](https://img.shields.io/github/v/release/Brunovncs/ciranda?label=macOS&logo=apple&style=for-the-badge&color=5b8cff)](https://github.com/Brunovncs/ciranda/releases/latest)
 [![Download for Linux](https://img.shields.io/github/v/release/Brunovncs/ciranda?label=Linux&logo=linux&style=for-the-badge&color=5b8cff)](https://github.com/Brunovncs/ciranda/releases/latest)
 
